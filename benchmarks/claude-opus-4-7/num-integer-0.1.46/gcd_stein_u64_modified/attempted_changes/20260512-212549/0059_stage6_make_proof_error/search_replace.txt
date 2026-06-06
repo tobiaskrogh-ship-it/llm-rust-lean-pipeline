@@ -1,0 +1,380 @@
+<<< SEARCH
+/-- Termination measure for the outer Stein loop: the sum `m.toNat +
+n.toNat` strictly decreases each iteration. -/
+private abbrev steinTerm (s : Tuple2 u64 u64) : Nat :=
+  s._0.toNat + s._1.toNat
+
+/-! ## Sub-lemmas for `gcd_stein_postcondition`
+===
+/-- Termination measure for the outer Stein loop: the sum `m.toNat +
+n.toNat` strictly decreases each iteration. -/
+private abbrev steinTerm (s : Tuple2 u64 u64) : Nat :=
+  s._0.toNat + s._1.toNat
+
+/-! ## Outer Stein-loop Hoare triple
+
+This is the main piece of new infrastructure added in retry-5.  The
+body step reduces the nested `RustM` bind chain (comparison, guarded
+subtraction, inner `trailing_zeros_u64` call, guarded right-shift)
+to a pure functional update on the pair, then discharges the
+invariant + termination conjunction using the algebraic lemmas
+above.
+
+The proof is structured as two long mirrored branches (`m > n` and
+`m ≤ n`).  Each branch:
+1. Reduces the comparison `m >? n` to `pure (decide (m.toNat > n.toNat))`.
+2. Discharges the boolean case via the assumed branch hypothesis.
+3. Reduces `m -? n` (or `n -? m`) to `pure (m - n)` using
+   `UInt64.subOverflow = false` (from the m > n branch hypothesis +
+   `UInt64.toNat_sub_of_le'`).
+4. Invokes `trailing_zeros_u64_correctness` on the (positive, even)
+   difference to extract a tz-witness `k` with `k.toNat < 64`,
+   `2^k.toNat ∣ (m-n).toNat`, and `((m-n).toNat / 2^k.toNat) % 2 = 1`.
+5. Reduces the inner `←` bind on the trailing-zeros call to a `let`.
+6. Reduces `(m-n) >>>? k` to `pure ((m-n) >>> k.toNat.toUInt64)`
+   using `k.toNat < 64`.
+7. Discharges the invariant via `stein_body_gcd_preserve_left/right`
+   and termination via `stein_term_decrease_left/right`.
+
+For both branches `k ≥ 1` follows from `(m - n).toNat % 2 = 0` (the
+loop body is only entered when m ≠ n; combined with both being odd,
+the difference is even, hence its trailing-zero count is ≥ 1).  This
+is what feeds `stein_term_decrease_{left,right}` to get strict
+decrease. -/
+private theorem stein_loop_triple (m₀ n₀ : u64) (G : Nat)
+    (h_init : steinInv G ⟨m₀, n₀⟩) :
+    ⦃⌜ steinInv G ⟨m₀, n₀⟩ ⌝⦄
+      steinLoop m₀ n₀
+    ⦃⇓ r => ⌜ steinInv G r ∧ ¬ steinCond r = true ⌝⦄ := by
+  apply Std.Do.Spec.MonoLoopCombinator.while_loop
+    ⟨m₀, n₀⟩ Lean.Loop.mk steinCond steinBody (steinInv G) steinTerm
+  intro s hcond hinv
+  cases s with
+  | mk m n =>
+    change 0 < m.toNat ∧ 0 < n.toNat ∧ m.toNat % 2 = 1 ∧ n.toNat % 2 = 1 ∧
+           Nat.gcd m.toNat n.toNat = G at hinv
+    change steinCond ⟨m, n⟩ = true at hcond
+    obtain ⟨hm_pos, hn_pos, hm_odd, hn_odd, hgcd⟩ := hinv
+    -- Derive m ≠ n at the Nat level.
+    have h_mn_neq : m.toNat ≠ n.toNat := by
+      intro h_eq
+      have h_eq_u64 : m = n := UInt64.toNat_inj.mp h_eq
+      have h_bne : (m != n) = false := by
+        rw [bne_iff_ne]; simp [h_eq_u64]
+      change (m != n) = true at hcond
+      rw [h_bne] at hcond
+      exact Bool.false_ne_true hcond
+    -- Reduce the comparison m >? n.
+    have h_gt_red : (m >? n : RustM Bool) = pure (decide (m.toNat > n.toNat)) := by
+      show (rust_primitives.cmp.gt m n : RustM Bool) = pure (decide (m.toNat > n.toNat))
+      show pure (decide (m > n)) = pure (decide (m.toNat > n.toNat))
+      congr 1
+      apply propext
+      constructor
+      · intro h; exact UInt64.toNat_lt_toNat.mpr h
+      · intro h; exact UInt64.toNat_lt_toNat.mp h
+    dsimp only [steinBody]
+    rw [h_gt_red, pure_bind]
+    -- Case-split on m.toNat > n.toNat.
+    by_cases h_gt : m.toNat > n.toNat
+    · -- Left branch: m > n.
+      rw [show decide (m.toNat > n.toNat) = true from decide_eq_true h_gt]
+      simp only [↓reduceIte]
+      -- Reduce m -? n.
+      have h_n_le_m : n.toNat ≤ m.toNat := Nat.le_of_lt h_gt
+      have h_no_underflow :
+          BitVec.usubOverflow m.toBitVec n.toBitVec = false := by
+        cases h_eq : BitVec.usubOverflow m.toBitVec n.toBitVec
+        · rfl
+        · exfalso
+          have h_ovf : UInt64.subOverflow m n = true := h_eq
+          rw [UInt64.subOverflow_iff] at h_ovf
+          omega
+      have h_sub_eq : (m -? n : RustM u64) = pure (m - n) := by
+        show (rust_primitives.ops.arith.Sub.sub m n : RustM u64) = pure (m - n)
+        show (if BitVec.usubOverflow m.toBitVec n.toBitVec
+              then (.fail .integerOverflow : RustM u64)
+              else pure (m - n)) = pure (m - n)
+        rw [h_no_underflow]; rfl
+      have h_sub_toNat : (m - n).toNat = m.toNat - n.toNat :=
+        UInt64.toNat_sub_of_le' h_n_le_m
+      rw [h_sub_eq, pure_bind]
+      -- m - n is positive and even (both inputs odd, m > n).
+      have h_diff_pos : 0 < (m - n).toNat := by rw [h_sub_toNat]; omega
+      have h_diff_even : (m - n).toNat % 2 = 0 := by
+        rw [h_sub_toNat]; omega
+      have h_diff_ne_zero : (m - n) ≠ 0 := by
+        intro h_zero
+        have : (m - n).toNat = 0 := by rw [h_zero]; rfl
+        omega
+      -- Extract the trailing-zeros witness for m - n.
+      obtain ⟨k, h_tz_diff, h_k_lt_64, h_k_dvd, h_k_odd⟩ :=
+        trailing_zeros_u64_correctness (m - n) h_diff_ne_zero
+      -- k ≥ 1 since (m - n) is even.
+      have h_k_pos : 1 ≤ k.toNat := by
+        by_contra h_k0
+        push_neg at h_k0
+        interval_cases k.toNat
+        · -- k.toNat = 0, so 2^0 = 1 divides everything trivially.
+          -- But then (m-n).toNat / 2^0 = (m-n).toNat, and oddness:
+          -- (m-n).toNat % 2 = 1, contradicting h_diff_even.
+          simp at h_k_odd
+          omega
+      -- Reduce ← trailing_zeros_u64 (m - n).
+      rw [h_tz_diff, pure_bind]
+      -- Reduce (m - n) >>>? k.
+      have h_k_u32_lt_64 : (k : u32) < (64 : u32) := by
+        have h_kn_lt : k.toNat < 64 := h_k_lt_64
+        have h_64_toNat : (64 : u32).toNat = 64 := rfl
+        rw [UInt32.lt_iff_toNat_lt, h_64_toNat]
+        exact h_kn_lt
+      have h_shr_bound :
+          ((0 : Int32) ≤ (k : u32) && (k : u32) < (64 : u32)) = true := by
+        have h0 : ((0 : Int32) ≤ (k : u32)) = true := by decide
+        rw [h0, Bool.true_and]
+        exact decide_eq_true h_k_u32_lt_64
+      have h_shr_eq :
+          ((m - n) >>>? k : RustM u64) =
+            pure ((m - n) >>> (k.toNat.toUInt64)) := by
+        show (rust_primitives.ops.bit.Shr.shr (m - n) k : RustM u64) = _
+        show (if ((0 : Int32) ≤ k && k < (64 : u32))
+              then pure ((m - n) >>> (k.toNat.toUInt64))
+              else (.fail .integerOverflow : RustM u64)) = _
+        rw [h_shr_bound]; rfl
+      rw [h_shr_eq, pure_bind]
+      -- Now the body has reduced to pure ⟨(m-n) >>> k.toNat.toUInt64, n⟩.
+      -- Discharge the invariant + termination.
+      refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+      · -- termination strictly decreases
+        show (((m - n) >>> k.toNat.toUInt64).toNat + n.toNat)
+              < (m.toNat + n.toNat)
+        have h_shr_toNat :
+            ((m - n) >>> k.toNat.toUInt64).toNat = (m - n).toNat / 2 ^ k.toNat := by
+          rw [UInt64.toNat_shiftRight]
+          have h_amount : k.toNat.toUInt64.toNat = k.toNat := by
+            rw [UInt64.toNat_ofNat']
+            have h_kn_lt : k.toNat < 64 := h_k_lt_64
+            have : k.toNat < 2 ^ 64 := by omega
+            omega
+          rw [h_amount, Nat.shiftRight_eq_div_pow]
+        rw [h_shr_toNat, h_sub_toNat]
+        exact stein_term_decrease_left m.toNat n.toNat k.toNat h_gt hn_pos h_k_pos
+      · -- new m positive
+        show 0 < ((m - n) >>> k.toNat.toUInt64).toNat
+        have h_shr_toNat :
+            ((m - n) >>> k.toNat.toUInt64).toNat = (m - n).toNat / 2 ^ k.toNat := by
+          rw [UInt64.toNat_shiftRight]
+          have h_amount : k.toNat.toUInt64.toNat = k.toNat := by
+            rw [UInt64.toNat_ofNat']
+            have h_kn_lt : k.toNat < 64 := h_k_lt_64
+            have : k.toNat < 2 ^ 64 := by omega
+            omega
+          rw [h_amount, Nat.shiftRight_eq_div_pow]
+        rw [h_shr_toNat]
+        -- (m - n).toNat / 2^k.toNat > 0:
+        -- (m - n).toNat = 2^k.toNat * ((m - n).toNat / 2^k.toNat), and
+        -- (m - n).toNat > 0, so the quotient is > 0.
+        have h_dvd_eq : (m - n).toNat = 2 ^ k.toNat * ((m - n).toNat / 2 ^ k.toNat) :=
+          (Nat.mul_div_cancel' h_k_dvd).symm
+        by_contra h_neg
+        push_neg at h_neg
+        have h_quot_zero : (m - n).toNat / 2 ^ k.toNat = 0 := Nat.le_zero.mp h_neg
+        rw [h_quot_zero, Nat.mul_zero] at h_dvd_eq
+        omega
+      · -- n still positive
+        exact hn_pos
+      · -- new m odd
+        show ((m - n) >>> k.toNat.toUInt64).toNat % 2 = 1
+        have h_shr_toNat :
+            ((m - n) >>> k.toNat.toUInt64).toNat = (m - n).toNat / 2 ^ k.toNat := by
+          rw [UInt64.toNat_shiftRight]
+          have h_amount : k.toNat.toUInt64.toNat = k.toNat := by
+            rw [UInt64.toNat_ofNat']
+            have h_kn_lt : k.toNat < 64 := h_k_lt_64
+            have : k.toNat < 2 ^ 64 := by omega
+            omega
+          rw [h_amount, Nat.shiftRight_eq_div_pow]
+        rw [h_shr_toNat]
+        exact h_k_odd
+      · -- n still odd
+        exact hn_odd
+      · -- gcd preserved
+        show Nat.gcd ((m - n) >>> k.toNat.toUInt64).toNat n.toNat = G
+        have h_shr_toNat :
+            ((m - n) >>> k.toNat.toUInt64).toNat = (m - n).toNat / 2 ^ k.toNat := by
+          rw [UInt64.toNat_shiftRight]
+          have h_amount : k.toNat.toUInt64.toNat = k.toNat := by
+            rw [UInt64.toNat_ofNat']
+            have h_kn_lt : k.toNat < 64 := h_k_lt_64
+            have : k.toNat < 2 ^ 64 := by omega
+            omega
+          rw [h_amount, Nat.shiftRight_eq_div_pow]
+        rw [h_shr_toNat, h_sub_toNat]
+        rw [stein_body_gcd_preserve_left m.toNat n.toNat k.toNat h_n_le_m hn_odd
+              (by rw [← h_sub_toNat]; exact h_k_dvd)]
+        exact hgcd
+    · -- Right branch: m ≤ n.  Since m ≠ n at Nat level, we have m < n.
+      push_neg at h_gt
+      have h_lt : m.toNat < n.toNat := Nat.lt_of_le_of_ne h_gt h_mn_neq
+      rw [show decide (m.toNat > n.toNat) = false from decide_eq_false (by omega)]
+      simp only [↓reduceIte, Bool.false_eq_true]
+      -- Reduce n -? m.
+      have h_m_le_n : m.toNat ≤ n.toNat := Nat.le_of_lt h_lt
+      have h_no_underflow :
+          BitVec.usubOverflow n.toBitVec m.toBitVec = false := by
+        cases h_eq : BitVec.usubOverflow n.toBitVec m.toBitVec
+        · rfl
+        · exfalso
+          have h_ovf : UInt64.subOverflow n m = true := h_eq
+          rw [UInt64.subOverflow_iff] at h_ovf
+          omega
+      have h_sub_eq : (n -? m : RustM u64) = pure (n - m) := by
+        show (rust_primitives.ops.arith.Sub.sub n m : RustM u64) = pure (n - m)
+        show (if BitVec.usubOverflow n.toBitVec m.toBitVec
+              then (.fail .integerOverflow : RustM u64)
+              else pure (n - m)) = pure (n - m)
+        rw [h_no_underflow]; rfl
+      have h_sub_toNat : (n - m).toNat = n.toNat - m.toNat :=
+        UInt64.toNat_sub_of_le' h_m_le_n
+      rw [h_sub_eq, pure_bind]
+      -- n - m is positive and even.
+      have h_diff_pos : 0 < (n - m).toNat := by rw [h_sub_toNat]; omega
+      have h_diff_even : (n - m).toNat % 2 = 0 := by
+        rw [h_sub_toNat]; omega
+      have h_diff_ne_zero : (n - m) ≠ 0 := by
+        intro h_zero
+        have : (n - m).toNat = 0 := by rw [h_zero]; rfl
+        omega
+      obtain ⟨k, h_tz_diff, h_k_lt_64, h_k_dvd, h_k_odd⟩ :=
+        trailing_zeros_u64_correctness (n - m) h_diff_ne_zero
+      have h_k_pos : 1 ≤ k.toNat := by
+        by_contra h_k0
+        push_neg at h_k0
+        interval_cases k.toNat
+        · simp at h_k_odd
+          omega
+      rw [h_tz_diff, pure_bind]
+      have h_k_u32_lt_64 : (k : u32) < (64 : u32) := by
+        have h_kn_lt : k.toNat < 64 := h_k_lt_64
+        have h_64_toNat : (64 : u32).toNat = 64 := rfl
+        rw [UInt32.lt_iff_toNat_lt, h_64_toNat]
+        exact h_kn_lt
+      have h_shr_bound :
+          ((0 : Int32) ≤ (k : u32) && (k : u32) < (64 : u32)) = true := by
+        have h0 : ((0 : Int32) ≤ (k : u32)) = true := by decide
+        rw [h0, Bool.true_and]
+        exact decide_eq_true h_k_u32_lt_64
+      have h_shr_eq :
+          ((n - m) >>>? k : RustM u64) =
+            pure ((n - m) >>> (k.toNat.toUInt64)) := by
+        show (rust_primitives.ops.bit.Shr.shr (n - m) k : RustM u64) = _
+        show (if ((0 : Int32) ≤ k && k < (64 : u32))
+              then pure ((n - m) >>> (k.toNat.toUInt64))
+              else (.fail .integerOverflow : RustM u64)) = _
+        rw [h_shr_bound]; rfl
+      rw [h_shr_eq, pure_bind]
+      have h_shr_toNat :
+          ((n - m) >>> k.toNat.toUInt64).toNat = (n - m).toNat / 2 ^ k.toNat := by
+        rw [UInt64.toNat_shiftRight]
+        have h_amount : k.toNat.toUInt64.toNat = k.toNat := by
+          rw [UInt64.toNat_ofNat']
+          have h_kn_lt : k.toNat < 64 := h_k_lt_64
+          have : k.toNat < 2 ^ 64 := by omega
+          omega
+        rw [h_amount, Nat.shiftRight_eq_div_pow]
+      refine ⟨?_, ?_, ?_, ?_, ?_, ?_⟩
+      · show (m.toNat + ((n - m) >>> k.toNat.toUInt64).toNat) < (m.toNat + n.toNat)
+        rw [h_shr_toNat, h_sub_toNat]
+        exact stein_term_decrease_right m.toNat n.toNat k.toNat h_lt hm_pos h_k_pos
+      · exact hm_pos
+      · show 0 < ((n - m) >>> k.toNat.toUInt64).toNat
+        rw [h_shr_toNat]
+        have h_dvd_eq : (n - m).toNat = 2 ^ k.toNat * ((n - m).toNat / 2 ^ k.toNat) :=
+          (Nat.mul_div_cancel' h_k_dvd).symm
+        by_contra h_neg
+        push_neg at h_neg
+        have h_quot_zero : (n - m).toNat / 2 ^ k.toNat = 0 := Nat.le_zero.mp h_neg
+        rw [h_quot_zero, Nat.mul_zero] at h_dvd_eq
+        omega
+      · exact hm_odd
+      · show ((n - m) >>> k.toNat.toUInt64).toNat % 2 = 1
+        rw [h_shr_toNat]
+        exact h_k_odd
+      · show Nat.gcd m.toNat ((n - m) >>> k.toNat.toUInt64).toNat = G
+        rw [h_shr_toNat, h_sub_toNat]
+        rw [stein_body_gcd_preserve_right m.toNat n.toNat k.toNat h_m_le_n hm_odd
+              (by rw [← h_sub_toNat]; exact h_k_dvd)]
+        exact hgcd
+
+/-! ## Loop result existence (equational form) -/
+
+/-- **Stein loop result.** Given a valid initial state, the loop returns
+`RustM.ok ⟨v, v⟩` for some `v` with `v.toNat = G` (the gcd invariant).
+
+This is the existential form of `stein_loop_triple`, useful for plugging
+into the function unfolding in `gcd_stein_postcondition`. -/
+private theorem stein_loop_ok (m₀ n₀ : u64) (G : Nat)
+    (h_init : steinInv G ⟨m₀, n₀⟩) :
+    ∃ v : u64, steinLoop m₀ n₀ = RustM.ok ⟨v, v⟩ ∧ v.toNat = G := by
+  have h_loop := stein_loop_triple m₀ n₀ G h_init
+  have h_loop' : ⦃⌜True⌝⦄ steinLoop m₀ n₀
+      ⦃⇓ r => ⌜ steinInv G r ∧ ¬ steinCond r = true ⌝⦄ := by
+    apply Std.Do.Triple.of_entails_left _ _ _ _ h_loop
+    intro _; exact h_init
+  rw [RustM.Triple_iff_BitVec] at h_loop'
+  simp only [decide_true, Bool.not_true, Bool.false_or,
+             Bool.and_eq_true, decide_eq_true_eq] at h_loop'
+  obtain ⟨hok, hpost⟩ := h_loop'
+  cases hf : steinLoop m₀ n₀ with
+  | none =>
+    rw [hf] at hok; simp [RustM.toBVRustM] at hok
+  | some result =>
+    cases result with
+    | ok v =>
+      rw [hf] at hpost
+      simp [RustM.toBVRustM] at hpost
+      obtain ⟨⟨hm_pos, hn_pos, hm_odd, hn_odd, hgcd⟩, hncond⟩ := hpost
+      -- ¬ steinCond v = true means v._0 = v._1.
+      have h_eq_u64 : v._0 = v._1 := by
+        change ¬ (v._0 != v._1) = true at hncond
+        rw [Bool.not_eq_true, bne_eq_false_iff_eq] at hncond
+        exact hncond
+      cases v with
+      | mk a b =>
+        change a = b at h_eq_u64
+        subst h_eq_u64
+        refine ⟨a, rfl, ?_⟩
+        -- Nat.gcd a.toNat a.toNat = a.toNat
+        change Nat.gcd a.toNat a.toNat = G at hgcd
+        rw [Nat.gcd_self] at hgcd
+        exact hgcd
+    | error e =>
+      rw [hf] at hok
+      cases e <;> simp [RustM.toBVRustM] at hok
+
+/-! ## Bridge between the original gcd and the odd-parts gcd
+
+The Stein algorithm computes `Nat.gcd (a_odd) (b_odd) << shift` where
+`a_odd = a / 2^k_a`, `b_odd = b / 2^k_b`, and `shift = k_ab` is the
+trailing-zero count of `a | b`.  The closed-form identity is:
+
+  `Nat.gcd a b = 2^k_ab * Nat.gcd a_odd b_odd`
+
+This follows from the fact that `k_ab = min(k_a, k_b)` (since the
+trailing-zero count of `a | b` equals the minimum of the trailing-zero
+counts of `a` and `b`), combined with the algebraic identity:
+
+  `Nat.gcd (2^k_a * a_odd) (2^k_b * b_odd) = 2^min(k_a, k_b) * Nat.gcd a_odd b_odd`
+
+when `a_odd` and `b_odd` are both odd.  Proving these structural
+facts at the Nat level requires more bit-trick infrastructure than
+the file currently provides, but the helper lemmas already prepared
+(`nat_gcd_halve_even_pow`, `nat_gcd_halve_even`) cover the core
+gcd-divides-into-powers reasoning.
+
+A specific stuck point in the bridge is the relationship
+`trailing_zeros_u64 (a ||| b) = min(trailing_zeros_u64 a, trailing_zeros_u64 b)`,
+which would need a bit-level argument (likely via `bv_decide` on the
+specific operation pattern) that isn't currently available. -/
+
+/-! ## Sub-lemmas for `gcd_stein_postcondition`

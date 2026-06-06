@@ -1,0 +1,33 @@
+pub fn min(a: u8, b: u8) -> u8 {
+    if a <= b { a } else { b }
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // Postcondition: the result is a lower bound of both inputs.
+    // A buggy implementation that e.g. always returns `a` would fail this
+    // whenever b < a.
+    proptest! {
+        #[test]
+        fn prop_min_is_lower_bound(a: u8, b: u8) {
+            let m = min(a, b);
+            prop_assert!(m <= a);
+            prop_assert!(m <= b);
+        }
+    }
+
+    // Postcondition: the result is achieved — it equals one of the inputs.
+    // A buggy implementation that always returns 0 would fail this whenever
+    // neither input is 0.
+    proptest! {
+        #[test]
+        fn prop_min_equals_one_input(a: u8, b: u8) {
+            let m = min(a, b);
+            prop_assert!(m == a || m == b);
+        }
+    }
+}

@@ -1,0 +1,74 @@
+/// HumanEval/121 / CLEVER 120 — `solution(lst)`.  Sum of all odd
+/// elements at even indices.
+fn sum_at(l: &[i64], i: usize, acc: i64) -> i64 {
+    if i >= l.len() { acc }
+    else if i % 2 == 0 && l[i] % 2 != 0 { sum_at(l, i + 1, acc + l[i]) }
+    else { sum_at(l, i + 1, acc) }
+}
+
+pub fn solution(lst: &[i64]) -> i64 {
+    sum_at(lst, 0, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn known() {
+        assert_eq!(solution(&[5, 8, 7, 1]), 12);   // 5 + 7
+        assert_eq!(solution(&[3, 3, 3, 3, 3]), 9); // 3 + 3 + 3
+        assert_eq!(solution(&[30, 13, 24, 321]), 0);
+    }
+
+    /// Boundary: the empty list contributes nothing, so the sum is 0.
+    #[test]
+    fn empty_is_zero() {
+        assert_eq!(solution(&[]), 0);
+    }
+
+    /// Reference implementation using the standard iterator pipeline.
+    /// This captures the full postcondition: the result is the sum of
+    /// elements `lst[i]` for which `i` is even AND `lst[i]` is odd.
+    /// Element range is bounded so that the sum cannot overflow i64.
+    fn reference(lst: &[i64]) -> i64 {
+        lst.iter()
+            .enumerate()
+            .filter(|(i, &x)| i % 2 == 0 && x % 2 != 0)
+            .map(|(_, &x)| x)
+            .sum()
+    }
+
+    proptest! {
+        /// Postcondition: `solution` agrees with the iterator-based
+        /// reference on every (bounded) input.
+        #[test]
+        fn matches_reference(lst in proptest::collection::vec(-1_000_000i64..1_000_000, 0..64)) {
+            prop_assert_eq!(solution(&lst), reference(&lst));
+        }
+
+        /// Independence claim: only values at *even* indices can affect
+        /// the result. Replacing every odd-indexed value with an
+        /// arbitrary other i64 must leave the result unchanged.
+        /// This is an orthogonal property from "matches reference" —
+        /// it pins down that the function is not, say, summing over a
+        /// different set of indices that happens to coincide on some
+        /// inputs.
+        #[test]
+        fn ignores_odd_indices(
+            lst in proptest::collection::vec(-1_000_000i64..1_000_000, 0..64),
+            replacements in proptest::collection::vec(any::<i64>(), 0..64),
+        ) {
+            let mut perturbed = lst.clone();
+            for (i, slot) in perturbed.iter_mut().enumerate() {
+                if i % 2 == 1 {
+                    if let Some(&r) = replacements.get(i / 2) {
+                        *slot = r;
+                    }
+                }
+            }
+            prop_assert_eq!(solution(&lst), solution(&perturbed));
+        }
+    }
+}

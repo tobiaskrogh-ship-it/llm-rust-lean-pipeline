@@ -1,0 +1,84 @@
+<<< SEARCH
+  · -- Non-empty branch.  Substantive attempt: unfold the function, extract
+    -- the divisor cast, run the function decomposition through to the
+    -- final division, and reduce to `0 ≤ ads.toInt.tdiv n.toInt`. We get
+    -- stuck because for slice sizes ≥ 2^63 the cast `as i64` wraps so
+    -- `n.toInt < 0`, and the contract is genuinely false on such inputs.
+    unfold clever_004_mean_absolute_deviation.mean_absolute_deviation at h
+    simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+               rust_primitives.hax.cast_op, pure_bind, RustM_ok_bind] at h
+    -- After this point we would case-split on `n ==? 0`, take the
+    -- non-zero branch, extract `sum`, `mean`, `abs_dev`, apply
+    -- `abs_dev_sum_from_nonneg_aux` for `0 ≤ abs_dev.toInt`, and apply
+    -- `i64_div_toInt` to compute `r.toInt = abs_dev.toInt.tdiv n.toInt`.
+    -- The goal reduces to `0 ≤ abs_dev.toInt.tdiv n.toInt`, which is
+    -- false in general because `n.toInt` can be negative.
+    sorry
+===
+  · -- Non-empty branch. Substantive attempt: unfold the function, reduce
+    -- the cast / `==?` boilerplate, case-split on whether `n = 0` (as i64),
+    -- decompose the sum_from + division + abs_dev_sum_from + division
+    -- chain, apply `abs_dev_sum_from_nonneg_aux` to get `0 ≤ abs_dev.toInt`,
+    -- and reduce to `0 ≤ abs_dev.toInt.tdiv n.toInt`.
+    unfold clever_004_mean_absolute_deviation.mean_absolute_deviation at h
+    have h_cast_pure :
+        (Cast.cast (USize64.ofNat s.val.size) : RustM i64)
+          = pure (USize64.toInt64 (USize64.ofNat s.val.size)) := rfl
+    simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+               rust_primitives.hax.cast_op, h_cast_pure,
+               rust_primitives.cmp.eq, pure_bind] at h
+    by_cases hn_eq : USize64.toInt64 (USize64.ofNat s.val.size) = (0 : i64)
+    · -- n = 0 (as i64): function returns 0, r = 0, 0 ≤ 0.
+      have h_beq : (USize64.toInt64 (USize64.ofNat s.val.size) == (0 : i64)) = true := by
+        rw [beq_iff_eq]; exact hn_eq
+      rw [h_beq] at h
+      simp only [↓reduceIte] at h
+      have h_pure : (pure (0 : i64) : RustM i64) = RustM.ok 0 := rfl
+      rw [h_pure] at h
+      injection h with h1
+      injection h1 with h2
+      subst h2
+      rw [i64_zero_toInt]; omega
+    · -- n ≠ 0: function does the divisions.
+      have h_beq : (USize64.toInt64 (USize64.ofNat s.val.size) == (0 : i64)) = false := by
+        rw [beq_eq_false_iff_ne]; exact hn_eq
+      rw [h_beq] at h
+      simp only [Bool.false_eq_true, ↓reduceIte] at h
+      obtain ⟨sum, h_sum_ok, h⟩ := (RustM_bind_ok_iff _ _ _).mp h
+      obtain ⟨mean, h_mean_ok, h⟩ := (RustM_bind_ok_iff _ _ _).mp h
+      obtain ⟨abs_dev, h_abs_dev_ok, h_r⟩ := (RustM_bind_ok_iff _ _ _).mp h
+      -- 0 ≤ abs_dev.toInt by abs_dev_sum_from_nonneg_aux.
+      have h_abs_dev_nn : 0 ≤ abs_dev.toInt :=
+        abs_dev_sum_from_nonneg_aux s mean (s.val.size - (0 : usize).toNat) 0 abs_dev
+          (Nat.le_refl _) h_abs_dev_ok
+      -- r.toInt = abs_dev.toInt.tdiv n.toInt by i64_div_toInt.
+      have h_r_toInt :
+          r.toInt = abs_dev.toInt.tdiv (USize64.toInt64 (USize64.ofNat s.val.size)).toInt :=
+        i64_div_toInt _ _ _ h_r
+      rw [h_r_toInt]
+      -- Sub-goal: 0 ≤ abs_dev.toInt.tdiv n.toInt, where 0 ≤ abs_dev.toInt.
+      -- This follows from `Int.tdiv_nonneg` if `0 ≤ n.toInt`. The slice
+      -- size invariant gives `s.val.size < 2^64` but not `s.val.size < 2^63`,
+      -- so `n.toInt` can be negative (when `2^63 ≤ s.val.size < 2^64`).
+      by_cases h_n_nn : 0 ≤ (USize64.toInt64 (USize64.ofNat s.val.size)).toInt
+      · -- n.toInt ≥ 0: positive divisor (or zero), tdiv_nonneg closes.
+        exact Int.tdiv_nonneg h_abs_dev_nn h_n_nn
+      · -- n.toInt < 0: pathological case (s.val.size ≥ 2^63).
+        --
+        -- Stuck sub-goal: `0 ≤ abs_dev.toInt.tdiv n.toInt` with
+        -- `0 ≤ abs_dev.toInt` and `n.toInt < 0`. The expression
+        -- `(positive Int).tdiv (negative Int)` can be strictly negative
+        -- (e.g. `5.tdiv (-2) = -2 < 0`), so the contract genuinely fails
+        -- on pathological inputs. Without a precondition restricting
+        -- `s.val.size < 2^63`, the obligation is not provable.
+        --
+        -- Structural unblock: tighten the obligation statement to include
+        -- `(h_size : s.val.size < 2^63)`. Then `n.toInt = s.val.size > 0`
+        -- (via the `USize64.toInt64`-of-small-Nat lemma) and the existing
+        -- positive-divisor branch closes via `Int.tdiv_nonneg`. Such a
+        -- precondition matches the implicit assumption of the proptest
+        -- `result_is_non_negative` (which restricts size to ≤ 50). The
+        -- retry instructions forbid weakening obligations, so this `sorry`
+        -- remains as a statement-level limitation.
+        sorry
+>>> REPLACE

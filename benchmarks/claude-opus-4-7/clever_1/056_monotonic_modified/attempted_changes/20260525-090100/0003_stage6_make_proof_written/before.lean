@@ -1,0 +1,80 @@
+-- Companion obligations file for the `clever_050_monotonic` extraction.
+-- Each property the Rust function should satisfy belongs here as a separate `theorem`.
+-- Proofs use `sorry` placeholders at this stage; they are filled in by the proof stage.
+
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+import clever_050_monotonic
+
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+
+namespace Clever_050_monotonicObligations
+
+/-! ## Specification: pairwise predicates on the underlying `i64` list.
+
+The brute-force oracle in the Rust source is equivalent to: "all adjacent
+pairs are non-strictly non-decreasing" ∨ "all adjacent pairs are non-strictly
+non-increasing". We capture each side as a private `Prop`. -/
+
+/-- All adjacent pairs of `l` are non-decreasing. -/
+private def is_nondec (l : RustSlice i64) : Prop :=
+  ∀ j : Nat, ∀ (hj1 : j + 1 < l.val.size),
+    l.val[j]'(Nat.lt_of_succ_lt hj1) ≤ l.val[j+1]'hj1
+
+/-- All adjacent pairs of `l` are non-increasing. -/
+private def is_noninc (l : RustSlice i64) : Prop :=
+  ∀ j : Nat, ∀ (hj1 : j + 1 < l.val.size),
+    l.val[j+1]'hj1 ≤ l.val[j]'(Nat.lt_of_succ_lt hj1)
+
+/-! ## Top-level contract clauses. -/
+
+/-- Boundary clause: lists of length 0 or 1 are vacuously monotonic.
+
+    Captures the `small_lists_are_monotonic` test (`monotonic(&[])` and
+    `monotonic(&[7])` both `true`). Although derivable from the main
+    completeness clause via vacuous quantification, it is asserted as an
+    explicit boundary check by the test suite. -/
+theorem monotonic_small_lists (l : RustSlice i64) (h : l.val.size ≤ 1) :
+    clever_050_monotonic.monotonic l = RustM.ok true := by
+  sorry
+
+/-- Completeness clause (positive direction):
+
+    Captures the `matches_brute_force` proptest in the `naive = true` case.
+    If every adjacent pair of `l` is non-decreasing, or every adjacent pair
+    is non-increasing, then `monotonic l = RustM.ok true`. -/
+theorem monotonic_returns_true (l : RustSlice i64) (h : is_nondec l ∨ is_noninc l) :
+    clever_050_monotonic.monotonic l = RustM.ok true := by
+  sorry
+
+/-- Soundness clause (negative direction):
+
+    Captures the `matches_brute_force` proptest in the `naive = false` case.
+    If `l` has both a strictly-decreasing adjacent pair (refuting `is_nondec`)
+    and a strictly-increasing adjacent pair (refuting `is_noninc`), then
+    `monotonic l = RustM.ok false`. -/
+theorem monotonic_returns_false (l : RustSlice i64)
+    (h : ¬ is_nondec l ∧ ¬ is_noninc l) :
+    clever_050_monotonic.monotonic l = RustM.ok false := by
+  sorry
+
+/-- Non-strict-semantics clause: a constant list is monotonic.
+
+    Captures the `constant_list_is_monotonic` proptest. The test author
+    flagged this as an independent contract clause: a buggy implementation
+    using strict `>=`/`<=` comparisons would still satisfy
+    `matches_brute_force` on strictly-varying lists, but fail this clause.
+    Although it is derivable from `monotonic_returns_true` (a constant list
+    satisfies `is_nondec`), the test pins it down explicitly. -/
+theorem monotonic_constant (l : RustSlice i64) (c : i64)
+    (hconst : ∀ i : Nat, ∀ (hi : i < l.val.size), l.val[i]'hi = c) :
+    clever_050_monotonic.monotonic l = RustM.ok true := by
+  sorry
+
+end Clever_050_monotonicObligations

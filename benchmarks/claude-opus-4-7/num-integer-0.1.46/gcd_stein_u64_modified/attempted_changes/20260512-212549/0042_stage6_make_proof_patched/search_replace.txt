@@ -1,0 +1,190 @@
+<<< SEARCH
+/-- **Functional correctness (closed form).** For every pair of `u64`
+inputs, `gcd_stein` succeeds and returns the integer gcd of the two
+inputs (computed over `Nat`).  This single equation pins down every
+concrete `known_values` case as well as the `zero_zero_is_zero`
+boundary (`Nat.gcd 0 0 = 0`).
+
+**Proof state (after this turn):**
+
+* `a = 0` branch — closed via `gcd_stein_a_zero` + `Nat.gcd_zero_left`.
+* `b = 0` branch — closed via `gcd_stein_b_zero` + `Nat.gcd_zero_right`.
+* `a ≠ 0 ∧ b ≠ 0` branch — left as `sorry`.
+
+**Specific stuck sub-goal (main case):** after the boundary cases
+collapse, the goal reduces to proving
+
+  `do { let shift ← tz(m|n); let m ← m >> tz(m); let n ← n >> tz(n);`
+  `     let ⟨m,n⟩ ← outer_loop ⟨m,n⟩; m << shift } = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat))`
+
+  under `a ≠ 0 ∧ b ≠ 0`.  This requires reasoning about three nested
+  `rust_primitives.hax.while_loop` calls (the trailing-zeros loop is
+  invoked four times: on `m|n`, on `m`, on `n`, and inside every outer
+  iteration), each requiring its own Hoare-triple correctness statement
+  plus the `RustM.Triple_iff_BitVec` ladder to peel back to an equation.
+  The classical Stein invariant `2^shift * Nat.gcd m n = Nat.gcd a b`
+  is the proof's core, but stating it requires a `Nat.log2_lowest_bit`
+  / `Nat.maxPowDvd` predicate that the Hax prelude does not expose —
+  and would need to be developed locally first.
+
+**Structural unblocks the next pass would need (in order):**
+
+1. A separately-verified `trailing_zeros_u64_correctness` lemma (the
+   Hoare-triple form of "returns k with 2^k | x and (x >>> k) odd"),
+   then its equation form via `RustM.Triple_iff_BitVec`.  Estimate: a
+   ~80-line proof following the `while_example` template.
+
+2. A `Nat.gcd_stein_step` lemma capturing the algebraic identity
+   `Nat.gcd m n = Nat.gcd (m - n) n` when `m ≥ n`, combined with
+   `Nat.gcd_two_div_two_odd : Nat.gcd (2*k) (2*l+1) = Nat.gcd k (2*l+1)`.
+   These exist in Mathlib's `Mathlib.Data.Nat.GCD.Basic` under names
+   like `Nat.gcd_sub_self_left` and `Nat.Coprime.coprime_dvd_two` — the
+   Hax prelude does not pull them in.
+
+3. Cross-target import of the `while_example`-style two-stage ladder
+   (Stage 1 Hoare triple via `Spec.MonoLoopCombinator.while_loop`,
+   Stage 2 equation via `RustM.Triple_iff_BitVec`) for the *outer*
+   Stein loop.  Would close the main equation once (1) and (2) are
+   available.
+
+4. A `UInt64.shiftLeft_no_overflow_iff` lemma proving `x <<< s` does
+   not overflow when `x.toNat * 2^s.toNat < 2^64`; combine with the
+   loop invariant's `m = Nat.gcd a b / 2^shift` to discharge the final
+   `<<<?`. -/
+theorem gcd_stein_postcondition (a b : u64) :
+    gcd_stein_u64.gcd_stein a b
+      = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat)) := by
+  -- Boundary case: a = 0.  Closed via gcd_stein_a_zero + Nat.gcd_zero_left.
+  by_cases ha : a = 0
+  · subst ha
+    rw [gcd_stein_a_zero]
+    apply congrArg RustM.ok
+    apply UInt64.toNat_inj.mp
+    rw [UInt64.toNat_ofNat_of_lt' (gcd_lt_2_64 0 b)]
+    show b.toNat = Nat.gcd (0 : u64).toNat b.toNat
+    rw [show ((0 : u64).toNat) = 0 from rfl, Nat.gcd_zero_left]
+  -- Boundary case: b = 0.  Closed via gcd_stein_b_zero + Nat.gcd_zero_right.
+  by_cases hb : b = 0
+  · subst hb
+    rw [gcd_stein_b_zero]
+    apply congrArg RustM.ok
+    apply UInt64.toNat_inj.mp
+    rw [UInt64.toNat_ofNat_of_lt' (gcd_lt_2_64 a 0)]
+    show a.toNat = Nat.gcd a.toNat (0 : u64).toNat
+    rw [show ((0 : u64).toNat) = 0 from rfl, Nat.gcd_zero_right]
+  -- Main case: a ≠ 0 ∧ b ≠ 0.  See docstring for the structural unblock.
+  exact sorry
+===
+/-- **Functional correctness (closed form).** For every pair of `u64`
+inputs, `gcd_stein` succeeds and returns the integer gcd of the two
+inputs (computed over `Nat`).  This single equation pins down every
+concrete `known_values` case as well as the `zero_zero_is_zero`
+boundary (`Nat.gcd 0 0 = 0`).
+
+**Proof state (after this turn — retry attempt 2):**
+
+* `a = 0` branch — closed via `gcd_stein_a_zero` + `Nat.gcd_zero_left`.
+* `b = 0` branch — closed via `gcd_stein_b_zero` + `Nat.gcd_zero_right`.
+* `a ≠ 0 ∧ b ≠ 0` branch — left as `sorry`.  All trailing-zero
+  prerequisites (totality + correctness) are now **fully proved** above;
+  the only remaining gap is the *outer Stein loop* invariant +
+  termination + final-shift overflow analysis.
+
+**Specific stuck sub-goal (main case):** after the boundary cases
+collapse and the function is unfolded, the goal is
+
+  `do { let shift ← trailing_zeros_u64 (a ||| b);`
+  `     let m ← a >> trailing_zeros_u64 a;`
+  `     let n ← b >> trailing_zeros_u64 b;`
+  `     let ⟨m, n⟩ ← outer_loop ⟨m, n⟩;`
+  `     m <<? shift }`
+  `   = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat))`
+
+The first three `let` bindings are now mechanical to discharge using
+`trailing_zeros_u64_correctness` proved above (each returns
+`RustM.ok k` for a specific `k`, and after the shifts `m_odd` and
+`n_odd` are odd values such that `m_odd * 2^k_a = a` and
+`n_odd * 2^k_b = b`).  The *outer-loop* call is the remaining
+obstacle: it has the same shape as the trailing-zeros inner loop
+(a `Loop.MonoLoopCombinator.while_loop`) but requires the stronger
+classical Stein invariant
+
+  `Nat.gcd m n = Nat.gcd m_odd n_odd`  (no `2^shift` factor here —
+                                         the shift factor lives in
+                                         the *outer* `shift` variable)
+
+combined with `m, n` both odd (preserved by `m -= n; m >>= tz(m)`).
+
+**Structural unblocks the next pass would need:**
+
+1. **A `tz_loop_triple`-style spec for the outer Stein loop.**  The
+   shape is identical to `tz_loop_triple` above, but the invariant is
+   the Stein-step preservation: under `m, n` both odd and `m ≠ n`,
+   the body produces `m', n'` both odd with
+   `Nat.gcd m'.toNat n'.toNat = Nat.gcd m.toNat n.toNat`.
+
+2. **A `Nat.gcd_stein_step` lemma** capturing
+   `Nat.gcd (m - n) n = Nat.gcd m n` for `m ≥ n` (combine
+   `Nat.gcd_sub_self_left` + commutativity), plus a "halve-by-2 on the
+   even side" lemma `Nat.gcd (2*k) (2*l+1) = Nat.gcd k (2*l+1)`.  These
+   exist in Mathlib as `Nat.gcd_sub_self_left` and `Nat.Coprime`-flavour
+   facts, but the Hax prelude does not pull Mathlib in.  Both can be
+   proved locally from `Nat.gcd_rec`.
+
+3. **A `UInt64.shiftLeft_no_overflow_iff` lemma**: `x <<< s` does not
+   overflow ↔ `x.toNat * 2^s.toNat < 2^64`.  Combine with the loop
+   invariant `m_final = Nat.gcd m_odd n_odd` and
+   `Nat.gcd m_odd n_odd * 2^shift ≤ max(a, b) < 2^64` to discharge the
+   final `<<<? shift`. -/
+theorem gcd_stein_postcondition (a b : u64) :
+    gcd_stein_u64.gcd_stein a b
+      = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat)) := by
+  -- Boundary case: a = 0.  Closed via gcd_stein_a_zero + Nat.gcd_zero_left.
+  by_cases ha : a = 0
+  · subst ha
+    rw [gcd_stein_a_zero]
+    apply congrArg RustM.ok
+    apply UInt64.toNat_inj.mp
+    rw [UInt64.toNat_ofNat_of_lt' (gcd_lt_2_64 0 b)]
+    show b.toNat = Nat.gcd (0 : u64).toNat b.toNat
+    rw [show ((0 : u64).toNat) = 0 from rfl, Nat.gcd_zero_left]
+  -- Boundary case: b = 0.  Closed via gcd_stein_b_zero + Nat.gcd_zero_right.
+  by_cases hb : b = 0
+  · subst hb
+    rw [gcd_stein_b_zero]
+    apply congrArg RustM.ok
+    apply UInt64.toNat_inj.mp
+    rw [UInt64.toNat_ofNat_of_lt' (gcd_lt_2_64 a 0)]
+    show a.toNat = Nat.gcd a.toNat (0 : u64).toNat
+    rw [show ((0 : u64).toNat) = 0 from rfl, Nat.gcd_zero_right]
+  -- Main case: a ≠ 0 ∧ b ≠ 0.
+  -- Pull out the three trailing-zeros applications using the now-proved
+  -- `trailing_zeros_u64_correctness` lemma.  The result is a witness
+  -- for each (shift, k_a, k_b) plus the divisibility / oddness facts.
+  obtain ⟨k_ab, h_tz_ab, h_kab_lt, h_ab_mod, h_ab_odd⟩ :=
+    trailing_zeros_u64_correctness (a ||| b) (by
+      intro h_or_zero
+      -- a ||| b = 0 ⟹ a = 0 and b = 0, contradicting ha or hb.
+      have h_a_or_b_zero : a.toNat ||| b.toNat = 0 := by
+        have : (a ||| b).toNat = (0 : u64).toNat := by rw [h_or_zero]
+        rwa [UInt64.toNat_or] at this
+      have h_a_zero : a.toNat = 0 := by
+        have := Nat.or_eq_zero_iff.mp h_a_or_b_zero
+        exact this.1
+      apply ha
+      apply UInt64.toNat_inj.mp
+      rw [h_a_zero]; rfl)
+  obtain ⟨k_a, h_tz_a, h_ka_lt, h_a_mod, h_a_odd⟩ :=
+    trailing_zeros_u64_correctness a ha
+  obtain ⟨k_b, h_tz_b, h_kb_lt, h_b_mod, h_b_odd⟩ :=
+    trailing_zeros_u64_correctness b hb
+  -- The outer Stein loop and final shift remain.  See the docstring
+  -- "Structural unblocks the next pass would need" for the precise
+  -- additional lemmas required.  The remaining sub-goal — after the
+  -- three trailing-zero `let` bindings are eliminated via h_tz_{ab,a,b}
+  -- — is the equation
+  --   `(rust_primitives.hax.while_loop ... ⟨a>>k_a, b>>k_b⟩ ...
+  --     >>= fun ⟨m, _⟩ => m <<? k_ab) = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat))`
+  -- which is the outer-loop + final-shift correctness.
+  exact sorry
+>>> REPLACE

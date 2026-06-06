@@ -1,0 +1,102 @@
+/// HumanEval/94 / CLEVER 093 — `sum_largest_prime(lst)`.  Find the
+/// largest prime in `lst`; return the sum of its decimal digits.
+/// Return `0` for an empty list or no primes.
+fn is_prime_at(n: u64, d: u64) -> bool {
+    if d * d > n { true }
+    else if n % d == 0 { false }
+    else { is_prime_at(n, d + 1) }
+}
+fn is_prime(n: u64) -> bool {
+    if n < 2 { false } else { is_prime_at(n, 2) }
+}
+
+fn largest_prime_at(l: &[u64], i: usize, best: u64, found: bool) -> (u64, bool) {
+    if i >= l.len() { (best, found) }
+    else if is_prime(l[i]) && (!found || l[i] > best) {
+        largest_prime_at(l, i + 1, l[i], true)
+    } else {
+        largest_prime_at(l, i + 1, best, found)
+    }
+}
+
+fn digit_sum_at(n: u64, acc: u64) -> u64 {
+    if n == 0 { acc } else { digit_sum_at(n / 10, acc + n % 10) }
+}
+
+pub fn sum_largest_prime(lst: &[u64]) -> u64 {
+    let (p, found) = largest_prime_at(lst, 0, 0, false);
+    if !found { 0 } else { digit_sum_at(p, 0) }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // Iterative reference helpers, used only to express the spec in the tests.
+    fn is_prime_ref(n: u64) -> bool {
+        if n < 2 {
+            return false;
+        }
+        let mut d = 2u64;
+        while d.saturating_mul(d) <= n {
+            if n % d == 0 {
+                return false;
+            }
+            d += 1;
+        }
+        true
+    }
+
+    fn digit_sum_ref(mut n: u64) -> u64 {
+        let mut s = 0u64;
+        while n > 0 {
+            s += n % 10;
+            n /= 10;
+        }
+        s
+    }
+
+    // Keep values small so trial-division primality stays cheap.
+    fn small_u64() -> impl Strategy<Value = u64> {
+        0u64..1_000u64
+    }
+
+    fn list_strategy() -> impl Strategy<Value = Vec<u64>> {
+        prop::collection::vec(small_u64(), 0..20)
+    }
+
+    #[test]
+    fn known() {
+        assert_eq!(sum_largest_prime(&[]), 0);
+        assert_eq!(sum_largest_prime(&[4, 6, 8]), 0);
+        assert_eq!(sum_largest_prime(&[2, 3, 5, 7]), 7);    // 7 → 7
+        assert_eq!(sum_largest_prime(&[13, 4, 11]), 1 + 3); // 13 → 4
+    }
+
+    proptest! {
+        /// Contract: if the input contains no primes (in particular if it is
+        /// empty), the result is `0`. Pins down the sentinel/total behaviour
+        /// — the function is not allowed to panic or fabricate a non-zero
+        /// value in this case.
+        #[test]
+        fn prop_no_primes_is_zero(xs in list_strategy()) {
+            prop_assume!(xs.iter().all(|n| !is_prime_ref(*n)));
+            prop_assert_eq!(sum_largest_prime(&xs), 0);
+        }
+
+        /// Contract: when at least one element is prime, the result equals
+        /// the decimal digit sum of the *largest* prime in the list. This
+        /// captures three independent facts at once:
+        ///   * the value comes from an element actually present in `xs`,
+        ///   * that element is prime,
+        ///   * no other prime in `xs` is greater.
+        #[test]
+        fn prop_digit_sum_of_max_prime(xs in list_strategy()) {
+            let max_prime = xs.iter().copied().filter(|n| is_prime_ref(*n)).max();
+            prop_assume!(max_prime.is_some());
+            let p = max_prime.unwrap();
+            prop_assert_eq!(sum_largest_prime(&xs), digit_sum_ref(p));
+        }
+    }
+}

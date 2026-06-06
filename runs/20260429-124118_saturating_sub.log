@@ -1,0 +1,285 @@
+Log: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260429-124118_saturating_sub.log
+Model: claude-opus-4-7
+Attempt logs: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub/attempted_changes/20260429-124118
+Stages: [1, 2, 3, 4]
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] Glob({"pattern": "Cargo.toml"})
+[tool] Read({"file_path": "Cargo.toml"})
+I'll analyze the contract and write property-based tests. Since the input domain is small (`u8 × u8 = 65536` combinations), exhaustive enumeration gives stronger coverage than randomized testing without needing extra dependencies.
+
+**Contract analysis:**
+- **Preconditions:** None — every `(u8, u8)` pair is valid input.
+- **Postconditions (two independent cases):**
+  - When `a > b`: result equals `a - b` (normal subtraction).
+  - When `a <= b`: result is `0` (saturation at zero).
+- **Failure conditions:** Never panics, never overflows — total function on `u8 × u8`.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n}\n===\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    /// Pos... [+2468 chars])
+[tool] run_cargo_test({})
+All 3 tests pass. Here is the summary:
+
+## Contract clauses captured
+
+| Test | Contract clause |
+|------|-----------------|
+| `postcondition_when_a_greater_than_b_result_is_difference` | **Normal-case postcondition:** when `a > b`, returns exactly `a - b`. |
+| `postcondition_when_a_leq_b_result_is_zero` | **Saturation postcondition:** when `a <= b`, returns `0`. (Independent of the normal case — distinguishes saturating from wrapping subtraction.) |
+| `never_panics_on_any_u8_input` | **Totality / failure condition:** there are *no* failure conditions; the function is total on `u8 × u8`. (No panic, no `Option::None`, no `Result::Err`.) |
+
+The input domain (`256 × 256 = 65536`) is small enough to test exhaustively, so the suite avoids needing `proptest`/`quickcheck` and gives complete coverage rather than statistical coverage.
+
+## Properties considered but excluded (and why)
+
+- **`saturating_sub(a, 0) == a`** — derived from the normal-case postcondition (with `b = 0`). Adds no information.
+- **`saturating_sub(0, b) == 0`** — derived from the saturation postcondition (with `a = 0` ⇒ `a <= b`). Adds no information.
+- **`saturating_sub(a, a) == 0`** — derived from the saturation postcondition (with `a <= b` taking equality).
+- **`saturating_sub(a, b) <= a`** (non-increase in first argument) — derived: in case 1, `a - b <= a` is a fact about `u8` subtraction; in case 2, `0 <= a` trivially.
+- **Monotonicity in `a` / antitonicity in `b`** — derived from the two postconditions plus arithmetic on `u8`. Doesn't pin down anything new about the implementation.
+- **Specific edge points** like `(0, 0)`, `(255, 0)`, `(0, 255)`, `(255, 255)` — already covered by the exhaustive sweep in the two postcondition tests.
+- **Comparison against `u8::saturating_sub`** — would test the standard library, not this implementation's contract; also creates a circular spec ("does the same thing as the std version") rather than a semantic one.
+
+Each retained test would catch a class of buggy implementation that the others would miss: swapping the branches, using wrapping arithmetic in the saturation case, or introducing an input that triggers a panic.
+
+make_pbt
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+[tool] Glob({"pattern": "proofs/**/*"})
+[tool] Read({"file_path": "proofs/lean/extraction/saturating_sub.lean"})
+[tool] Glob({"pattern": "**/lakefile.*"})
+[tool] Glob({"pattern": "**/lean-toolchain"})
+## Final Report
+
+### Status of the three criteria
+
+| Check | Result |
+|---|---|
+| `cargo test` | ✅ All 3 tests pass |
+| `cargo hax into lean` | ✅ Exits 0, extracts to `proofs/lean/extraction/saturating_sub.lean` |
+| `lake build` | ❌ Fails — but **not** due to Rust/Hax incompatibility |
+
+### `lake build` failure analysis
+
+```
+error: [root]: no configuration file with a supported extension:
+.../proofs/lean/extraction/lakefile.lean
+.../proofs/lean/extraction/lakefile.toml
+```
+
+This is a **project infrastructure issue**, not a Rust-source or Hax-extraction issue:
+
+- No `lakefile.lean` / `lakefile.toml` exists anywhere in the repo (`Glob` for `**/lakefile.*` and `**/lean-toolchain` both return no files).
+- The directory `proofs/lean/extraction/` only contains the extracted `saturating_sub.lean`.
+- This cannot be fixed by editing `src/lib.rs`.
+
+The skill explicitly forbids editing `.lake/packages/`; here the problem is upstream of that — the Lake project itself has not been initialised. That is outside the rewrite-Rust scope.
+
+### Quality of the extracted Lean
+
+The Hax output is clean and uses only well-supported prelude constructs — no `core_models.*` calls that would require inlining:
+
+```lean
+def saturating_sub (a : u8) (b : u8) : RustM u8 := do
+  if (← (a >? b)) then do (a -? b) else do (pure (0 : u8))
+```
+
+`>?` and `-?` are the standard Hax overflow-checked operators on primitives, which the Hax Lean prelude supports. So **once a lakefile is present, this Lean file should compile without further Rust changes.**
+
+### Changes made to `src/lib.rs`
+
+**None.** The original source
+
+```rust
+pub fn saturating_sub(a: u8, b: u8) -> u8 {
+    if a > b { a - b } else { 0 }
+}
+```
+
+uses only:
+- primitive `u8` arithmetic (`-`),
+- a primitive comparison (`>`),
+- an `if`/`else` returning a primitive literal.
+
+All three are first-class Hax-supported patterns.
+
+### Library calls inlined
+
+None — no `abs`, `pow`, `checked_*`, `wrapping_*`, iterator chains, or other unsupported `std`/`core` methods appear in the source.
+
+### Patterns considered but not changed
+
+- `a - b` is a plain primitive subtraction, guarded by `a > b`. Hax encodes the overflow check via `-?`; no inlining needed.
+- The `if-else` returns the same primitive type on both branches (`u8`), so no monad-mismatch / lifting issue.
+
+### Subtle semantics concerns
+
+None — no edits were made.
+
+### Recommendation
+
+To unblock `lake build`, the project needs a `lakefile.lean` (or `lakefile.toml`) and a `lean-toolchain` in `proofs/lean/extraction/` that depends on the Hax Lean prelude. That is a project-setup task, not a Rust rewrite task, so it falls outside this skill's mandate.
+
+rust_hax_lean
+[scaffold] could not parse package name from /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/proofs/lean/extraction/lakefile.toml; skipping
+[tool] Read({"file_path": "proofs/lean/extraction/saturating_subObligations.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/**/*Obligations*"})
+[tool] Glob({"pattern": "proofs/lean/extraction/*"})
+[tool] Glob({"pattern": "proofs/lean/**/lakefile*"})
+[tool] Glob({"pattern": "proofs/**/*"})
+[tool] Glob({"pattern": "**/lakefile*"})
+[tool] Glob({"pattern": "**/*.toml"})
+[tool] Glob({"pattern": "**/Hax*"})
+[tool] Glob({"pattern": "**/.lake/**"})
+[tool] Glob({"pattern": "**/Hax.lean"})
+[tool] Glob({"pattern": "**/*.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/saturating_sub.lean"})
+Let me write the obligations file. First, I'll create it with sensible theorem statements covering the three contract clauses.
+[tool] write_working_file({"path": "proofs/lean/extraction/saturating_subObligations.lean", "content": "-- Obligations for the `saturating_sub` crate.\n-- Each theorem captures one indep... [+1411 chars])
+[tool] run_lake_build({})
+The lake build fails because the lakefile is missing in this environment. The task instructions say the lakefile is pre-registered, so this appears to be a setup discrepancy I can't fix (and am told not to modify `lakefile.toml`). Let me ensure the obligations file itself is well-formed and review the theorem statements.
+[tool] Read({"file_path": "proofs/lean/extraction/saturating_subObligations.lean"})
+## Final output
+
+**File edited:** `proofs/lean/extraction/saturating_subObligations.lean` (created — the pre-registration step in this environment did not produce it, so I wrote it from scratch matching the imports/options used in the extracted module).
+
+**Theorems added** (one per independent contract clause):
+
+| Theorem | Contract clause |
+|---|---|
+| `saturating_sub_postcondition_normal` | **Postcondition (normal case)** — when `b < a`, the result is exactly `a - b`. |
+| `saturating_sub_postcondition_saturating` | **Postcondition (saturation case)** — when `a ≤ b`, the result is `0`. |
+| `saturating_sub_total` | **Failure-condition (negative)** / **totality** — for every `(a, b) : u8 × u8`, the function returns a `pure` value (no panic). Captures saturating arithmetic's "no failure mode" guarantee. |
+
+**Properties intentionally not turned into theorems:** None of the three proptests was skipped — each captures a genuinely independent claim.
+
+I considered, and decided *not* to add, a few derived facts that the proptests do not raise but a reader might:
+
+- `saturating_sub a b ≤ a` (result never exceeds `a`) — derivable from the two postcondition theorems plus arithmetic; pure mathematics about the result, no extra verification value.
+- `b < a → saturating_sub a b > 0` and `a = b → saturating_sub a b = 0` — special cases of the postconditions.
+- Monotonicity in `a` (e.g. `a ≤ a' → saturating_sub a b ≤ saturating_sub a' b`) — derivable from the postconditions.
+
+**Uncertainty:** I could not run `lake build` to confirm well-typedness — the working directory is missing `lakefile.toml`/`lakefile.lean`, so `cargo hax → lake` validation cannot complete here. Given that, the statements I'm least certain about are:
+
+- The equality form `saturating_sub a b = pure (a - b)` assumes `a -? b` reduces to `pure (a - b)` whenever `b < a` (i.e. that Hax's checked subtraction returns `pure` of the natural Lean `u8` difference in the no-underflow case). This is the conventional reduction, but if the Hax prelude in your tree uses a different `RustM`-injection (e.g. `RustM.ok` rather than `pure`), the statements may need to be rewritten as `… = RustM.ok (a - b)`.
+- `saturating_sub_total` uses `∃ v, saturating_sub a b = pure v` to express no-panic; if `RustM` is not exposed via a `Pure` instance whose `pure` is the success constructor, this statement may need to be rephrased (e.g. `∃ v, saturating_sub a b = RustM.ok v`).
+
+Both are statement-shape concerns, not proof concerns; the next pipeline stage (proof) should flag them quickly if the prelude names differ.
+
+make_lean_obligations
+[tool] Glob({"pattern": "**/Hax.lean"})
+[tool] Glob({"pattern": "**/lakefile*"})
+[tool] Glob({"pattern": "**/*.lean"})
+[tool] Glob({"pattern": "**/Hax/**"})
+[tool] Glob({"pattern": "**/proof-libs/**"})
+[tool] Glob({"pattern": "proofs/**"})
+[tool] run_lake_build({})
+[tool] Glob({"pattern": "**/*.toml"})
+[tool] Glob({"pattern": "**/lean-toolchain"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/Cargo.toml"})
+[tool] Glob({"pattern": "**/*.lean", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6"})
+[tool] Glob({"pattern": "**/lakefile*", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/lakefile.toml"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/SquareObligations*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub/proofs/**/*.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/SquareObligations.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/square.lean"})
+Now let me look at the key Hax prelude files to understand the operators:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/.lake/packages/Hax/hax-l... [+29 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+39 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/.lake/packages/Hax/hax-l... [+45 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+48 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/.lake/packages/Hax/hax-l... [+51 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/.lake/packages/Hax/hax-l... [+56 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/.lake/packages/Hax/hax-l... [+49 chars])
+Let me look at some existing example proofs for similar patterns:
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/min_modified/proofs/lean/extraction/*Obligations*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/clamp_modified/proofs/lean/extraction/*Obligations*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/is_zero_modified/proofs/lean/extraction/*Obligations*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/add_one_modified/proofs/lean/extraction/*Obligations*.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/min_modified/proofs/lean/extraction/MinObligations.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/clamp_modified/proofs/lean/extraction/ClampObligations.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/min_modified/proofs/lean/extraction/min.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/clamp_modified/proofs/lean/extraction/clamp.lean"})
+Let me check the existing lakefile pattern more carefully to understand if I need to create one:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/min_modified/proofs/lean/extraction/lakefile.toml"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/clamp_modified/proofs/lean/extraction/lakefile.toml"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/add_one_modified/proofs/lean/extraction/lakefile.toml"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/add_one_modified/proofs/lean/extraction/Add_oneObligations.lean... [+2 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/**/*Obligations*"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/**/*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/**/*", "path": "/Users/tobiaskrogh/Deskto... [+82 chars])
+The lakefile is missing. Let me create it following the pattern from existing examples:
+[tool] write_working_file({"path": "proofs/lean/extraction/lakefile.toml", "content": "name = \"saturating_sub\"\nversion = \"0.1.0\"\ndefaultTargets = [\"saturating_sub\", \"saturating_... [+404 chars])
+[tool] run_lake_build({})
+Now lake build works. Let me write the proofs. Let me first try a straightforward approach:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/saturating_subObligations.lean", "patch": "<<< SEARCH\n/-- Postcondition (normal case): when `b < a`, the function returns `a -... [+3099 chars])
+[tool] run_lake_build({})
+Let me explore the prelude to understand the lemma names:
+[tool] Grep({"pattern": "usubOverflow", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/.l... [+74 chars])
+[tool] Grep({"pattern": "UInt8.subOverflow", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extracti... [+79 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/square_modified/proofs/lean/extraction/.lake/packages/Hax/hax-l... [+62 chars])
+Let me look at how the `do` notation desugars, by checking a simpler test:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/proofs/lean/extraction/saturating_subOb... [+16 chars])
+Let me try a different, simpler approach using mvcgen and the existing pattern:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/saturating_subObligations.lean", "patch": "<<< SEARCH\n/-- Postcondition (normal case): when `b < a`, the function returns `a -... [+4538 chars])
+[tool] run_lake_build({})
+[tool] Grep({"pattern": "UInt8.lt_iff_toNat_lt|UInt8.toNat_toBitVec|UInt8.toBitVec_toNat", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pi... [+133 chars])
+[tool] Grep({"pattern": "lt_iff_toNat_lt", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/proofs/lean/ex... [+81 chars])
+[tool] Grep({"pattern": "UInt8.lt|toNat.*lt", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/proofs/lean... [+155 chars])
+[tool] Grep({"pattern": "subOverflow_iff", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/proofs/lean/ex... [+85 chars])
+[tool] Grep({"pattern": "def BitVec.usubOverflow|theorem BitVec.usubOverflow", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/sa... [+99 chars])
+[tool] Grep({"pattern": "usubOverflow_eq", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/proofs/lean/ex... [+63 chars])
+[tool] Grep({"pattern": "usubOverflow|subOverflow", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/proof... [+128 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/proofs/lean/extraction/.lake/packages/H... [+56 chars])
+Let me look at the actual tactic state by trying a minimal approach first:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/saturating_subObligations.lean", "patch": "<<< SEARCH\n/-- Postcondition (normal case): when `b < a`, the function returns `a -... [+4988 chars])
+[tool] run_lake_build({})
+[tool] Grep({"pattern": "UInt8.lt_iff_toNat_lt|UInt8.le_iff_toNat_le", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating... [+109 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/saturating_subObligations.lean", "patch": "<<< SEARCH\n/-- Postcondition (saturation case): when `a \u2264 b`, the function ret... [+1723 chars])
+[tool] run_lake_build({})
+Lake build now succeeds with no warnings or errors. Let me verify the final state of the file:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/saturating_sub_modified/proofs/lean/extraction/saturating_subOb... [+16 chars])
+All three theorems are now proven. The build is clean — no warnings, no errors, no `sorry` placeholders. Here is the summary.
+
+## Final output
+
+### Files changed
+
+1. **`proofs/lean/extraction/lakefile.toml`** — created. The pipeline did not pre-register a lakefile in this `_modified` working tree (only the unmodified `saturating_sub` and the other `*_modified` crates had one), so `lake build` failed with `no configuration file with a supported extension`. The new file follows the exact pattern of the other `*_modified` crates (`min_modified/lakefile.toml`, `clamp_modified/lakefile.toml`, …), declaring the `saturating_sub` and `saturating_subObligations` lean libs and pulling Hax from `cryspen/hax` `hax-lib/proof-libs/lean@main`. The first build cloned `Hax` and `Qq` into `.lake/packages/`.
+
+2. **`proofs/lean/extraction/saturating_subObligations.lean`** — replaced all three `sorry` placeholders with proofs. No imports added, no theorem statements changed.
+
+### Sub-goals and how they were resolved
+
+The function is
+```lean
+def saturating_sub (a b : u8) : RustM u8 := do
+  if (← (a >? b)) then do (a -? b) else do (pure (0 : u8))
+```
+which after unfolding `>?` (`rust_primitives.cmp.gt`) and `-?` (`rust_primitives.ops.arith.Sub.sub`) reduces to
+```
+if (decide (a > b)) then
+  (if BitVec.usubOverflow a.toBitVec b.toBitVec then RustM.fail … else pure (a-b))
+else pure 0
+```
+(the bind on `pure (decide …)` collapses via `LawfulMonad`).
+
+**`saturating_sub_postcondition_normal` (`b < a → … = pure (a-b)`).** The hard sub-goal was discharging the inner `BitVec.usubOverflow a.toBitVec b.toBitVec`. My first attempt rewrote `simp [BitVec.usubOverflow]` and called `omega`, but `omega` couldn't bridge `a.toBitVec.toNat` with `UInt8.toNat a`. **Resolution:** use `show ¬ (UInt8.subOverflow a b = true)` to convert via definitional equality (`UInt8.subOverflow` *is* `BitVec.usubOverflow … .toBitVec …`), then rewrite with `UInt8.subOverflow_iff` (giving `a.toNat < b.toNat`), and combine with `UInt8.lt_iff_toNat_lt.mp h` to feed `omega`. The outer branch is closed by `simp [hgt, hno_overflow]`.
+
+**`saturating_sub_postcondition_saturating` (`a ≤ b → … = pure 0`).** First attempt used `lt_of_lt_of_le` / `lt_irrefl` / `push_neg` / `le_of_not_lt` — all Mathlib names, none available in this Hax-only environment. **Resolution:** drop to `UInt8.lt_iff_toNat_lt` + `UInt8.le_iff_toNat_le` and let `omega` handle the contradiction. A subtler issue: passing `hgt : a > b` directly into `UInt8.lt_iff_toNat_lt.mp` failed because Lean unified `a > b` against the lemma's `?a < ?b` literally rather than the unfolded `b < a`; introducing `have hba : b < a := hgt` makes the direction explicit and the `.mp` call type-checks.
+
+**`saturating_sub_total` (`∃ v, … = pure v`).** Reduced to the previous two via `by_cases h : b < a`. The negative branch needed `¬ (b < a) → a ≤ b` for `UInt8`. Without Mathlib's `le_of_not_lt`, this is proved by routing through `toNat`: `UInt8.le_iff_toNat_le.mpr` after deriving `a.toNat ≤ b.toNat` from `¬ (b.toNat < a.toNat)` via `omega`.
+
+### Obligations left unproved
+
+None. All three theorems compile without `sorry` and `lake build` is clean (95/95 jobs, no warnings).
+
+### Notes
+
+- The obligations agent's stated uncertainty about `pure (a - b)` vs `RustM.ok (a - b)` was unfounded: in `Hax/rust_primitives/RustM.lean`, `RustM.ok v` is defined as `@[reducible, match_pattern]` equal to `some (.ok v)`, and the `Monad RustM` instance is inherited from `ExceptT Error Option` whose `pure` is the same `some (.ok ·)`. So `pure v = RustM.ok v` definitionally, and the equational-form statements went through unchanged.
+- No theorem statements were modified.
+
+make_proof
+Stage notes: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260429-124118_saturating_sub_stage_notes.json

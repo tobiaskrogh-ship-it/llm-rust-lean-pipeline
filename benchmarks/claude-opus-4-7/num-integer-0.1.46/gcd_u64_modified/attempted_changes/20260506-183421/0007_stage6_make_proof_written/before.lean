@@ -1,0 +1,89 @@
+-- Companion obligations file for the `gcd_u64` extraction.
+-- Each property the Rust function should satisfy belongs here as a separate `theorem`.
+-- Proofs use `sorry` placeholders at this stage; they are filled in by the proof stage.
+
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+import gcd_u64
+
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+
+namespace Gcd_u64Obligations
+
+/-- Totality / no-failure: `gcd` is total on the entire `(u64, u64)` domain.
+    The contract documents this explicitly: "no panics, and the result is
+    bounded by `max(x, y)` so `m << shift` cannot overflow". This is the
+    independent failure-mode clause — every property test below assumes a
+    successful return; this theorem guarantees one exists. -/
+theorem gcd_total (x y : u64) :
+    ∃ v : u64, gcd_u64.gcd x y = RustM.ok v := by
+  sorry
+
+/-- Postcondition (Z-left): `gcd(0, y) = y`.
+
+    Captured by the `prop_gcd_zero_cases` test which asserts
+    `gcd(0, x) = x` for every `x` in `0..=255` plus the `u64::MAX`
+    spot check. The implementation realises this via the early-return
+    `if m == 0 || n == 0 then m | n` path (here `0 | y = y`). -/
+theorem gcd_zero_left (y : u64) :
+    gcd_u64.gcd 0 y = RustM.ok y := by
+  sorry
+
+/-- Postcondition (Z-right): `gcd(x, 0) = x`.
+
+    Captured by the `prop_gcd_zero_cases` test which asserts
+    `gcd(x, 0) = x` for every `x` in `0..=255` plus the `u64::MAX`
+    spot check, and subsumes the `gcd(0, 0) = 0` boundary at `x = 0`.
+    The implementation realises this via the early-return path
+    (here `x | 0 = x`). -/
+theorem gcd_zero_right (x : u64) :
+    gcd_u64.gcd x 0 = RustM.ok x := by
+  sorry
+
+/-- Postcondition (D-x): the result divides the first input.
+
+    Captured by the `prop_gcd_divides_both` test which asserts
+    `x % g == 0` whenever `g != 0` (and forces `x = y = 0` when
+    `g == 0`). Stated at the `Nat` level via `Nat.dvd`, which has
+    `0 ∣ 0` true and `0 ∣ n` false for `n > 0`, so the convention
+    `gcd(0, 0) = 0` is consistent with this clause. -/
+theorem gcd_divides_x (x y : u64) :
+    ⦃ ⌜ True ⌝ ⦄
+      gcd_u64.gcd x y
+    ⦃ ⇓ g => ⌜ g.toNat ∣ x.toNat ⌝ ⦄ := by
+  sorry
+
+/-- Postcondition (D-y): the result divides the second input.
+
+    Captured by the `prop_gcd_divides_both` test (same clause as
+    `gcd_divides_x` but for `y`). Independent because an
+    implementation could divide one input but not the other. -/
+theorem gcd_divides_y (x y : u64) :
+    ⦃ ⌜ True ⌝ ⦄
+      gcd_u64.gcd x y
+    ⦃ ⇓ g => ⌜ g.toNat ∣ y.toNat ⌝ ⦄ := by
+  sorry
+
+/-- Postcondition (G): every common divisor of `x` and `y` divides
+    the result — i.e. the result is the *greatest* common divisor.
+
+    Captured by the `prop_gcd_is_greatest` test, which iterates over
+    every candidate `d ∈ 1..=64` and checks `g % d == 0` whenever
+    `d` is a common divisor of `x, y`. The Lean statement quantifies
+    over all `d : u64` rather than a finite range, since the
+    contract clause is `∀ d, d | x ∧ d | y → d | g`.
+    Independent of (D): an implementation returning `1` would
+    satisfy (D) but fail (G). -/
+theorem gcd_is_greatest (x y d : u64) :
+    ⦃ ⌜ d.toNat ∣ x.toNat ∧ d.toNat ∣ y.toNat ⌝ ⦄
+      gcd_u64.gcd x y
+    ⦃ ⇓ g => ⌜ d.toNat ∣ g.toNat ⌝ ⦄ := by
+  sorry
+
+end Gcd_u64Obligations

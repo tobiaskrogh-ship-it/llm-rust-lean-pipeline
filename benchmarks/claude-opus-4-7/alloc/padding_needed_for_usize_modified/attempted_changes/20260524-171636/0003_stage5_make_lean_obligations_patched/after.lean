@@ -1,0 +1,94 @@
+-- Companion obligations file for the `padding_needed_for_usize` extraction.
+-- Each property the Rust function should satisfy belongs here as a separate `theorem`.
+-- Proofs use `sorry` placeholders at this stage; they are filled in by the proof stage.
+
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+import padding_needed_for_usize
+
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+
+namespace Padding_needed_for_usizeObligations
+
+open padding_needed_for_usize
+
+/-- Failure-mode clause: when `align` is not a power of two (as decided by
+    the helper `is_power_of_two_usize`), the function returns the inlined
+    `usize::MAX = 2 ^ 64 - 1` regardless of `size`. Captures the property
+    test `prop_non_power_of_two_returns_max`, which sweeps every
+    non-power-of-two `align ∈ 0..256` (including `0` and the odd values
+    `3`, `5`, `6`, …) with every size `0..256`. A buggy implementation
+    that produced a smaller result for some non-power-of-two align would
+    falsify this. -/
+theorem padding_needed_for_non_power_of_two
+    (size align : usize)
+    (h : is_power_of_two_usize align = RustM.ok false) :
+    padding_needed_for size align
+      = RustM.ok (18446744073709551615 : usize) := by
+  sorry
+
+/-- Postcondition (alignment): when `align` is a power of two and the
+    inputs fit in the safe range `size + align ≤ 2 ^ 64`, the function
+    returns some `p : usize` such that `size + p` is a multiple of
+    `align`, i.e. the address following the `size`-byte block is aligned
+    to `align`. Captures the property test `prop_result_aligns_size_up`
+    (which sweeps `align ∈ {1, 2, 4, …, 2^15}` and `size ∈ 0..1000` —
+    well within the no-overflow envelope).
+
+    The bound `size.toNat + align.toNat ≤ 2 ^ 64` is the no-overflow
+    guard for the internal `size +? (align - 1)` step; for power-of-two
+    `align ≤ 2^63` this is implied by `size.toNat ≤ 2^63`, which is
+    the implicit precondition of the standard `Layout` API. -/
+theorem padding_needed_for_aligns_size_up
+    (size align : usize)
+    (hpow : is_power_of_two_usize align = RustM.ok true)
+    (hbound : size.toNat + align.toNat ≤ 2 ^ 64) :
+    ∃ p : usize, padding_needed_for size align = RustM.ok p ∧
+                  (size.toNat + p.toNat) % align.toNat = 0 := by
+  sorry
+
+/-- Postcondition (minimality): under the same preconditions, the
+    returned padding `p` is strictly smaller than `align`. Captures the
+    property test `prop_padding_is_minimal`. Independent of the
+    alignment clause: together they pin down `p` as the smallest
+    non-negative offset such that `size + p` is a multiple of `align`
+    (a result that overshoots by a whole `align` block would satisfy
+    the alignment clause but fail this one). -/
+theorem padding_needed_for_minimal
+    (size align : usize)
+    (hpow : is_power_of_two_usize align = RustM.ok true)
+    (hbound : size.toNat + align.toNat ≤ 2 ^ 64) :
+    ∃ p : usize, padding_needed_for size align = RustM.ok p ∧
+                  p.toNat < align.toNat := by
+  sorry
+
+/-- Totality / no-panic: the function returns successfully whenever the
+    non-power-of-two branch fires (any `align`, any `size`) or the
+    power-of-two branch's safe range `size + align ≤ 2 ^ 64` holds.
+
+    The non-pow-of-two branch returns the inlined `usize::MAX` directly,
+    with no partial operations. In the pow-of-two branch the partial
+    operators (`align -? 1`, `size +? align_m1`, `~? align_m1`, `&&&?`,
+    `len_rounded_up -? size`) are all safe under the precondition:
+    `align ≥ 1` from the power-of-two characterization makes
+    `align - 1` non-underflowing; `hbound` makes `size + align_m1`
+    non-overflowing; `~?` and `&&&?` are total bitwise operators; and
+    the bit-mask round-up satisfies `len_rounded_up ≥ size` (the
+    explicit Rust source comment "cannot overflow because the
+    rounded-up value is never less than `size`"), so the final
+    subtraction is safe. Captures the implicit "no panic" totality
+    contract exercised by every property test. -/
+theorem padding_needed_for_total
+    (size align : usize)
+    (hbound : is_power_of_two_usize align = RustM.ok true
+              → size.toNat + align.toNat ≤ 2 ^ 64) :
+    ∃ p : usize, padding_needed_for size align = RustM.ok p := by
+  sorry
+
+end Padding_needed_for_usizeObligations

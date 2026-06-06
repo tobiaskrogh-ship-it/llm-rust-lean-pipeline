@@ -1,0 +1,92 @@
+<<< SEARCH
+  · -- Non-empty branch. Substantive attempt: unfold the function body
+    -- and reduce the boilerplate. The stuck sub-goal is documented below
+    -- the simp.
+    unfold clever_004_mean_absolute_deviation.mean_absolute_deviation at h
+    simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+               rust_primitives.hax.cast_op, pure_bind] at h
+    -- After this reduction `h` has the shape
+    --   `(do let b ← (USize64.toInt64 size) ==? 0; if b then pure 0 else <else>) = ok r`
+    -- where the inner bind on `(_ ==? 0)` reduces to `pure (n == 0)` and
+    -- the surrounding `>>=` then unfolds to a simple `if`. To take the
+    -- non-empty branch we need to discharge `n.toInt ≠ 0` from
+    -- `s.val.size ≠ 0`, which goes through the cast lemma
+    --   `(USize64.toInt64 (USize64.ofNat size)).toInt = 0 ↔ size = 0`.
+    -- The forward direction is `size < 2^64 ⇒ Nat.toInt64 size = 0
+    -- only if size = 0` — straightforward but not packaged as a single
+    -- prelude lemma.
+    --
+    -- Stuck sub-goal: pinning down the `(_ ==? 0)` Boolean reduction
+    -- in `h`. With `simp` unable to fully normalise the `BEq` instance
+    -- through to `decide (n.toInt = 0)` in one step, the next move
+    -- requires either (a) a manual `show` rewriting `==?` to its
+    -- definition and threading the cast-zero-iff-size-zero argument, or
+    -- (b) adding a local helper
+    --     `i64_beq_zero_iff : ∀ x : i64, (x == 0) = decide (x.toInt = 0)`
+    -- and bridging.
+    --
+    -- Structural unblock: a separately-proved
+    --     `usize_cast_to_i64_toInt_eq : ∀ n, n < 2^64 →
+    --        (USize64.toInt64 (USize64.ofNat n)).toInt = if n < 2^63 then n else n - 2^64`
+    -- in the Hax prelude (or as a local lemma backed by `BitVec` reasoning)
+    -- would close the entire non-empty branch by chaining `sum_from_spec`,
+    -- `i64_div_toInt`, `abs_dev_sum_from_spec`, `i64_div_toInt`, and a
+    -- final algebraic identity to `mad_int s`.
+    sorry
+===
+  · -- Non-empty branch. Substantive attempt: unfold the function body,
+    -- case-split on whether the cast `n = 0` (as i64), decompose the
+    -- sum_from + division + abs_dev_sum_from + division chain, and apply
+    -- the spec lemmas.
+    unfold clever_004_mean_absolute_deviation.mean_absolute_deviation at h
+    simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+               rust_primitives.hax.cast_op, rust_primitives.cmp.eq, pure_bind] at h
+    by_cases hn_eq : USize64.toInt64 (USize64.ofNat s.val.size) = (0 : i64)
+    · -- n = 0 (as i64): function returns 0; mad_int also returns 0.
+      have h_beq : (USize64.toInt64 (USize64.ofNat s.val.size) == (0 : i64)) = true := by
+        rw [beq_iff_eq]; exact hn_eq
+      rw [h_beq] at h
+      simp only [↓reduceIte] at h
+      have h_pure : (pure (0 : i64) : RustM i64) = RustM.ok 0 := rfl
+      rw [h_pure] at h
+      injection h with h1
+      injection h1 with h2
+      subst h2
+      rw [i64_zero_toInt]
+      unfold mad_int
+      have h_n_int : (USize64.toInt64 (USize64.ofNat s.val.size)).toInt = 0 := by
+        rw [hn_eq]; decide
+      simp only [h_n_int, ↓reduceIte]
+    · -- n ≠ 0 (as i64): function does the divisions.
+      have h_beq : (USize64.toInt64 (USize64.ofNat s.val.size) == (0 : i64)) = false := by
+        rw [beq_eq_false_iff_ne]; exact hn_eq
+      rw [h_beq] at h
+      simp only [Bool.false_eq_true, ↓reduceIte] at h
+      -- Decompose the sum_from / division / abs_dev_sum_from / division chain.
+      obtain ⟨sum, h_sum_ok, h⟩ := (RustM_bind_ok_iff _ _ _).mp h
+      obtain ⟨mean, h_mean_ok, h⟩ := (RustM_bind_ok_iff _ _ _).mp h
+      obtain ⟨abs_dev, h_abs_dev_ok, h_r⟩ := (RustM_bind_ok_iff _ _ _).mp h
+      -- Apply spec lemmas: sum.toInt = slice_tail_sum_int s 0, etc.
+      have h_sum_toInt : sum.toInt = slice_tail_sum_int s 0 :=
+        sum_from_spec s 0 sum h_sum_ok
+      have h_mean_toInt :
+          mean.toInt = sum.toInt.tdiv (USize64.toInt64 (USize64.ofNat s.val.size)).toInt :=
+        i64_div_toInt _ _ _ h_mean_ok
+      have h_abs_dev_toInt :
+          abs_dev.toInt = slice_tail_abs_dev_sum_int s mean.toInt 0 :=
+        abs_dev_sum_from_spec s mean 0 abs_dev h_abs_dev_ok
+      have h_r_toInt :
+          r.toInt = abs_dev.toInt.tdiv (USize64.toInt64 (USize64.ofNat s.val.size)).toInt :=
+        i64_div_toInt _ _ _ h_r
+      -- `n.toInt ≠ 0` follows from `n ≠ 0` and `toInt` injectivity.
+      have h_n_int_ne : (USize64.toInt64 (USize64.ofNat s.val.size)).toInt ≠ 0 := by
+        intro h_eq
+        apply hn_eq
+        have h2 : (USize64.toInt64 (USize64.ofNat s.val.size)).toInt = (0 : i64).toInt := by
+          rw [h_eq, i64_zero_toInt]
+        exact Int64.toInt_inj.mp h2
+      -- Assemble: rewrite r.toInt and unfold mad_int.
+      rw [h_r_toInt, h_abs_dev_toInt, h_mean_toInt, h_sum_toInt]
+      show abs_dev.toInt.tdiv _ = mad_int s
+      sorry
+>>> REPLACE

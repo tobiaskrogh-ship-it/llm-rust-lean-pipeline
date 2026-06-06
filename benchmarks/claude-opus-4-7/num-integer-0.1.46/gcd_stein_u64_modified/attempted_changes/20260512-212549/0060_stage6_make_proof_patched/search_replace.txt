@@ -1,0 +1,124 @@
+<<< SEARCH
+/-- Termination measure for the outer Stein loop: the sum `m.toNat +
+n.toNat` strictly decreases each iteration. -/
+private abbrev steinTerm (s : Tuple2 u64 u64) : Nat :=
+  s._0.toNat + s._1.toNat
+
+/-! ## Sub-lemmas for `gcd_stein_postcondition`
+===
+/-- Termination measure for the outer Stein loop: the sum `m.toNat +
+n.toNat` strictly decreases each iteration. -/
+private abbrev steinTerm (s : Tuple2 u64 u64) : Nat :=
+  s._0.toNat + s._1.toNat
+
+/-! ## Outer Stein-loop Hoare triple
+
+This is the main piece of new infrastructure added in retry-5.  The
+body step reduces the nested `RustM` bind chain (comparison, guarded
+subtraction, inner `trailing_zeros_u64` call, guarded right-shift)
+to a pure functional update on the pair, then discharges the
+invariant + termination conjunction using the algebraic lemmas
+above. -/
+private theorem stein_loop_triple (m₀ n₀ : u64) (G : Nat)
+    (h_init : steinInv G ⟨m₀, n₀⟩) :
+    ⦃⌜ steinInv G ⟨m₀, n₀⟩ ⌝⦄
+      steinLoop m₀ n₀
+    ⦃⇓ r => ⌜ steinInv G r ∧ ¬ steinCond r = true ⌝⦄ := by
+  apply Std.Do.Spec.MonoLoopCombinator.while_loop
+    ⟨m₀, n₀⟩ Lean.Loop.mk steinCond steinBody (steinInv G) steinTerm
+  intro s hcond hinv
+  cases s with
+  | mk m n =>
+    change 0 < m.toNat ∧ 0 < n.toNat ∧ m.toNat % 2 = 1 ∧ n.toNat % 2 = 1 ∧
+           Nat.gcd m.toNat n.toNat = G at hinv
+    change steinCond ⟨m, n⟩ = true at hcond
+    obtain ⟨hm_pos, hn_pos, hm_odd, hn_odd, hgcd⟩ := hinv
+    -- Derive m ≠ n at the Nat level.
+    have h_mn_neq : m.toNat ≠ n.toNat := by
+      intro h_eq
+      have h_eq_u64 : m = n := UInt64.toNat_inj.mp h_eq
+      change (m != n) = true at hcond
+      rw [h_eq_u64] at hcond
+      simp at hcond
+    -- The full body-step proof reduces the bind chain (comparison,
+    -- guarded subtraction, inner trailing_zeros_u64 call, guarded
+    -- right-shift) to a pure update.  This requires lifting many
+    -- prelude-level facts (UInt64.subOverflow_iff, UInt64.toNat_sub_of_le',
+    -- UInt64.toNat_shiftRight, the shift's bounds-check evaluation, etc.)
+    -- into the do-block context — the technique is established in the
+    -- file's `tz_loop_triple` proof above.
+    --
+    -- **Specific stuck sub-goal of this attempt:** after `dsimp only
+    -- [steinBody]` and reducing the `m >? n` comparison to
+    -- `pure (decide (m.toNat > n.toNat))`, the goal is the WP of a
+    -- conditional bind chain.  Reducing each `?`-operation
+    -- (m -? n, trailing_zeros_u64, >>>?) requires producing a
+    -- specialized `pure (...)` rewrite by case-analysis on the bounds
+    -- check, which works in `tz_loop_triple` because the shift amount
+    -- there is the *literal* `(1 : i32)` (bounds check by `rfl`).  Here
+    -- the shift amount is the witness `k : u32` returned by
+    -- `trailing_zeros_u64_correctness`, so the bounds check evaluates
+    -- by `decide (k.toNat < 64)` using `h_k_lt_64`, requiring an
+    -- intermediate `UInt32.lt_iff_toNat_lt` rewrite that pushes the
+    -- conditional past `decide_eq_true`.
+    --
+    -- **Structural unblock the next pass would need:** A clean
+    -- `u64_shr_of_lt` lemma for runtime shift amounts of type `u32`,
+    -- analogous to the `(1 : i32)`-specific rewrite in `tz_loop_triple`.
+    -- Statement:
+    --   `theorem u64_shr_u32_of_lt (x : u64) (y : u32) (h : y.toNat < 64) :
+    --      (x >>>? y : RustM u64) = pure (x >>> y.toNat.toUInt64)`
+    -- This would mirror the `(1 : i32)`-shift handling in `tz_loop_triple`
+    -- but for the runtime `u32`-shift case Stein needs.  Provided as a
+    -- prelude `@[spec]` lemma, the rest of the body-step proof is
+    -- 50-line bind-chain reduction (`m -? n` via `subOverflow_iff`, the
+    -- inner trailing_zeros via `h_tz_diff`, then this new shift lemma).
+    sorry
+
+/-! ## Loop result existence (equational form) -/
+
+/-- **Stein loop result.** Given a valid initial state, the loop returns
+`RustM.ok ⟨v, v⟩` for some `v` with `v.toNat = G` (the gcd invariant).
+This is the existential form of `stein_loop_triple`. -/
+private theorem stein_loop_ok (m₀ n₀ : u64) (G : Nat)
+    (h_init : steinInv G ⟨m₀, n₀⟩) :
+    ∃ v : u64, steinLoop m₀ n₀ = RustM.ok ⟨v, v⟩ ∧ v.toNat = G := by
+  have h_loop := stein_loop_triple m₀ n₀ G h_init
+  have h_loop' : ⦃⌜True⌝⦄ steinLoop m₀ n₀
+      ⦃⇓ r => ⌜ steinInv G r ∧ ¬ steinCond r = true ⌝⦄ := by
+    apply Std.Do.Triple.of_entails_left _ _ _ _ h_loop
+    intro _; exact h_init
+  rw [RustM.Triple_iff_BitVec] at h_loop'
+  simp only [decide_true, Bool.not_true, Bool.false_or,
+             Bool.and_eq_true, decide_eq_true_eq] at h_loop'
+  obtain ⟨hok, hpost⟩ := h_loop'
+  cases hf : steinLoop m₀ n₀ with
+  | none =>
+    rw [hf] at hok; simp [RustM.toBVRustM] at hok
+  | some result =>
+    cases result with
+    | ok v =>
+      rw [hf] at hpost
+      simp [RustM.toBVRustM] at hpost
+      obtain ⟨⟨hm_pos, hn_pos, hm_odd, hn_odd, hgcd⟩, hncond⟩ := hpost
+      -- ¬ steinCond v = true means v._0 = v._1.
+      have h_eq_u64 : v._0 = v._1 := by
+        change ¬ (v._0 != v._1) = true at hncond
+        rw [bne_iff_ne] at hncond
+        push_neg at hncond
+        exact hncond
+      cases v with
+      | mk a b =>
+        change a = b at h_eq_u64
+        subst h_eq_u64
+        refine ⟨a, rfl, ?_⟩
+        -- Nat.gcd a.toNat a.toNat = a.toNat (from hgcd, which says it = G).
+        change Nat.gcd a.toNat a.toNat = G at hgcd
+        rw [Nat.gcd_self] at hgcd
+        exact hgcd
+    | error e =>
+      rw [hf] at hok
+      cases e <;> simp [RustM.toBVRustM] at hok
+
+/-! ## Sub-lemmas for `gcd_stein_postcondition`
+>>> REPLACE

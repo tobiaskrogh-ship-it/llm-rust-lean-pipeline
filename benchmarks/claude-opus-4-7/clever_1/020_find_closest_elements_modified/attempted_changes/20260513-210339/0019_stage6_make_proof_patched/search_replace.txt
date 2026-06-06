@@ -1,0 +1,172 @@
+<<< SEARCH
+/-- Scan-at invariant: when `scan_at` is called with valid distinct indices
+    `bi, bj` for the "best so far" pair (both < size, bi ≠ bj) and any
+    cursor positions `i, j`, the returned `(retI, retJ)` is also a valid
+    distinct pair of indices.
+
+    This captures the argmin-tracking invariant of the recursion: `scan_at`
+    only ever returns either its `(best_i, best_j)` arguments unchanged
+    (base case `i + 1 >= n`) or updates them to `(i, j)` with `j > i ≥ 0`
+    in the `cur < best` branch (where `j < n` and `i + 1 < n` from the
+    branch guards). The two cases preserve "valid distinct pair".
+
+    Left as `sorry`: the proof requires strong induction on a Nat measure
+    capturing `scan_at`'s termination (e.g. `n*n - (i.toNat*n + j.toNat)`
+    treated as a bounded decreasing quantity, or the lexicographic measure
+    `(n - i, n - j)`). The recursion `(i+1, i+2, best_i, best_j)` strictly
+    increases `i`, and `(i, j+1, ...)` strictly increases `j`, so the
+    measure is well-defined. The hard parts are: (1) the `j` may exceed
+    `n` in the inner branch before the `j ≥ n` check fires, requiring care
+    about usize overflow on `i+1` and `i+2`; (2) `partial_fixpoint` unfolds
+    require chasing the bind chain in `cur`/`best` computations through
+    `abs_diff`, which can fail with overflow when `numbers[i] - numbers[j]`
+    overflows `i64`. The success hypothesis on the top-level call
+    propagates a no-overflow witness backwards but threading this through
+    the recursion is the heart of the proof. -/
+private theorem scan_at_returns_valid_pair
+    (numbers : RustSlice i64) (i j bi bj retI retJ : usize)
+    (hbi : bi.toNat < numbers.val.size)
+    (hbj : bj.toNat < numbers.val.size)
+    (hbi_ne_bj : bi.toNat ≠ bj.toNat)
+    (hscan : scan_at numbers i j bi bj
+              = RustM.ok (rust_primitives.hax.Tuple2.mk retI retJ)) :
+    ∃ (hretI : retI.toNat < numbers.val.size)
+      (hretJ : retJ.toNat < numbers.val.size),
+      retI.toNat ≠ retJ.toNat := by
+  sorry
+===
+/-! ## Step lemmas for `scan_at`
+
+The function has four branches: a base case (`i+1 ≥ n`) returning
+`(bi, bj)`, an "advance i" case (`j ≥ n`) recursing with `(i+1, i+2)`,
+and two inner cases (`cur < best` / otherwise) recursing with `(i, j+1)`
+and either `(i, j)` or `(bi, bj)` as the new best. The step lemmas below
+peel one iteration of the recursion when the no-overflow side conditions
+on `i+1`, `i+2`, and `j+1` are satisfied. -/
+
+/-- Base case step lemma: when `i + 1 ≥ n` (and `i + 1` does not overflow
+    `usize`), `scan_at` returns `(bi, bj)` immediately. -/
+private theorem scan_at_base_case
+    (numbers : RustSlice i64) (i j bi bj : usize)
+    (h_no_ov : i.toNat + 1 < 2 ^ 64)
+    (h_ge : numbers.val.size ≤ i.toNat + 1) :
+    scan_at numbers i j bi bj
+      = RustM.ok (rust_primitives.hax.Tuple2.mk bi bj) := by
+  conv => lhs; unfold scan_at
+  have h_n_lt : numbers.val.size < 2 ^ 64 := numbers.size_lt_usizeSize
+  have h_n_eq : (USize64.ofNat numbers.val.size).toNat = numbers.val.size :=
+    USize64.toNat_ofNat_of_lt' h_n_lt
+  have h_no_bv :
+      BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = false := by
+    generalize hbo : BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = bo
+    cases bo with
+    | false => rfl
+    | true =>
+      exfalso
+      have hii := (USize64.uaddOverflow_iff i 1).mp hbo
+      rw [usize_one_toNat] at hii
+      omega
+  have h_add_eq : (i +? (1 : usize) : RustM usize) = pure (i + 1) := by
+    show (rust_primitives.ops.arith.Add.add i 1 : RustM usize) = pure (i + 1)
+    show (if BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec
+          then (.fail .integerOverflow : RustM usize)
+          else pure (i + 1)) = _
+    rw [h_no_bv]; rfl
+  have h_i1_toNat : (i + 1).toNat = i.toNat + 1 :=
+    usize_add_one_toNat i h_no_ov
+  have h_ge_cond :
+      decide ((USize64.ofNat numbers.val.size) ≤ (i + 1)) = true := by
+    rw [decide_eq_true_iff]
+    rw [USize64.le_iff_toNat_le, h_n_eq, h_i1_toNat]
+    exact h_ge
+  simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+             rust_primitives.cmp.ge, pure_bind, RustM_ok_bind,
+             h_add_eq, h_ge_cond, ↓reduceIte]
+  rfl
+
+/-- Scan-at invariant: when `scan_at` is called with valid distinct indices
+    `bi, bj` for the "best so far" pair (both < size, bi ≠ bj), with the
+    cursor invariant `j > i`, the returned `(retI, retJ)` is also a valid
+    distinct pair of indices.
+
+    The cursor invariant `j > i` is what links the inner-update branch
+    `(bi, bj) := (i, j)` to preservation of `bi ≠ bj`: since `j > i`, the
+    new best pair is distinct. The seed `(i, j) = (0, 1)` used at the
+    top level satisfies `j > i`, and each recursive call preserves it
+    (`(i+1, i+2)` has `i+2 > i+1`, and `(i, j+1)` has `j+1 > j > i`).
+
+    Stuck sub-goal (despite a substantive attempt below): the strong-
+    induction step requires `partial_fixpoint`-style equational unfolding
+    of `scan_at` AND chasing the bind chain through the inner
+    `abs_diff` calls. Specifically:
+      * After `unfold scan_at`, the inner branch's `let cur ← abs_diff
+        (← numbers[i]_?) (← numbers[j]_?)` requires extracting four
+        ok-witnesses: `(numbers[i]_? = ok a_i)`, `(numbers[j]_? = ok a_j)`,
+        `(a_i -? a_j = ok cur)` (or `a_j -? a_i` after the swap), and
+        analogously for `best`.
+      * Each `abs_diff` call requires `Int64.subOverflow` to be `false`
+        at runtime, and the hypothesis `hscan = ok _` propagates only an
+        *existential* witness — it doesn't expose the concrete values
+        of `cur` and `best` symbolically.
+      * The branching on `cur < best` then routes to one of two
+        recursive calls, each of which needs the IH applied with a
+        decreased Nat measure.
+    The Clever_000 reference does this for a single-counter scan via
+    `step_analyze` (~250 lines); doing it for a two-counter scan with
+    paired update is roughly twice that. The structural unblock is
+    porting / adapting `Clever_000_has_close_elementsObligations.step_analyze`
+    to a `scan_at`-shaped two-cursor invariant. -/
+private theorem scan_at_returns_valid_pair
+    (numbers : RustSlice i64) (i j bi bj retI retJ : usize)
+    (hbi : bi.toNat < numbers.val.size)
+    (hbj : bj.toNat < numbers.val.size)
+    (hbi_ne_bj : bi.toNat ≠ bj.toNat)
+    (hscan : scan_at numbers i j bi bj
+              = RustM.ok (rust_primitives.hax.Tuple2.mk retI retJ)) :
+    ∃ (hretI : retI.toNat < numbers.val.size)
+      (hretJ : retJ.toNat < numbers.val.size),
+      retI.toNat ≠ retJ.toNat := by
+  -- The base case handles `i + 1 ≥ n` directly: the function returns
+  -- `(bi, bj)` and the invariant carries over by hypothesis. The recursive
+  -- cases require strong induction (see structural-unblock note above).
+  by_cases h_no_ov : i.toNat + 1 < 2 ^ 64
+  · by_cases h_ge : numbers.val.size ≤ i.toNat + 1
+    · -- Base case: scan_at returns (bi, bj) directly, so (retI, retJ) = (bi, bj).
+      have h_base := scan_at_base_case numbers i j bi bj h_no_ov h_ge
+      rw [h_base] at hscan
+      injection hscan with h_eq
+      injection h_eq with h_eq2
+      injection h_eq2 with h_eq_bi h_eq_bj
+      refine ⟨?_, ?_, ?_⟩
+      · rw [← h_eq_bi]; exact hbi
+      · rw [← h_eq_bj]; exact hbj
+      · rw [← h_eq_bi, ← h_eq_bj]; exact hbi_ne_bj
+    · -- Recursive case: i + 1 < n. Strong induction on a Nat measure
+      -- combining the remaining (i, j) range. See structural-unblock note
+      -- on the theorem above.
+      sorry
+  · -- `i + 1` overflows. Then `scan_at` fails (returns .fail), contradicting hscan.
+    exfalso
+    conv at hscan => lhs; unfold scan_at
+    have h_n_lt : numbers.val.size < 2 ^ 64 := numbers.size_lt_usizeSize
+    have h_ov_bv :
+        BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = true := by
+      have h_ov : USize64.uaddOverflow i 1 := by
+        rw [USize64.uaddOverflow_iff, usize_one_toNat]
+        omega
+      exact h_ov
+    have h_add_fail :
+        (i +? (1 : usize) : RustM usize) = .fail .integerOverflow := by
+      show (rust_primitives.ops.arith.Add.add i 1 : RustM usize)
+            = .fail .integerOverflow
+      show (if BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec
+            then (.fail .integerOverflow : RustM usize)
+            else pure (i + 1)) = _
+      rw [h_ov_bv]; rfl
+    simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+               pure_bind, h_add_fail] at hscan
+    -- After the failure of the bind, the whole expression is `.fail`, not `ok`.
+    simp only [bind, ExceptT.bind, ExceptT.mk, ExceptT.bindCont,
+               Option.bind] at hscan
+    cases hscan
+>>> REPLACE

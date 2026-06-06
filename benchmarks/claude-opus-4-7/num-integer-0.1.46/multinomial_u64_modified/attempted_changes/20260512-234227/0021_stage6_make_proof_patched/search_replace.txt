@@ -1,0 +1,223 @@
+<<< SEARCH
+/-- Failure condition: running sum overflow. -/
+theorem multinomial_sum_overflow_panics
+    (k : RustSlice u64)
+    (h : k.val = #[UInt64.ofNat (2 ^ 64 - 1), 1]) :
+    multinomial_u64.multinomial k = RustM.fail .integerOverflow := by
+  /- Stuck sub-goal: drive the outer `while_loop` through *exactly two*
+     iterations and show that the second iteration's `p +? i` (with
+     `p = u64::MAX` and `i = 1`) returns `RustM.fail .integerOverflow`.
+     First iteration: `idx = 0, p = 0, r = 1, remaining = 2`. The body
+     reads `i = u64::MAX`, computes `p +? i = pure u64::MAX` (no
+     overflow because `0 + u64::MAX < 2^64`), then `r *? (binomial
+     u64::MAX u64::MAX)`. Closing the multiplication needs
+     `binomial_diag` (above, currently `sorry`) plus the fact that
+     `1 *? 1 = pure 1`. Then `remaining` becomes `1`, `idx` becomes `1`.
+     Second iteration: `i = 1, p = u64::MAX`, and `p +? i =
+     RustM.fail .integerOverflow` (since `u64::MAX + 1 ≥ 2^64`). The
+     while_loop then propagates the failure.
+     Structural unblock: in addition to `binomial_diag` (which closes
+     the first iteration's `r` update), we need a two-iteration
+     analogue of `Spec.MonoLoopCombinator.while_loop` — or a manual
+     unrolling lemma `unfold_while_loop : cond init → while_loop … =
+     body init >>= (fun s => while_loop … s body)` plus its `¬ cond`
+     dual. Lean's `Loop.MonoLoopCombinator.forIn` does not ship such
+     an unrolling lemma; a separately-verified one in
+     `Hax/MissingLean/Init/While.lean` would unblock this obligation
+     and would also be useful for any future overflow-after-N-steps
+     obligation. -/
+  sorry
+===
+/-! ## Overflow case infrastructure
+
+For overflow we cannot use `Spec.MonoLoopCombinator.while_loop` directly:
+the Hoare triple in `noThrow` form asserts the function returns `ok`,
+not `fail`. We instead use the auto-generated `eq_def` unfolding lemma
+for the `partial_fixpoint`-built `Loop.MonoLoopCombinator.forIn.loop`,
+unroll the loop twice manually, and exhibit the failure via `bind`. -/
+
+/-- Body of one iteration on the initial overflow state `⟨0, 0, 1, 2⟩`.
+    Reads `k[0] = u64::MAX`, sets `p = MAX`, computes `binomial(MAX, MAX) = 1`,
+    finishes with `r = 1`, `idx = 1`, `remaining = 1`. -/
+private theorem overflow_body_init_step
+    (k : RustSlice u64) (h : k.val = #[UInt64.ofNat (2 ^ 64 - 1), 1]) :
+    outerBody k ⟨(0 : usize), (0 : u64), (1 : u64), (2 : usize)⟩ =
+    pure ⟨(1 : usize), UInt64.ofNat (2 ^ 64 - 1), (1 : u64), (1 : usize)⟩ := by
+  let MAX : u64 := UInt64.ofNat (2 ^ 64 - 1)
+  have hMAX_toNat : MAX.toNat = 2 ^ 64 - 1 := by
+    show (BitVec.ofNat 64 (2 ^ 64 - 1)).toNat = 2 ^ 64 - 1
+    rw [BitVec.toNat_ofNat]
+    decide
+  -- 1) k[0]_? reduces to pure MAX using h
+  have h_size : k.val.size = 2 := by rw [h]; rfl
+  have h_bound : USize64.toNat (0 : usize) < k.val.size := by
+    rw [h_size]; decide
+  have h_val_idx : k.val[(0 : usize).toNat]'h_bound = MAX := by
+    simp [h]
+  have h_idx : (k[(0 : usize)]_? : RustM u64) = pure MAX := by
+    show (if hh : USize64.toNat (0 : usize) < k.val.size then pure (k.val[(0 : usize).toNat]'hh)
+          else (RustM.fail .arrayOutOfBounds : RustM u64)) = pure MAX
+    rw [dif_pos h_bound]
+    exact congrArg pure h_val_idx
+  -- 2) (0 +? MAX) = pure MAX
+  have h_add0MAX : ((0 : u64) +? MAX : RustM u64) = pure MAX := by
+    show (rust_primitives.ops.arith.Add.add (0 : u64) MAX : RustM u64) = pure MAX
+    show (if BitVec.uaddOverflow (0 : u64).toBitVec MAX.toBitVec then
+            (RustM.fail .integerOverflow : RustM u64)
+          else pure ((0 : u64) + MAX)) = pure MAX
+    have h_no : BitVec.uaddOverflow (0 : u64).toBitVec MAX.toBitVec = false := by
+      simp [BitVec.uaddOverflow]; exact MAX.toNat_lt
+    rw [h_no]
+    have h_zero_add : (0 : u64) + MAX = MAX := by
+      apply UInt64.toNat_inj.mp
+      rw [UInt64.toNat_add_of_lt (by simp; exact MAX.toNat_lt)]
+      simp
+    rw [h_zero_add]
+    rfl
+  -- 3) binomial MAX MAX = ok 1 — diagonal case
+  have h_binom : multinomial_u64.binomial MAX MAX = pure (1 : u64) := binomial_diag MAX
+  -- 4) (1 *? 1) = pure 1
+  have h_mul11 : ((1 : u64) *? (1 : u64) : RustM u64) = pure 1 := by
+    show (rust_primitives.ops.arith.Mul.mul (1 : u64) 1 : RustM u64) = pure 1
+    show (if BitVec.umulOverflow (1 : u64).toBitVec (1 : u64).toBitVec then
+            (RustM.fail .integerOverflow : RustM u64)
+          else pure ((1 : u64) * 1)) = pure 1
+    have h_no : BitVec.umulOverflow (1 : u64).toBitVec (1 : u64).toBitVec = false := by
+      decide
+    rw [h_no]
+    rfl
+  -- 5) (0 +? 1 : usize) = pure 1
+  have h_idx_inc : ((0 : usize) +? (1 : usize) : RustM usize) = pure (1 : usize) := by
+    show (rust_primitives.ops.arith.Add.add (0 : usize) (1 : usize) : RustM usize) = pure 1
+    show (if BitVec.uaddOverflow (0 : usize).toBitVec (1 : usize).toBitVec then
+            (RustM.fail .integerOverflow : RustM usize)
+          else pure ((0 : usize) + 1)) = pure 1
+    have h_no : BitVec.uaddOverflow (0 : usize).toBitVec (1 : usize).toBitVec = false := by
+      decide
+    rw [h_no]
+    rfl
+  -- 6) (2 -? 1 : usize) = pure 1
+  have h_rem_dec : ((2 : usize) -? (1 : usize) : RustM usize) = pure (1 : usize) := by
+    show (rust_primitives.ops.arith.Sub.sub (2 : usize) (1 : usize) : RustM usize) = pure 1
+    show (if BitVec.usubOverflow (2 : usize).toBitVec (1 : usize).toBitVec then
+            (RustM.fail .integerOverflow : RustM usize)
+          else pure ((2 : usize) - 1)) = pure 1
+    have h_no : BitVec.usubOverflow (2 : usize).toBitVec (1 : usize).toBitVec = false := by
+      decide
+    rw [h_no]
+    rfl
+  -- Combine
+  show (do
+        let i : u64 ← k[(0 : usize)]_?
+        let p : u64 ← ((0 : u64) +? i)
+        let r : u64 ← ((1 : u64) *? (← multinomial_u64.binomial p i))
+        let idx : usize ← ((0 : usize) +? (1 : usize))
+        let remaining : usize ← ((2 : usize) -? (1 : usize))
+        pure (rust_primitives.hax.Tuple4.mk idx p r remaining) :
+        RustM (rust_primitives.hax.Tuple4 usize u64 u64 usize)) =
+        pure ⟨(1 : usize), MAX, (1 : u64), (1 : usize)⟩
+  rw [h_idx]
+  simp only [pure_bind]
+  rw [h_add0MAX]
+  simp only [pure_bind]
+  rw [h_binom]
+  simp only [pure_bind]
+  rw [h_mul11]
+  simp only [pure_bind]
+  rw [h_idx_inc]
+  simp only [pure_bind]
+  rw [h_rem_dec]
+  simp only [pure_bind]
+
+/-- Body of the second iteration on state `⟨1, MAX, 1, 1⟩`.
+    Reads `k[1] = 1`. The first arithmetic op `MAX +? 1` overflows. -/
+private theorem overflow_body_second_step
+    (k : RustSlice u64) (h : k.val = #[UInt64.ofNat (2 ^ 64 - 1), 1]) :
+    outerBody k ⟨(1 : usize), UInt64.ofNat (2 ^ 64 - 1), (1 : u64), (1 : usize)⟩ =
+    RustM.fail .integerOverflow := by
+  let MAX : u64 := UInt64.ofNat (2 ^ 64 - 1)
+  have hMAX_toNat : MAX.toNat = 2 ^ 64 - 1 := by
+    show (BitVec.ofNat 64 (2 ^ 64 - 1)).toNat = 2 ^ 64 - 1
+    rw [BitVec.toNat_ofNat]
+    decide
+  have h_size : k.val.size = 2 := by rw [h]; rfl
+  have h_bound : USize64.toNat (1 : usize) < k.val.size := by
+    rw [h_size]; decide
+  have h_val_idx : k.val[(1 : usize).toNat]'h_bound = (1 : u64) := by
+    simp [h]
+  have h_idx : (k[(1 : usize)]_? : RustM u64) = pure (1 : u64) := by
+    show (if hh : USize64.toNat (1 : usize) < k.val.size then pure (k.val[(1 : usize).toNat]'hh)
+          else (RustM.fail .arrayOutOfBounds : RustM u64)) = pure (1 : u64)
+    rw [dif_pos h_bound]
+    exact congrArg pure h_val_idx
+  -- The critical step: MAX +? 1 overflows
+  have h_add_overflow : (MAX +? (1 : u64) : RustM u64) = RustM.fail .integerOverflow := by
+    show (rust_primitives.ops.arith.Add.add MAX (1 : u64) : RustM u64) = RustM.fail .integerOverflow
+    show (if BitVec.uaddOverflow MAX.toBitVec (1 : u64).toBitVec then
+            (RustM.fail .integerOverflow : RustM u64)
+          else pure (MAX + 1)) = RustM.fail .integerOverflow
+    have h_yes : BitVec.uaddOverflow MAX.toBitVec (1 : u64).toBitVec = true := by
+      simp only [BitVec.uaddOverflow]
+      decide
+    rw [h_yes]
+    rfl
+  show (do
+        let i : u64 ← k[(1 : usize)]_?
+        let p : u64 ← (MAX +? i)
+        let r : u64 ← ((1 : u64) *? (← multinomial_u64.binomial p i))
+        let idx : usize ← ((1 : usize) +? (1 : usize))
+        let remaining : usize ← ((1 : usize) -? (1 : usize))
+        pure (rust_primitives.hax.Tuple4.mk idx p r remaining) :
+        RustM (rust_primitives.hax.Tuple4 usize u64 u64 usize)) =
+        RustM.fail .integerOverflow
+  rw [h_idx]
+  simp only [pure_bind]
+  rw [h_add_overflow]
+  rfl
+
+/-- Unrolling lemma: `outerLoop k init` with `cond init = true` equals
+    `body init >>= (fun s => outerLoop k s)`. Generated from the
+    `partial_fixpoint` definition via `Loop.MonoLoopCombinator.forIn.loop.eq_def`. -/
+private theorem outerLoop_unfold (k : RustSlice u64) (init : Tuple4 usize u64 u64 usize)
+    (hcond : outerCond init = true) :
+    outerLoop k init = outerBody k init >>= fun s => outerLoop k s := by
+  unfold outerLoop
+  unfold Lean.Loop.MonoLoopCombinator.while_loop
+  unfold Lean.Loop.MonoLoopCombinator.forIn
+  rw [Lean.Loop.MonoLoopCombinator.forIn.loop.eq_def]
+  unfold Lean.Loop.loopCombinator
+  simp only [hcond, ↓reduceIte, bind_pure_comp, bind_assoc, pure_bind]
+  rfl
+
+/-- Failure condition: running sum overflow. -/
+theorem multinomial_sum_overflow_panics
+    (k : RustSlice u64)
+    (h : k.val = #[UInt64.ofNat (2 ^ 64 - 1), 1]) :
+    multinomial_u64.multinomial k = RustM.fail .integerOverflow := by
+  -- Step 1: reduce `multinomial k` to the outer loop applied to the initial state.
+  have h_size : k.val.size = 2 := by rw [h]; rfl
+  have h_len : core_models.slice.Impl.len u64 k = pure (2 : usize) := by
+    unfold core_models.slice.Impl.len rust_primitives.slice.slice_length
+    rw [h_size]
+    rfl
+  unfold multinomial_u64.multinomial
+  unfold rust_primitives.hax.while_loop
+  rw [h_len]
+  show (outerLoop k ⟨(0 : usize), (0 : u64), (1 : u64), (2 : usize)⟩ >>=
+       fun s => match s with | ⟨_, _, r, _⟩ => pure r) = RustM.fail .integerOverflow
+  -- Step 2: Unroll the loop one iteration (state has cond = true).
+  have h_cond_init : outerCond ⟨(0 : usize), (0 : u64), (1 : u64), (2 : usize)⟩ = true := by
+    show decide (USize64.toNat (2 : usize) > USize64.toNat (0 : usize)) = true
+    decide
+  rw [outerLoop_unfold k _ h_cond_init]
+  rw [overflow_body_init_step k h]
+  simp only [pure_bind]
+  -- Now goal: outerLoop k ⟨1, MAX, 1, 1⟩ >>= ... = fail .integerOverflow
+  -- Unroll once more.
+  have h_cond_2 : outerCond ⟨(1 : usize), UInt64.ofNat (2 ^ 64 - 1), (1 : u64), (1 : usize)⟩ = true := by
+    show decide (USize64.toNat (1 : usize) > USize64.toNat (0 : usize)) = true
+    decide
+  rw [outerLoop_unfold k _ h_cond_2]
+  rw [overflow_body_second_step k h]
+  rfl
+>>> REPLACE

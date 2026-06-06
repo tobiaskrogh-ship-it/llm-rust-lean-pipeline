@@ -1,0 +1,168 @@
+<<< SEARCH
+    -- After these reductions, the goal is a Hoare triple about
+    -- `do let ⟨d, n', r'⟩ ← Loop.MonoLoopCombinator.while_loop … ⟨1, n, 1⟩ …; pure r'`.
+    -- A first attempt at pushing further unfolded
+    -- `rust_primitives.hax.while_loop` and tried to extract `r` from the
+    -- final Tuple3 by binding through `pure r`. That attempt surfaced a
+    -- second concrete blocker beyond the body-step itself: the overflow
+    -- bound. The available `natChoose_le_two_pow` gives only
+    -- `natChoose n k ≤ 2^n`, which for `n ≤ 67` exceeds `2^64` (since
+    -- `2^67 > 2^64`). The actual fact we need —
+    --   `∀ k, n.toNat ≤ 67 → natChoose n.toNat k < 2^64`
+    -- — is true (since `natChoose 67 33 ≈ 1.42 * 10^19 < 2^64 ≈ 1.84 * 10^19`),
+    -- but requires a different argument than the symmetric row-sum bound.
+    -- That argument is itself part of the structural unblock listed in the
+    -- docstring: a tight `natChoose_lt_two_pow_64` lemma (provable by
+    -- `decide` on the finite table for `n ≤ 67`, or by Pascal-recurrence
+    -- induction with the explicit `1.42 * 10^19 < 2^64` bound) plus the
+    -- gcd / multiply_and_divide correctness chain together discharge the
+    -- loop. See docstring for the full unblock path.
+    sorry
+===
+    -- After these reductions, the goal is a Hoare triple about
+    -- `do let ⟨d, n', r'⟩ ← while_loop … ⟨1, n, 1⟩ …; pure r'`.
+    -- Unfold the Hax `while_loop` wrapper to expose `Loop.MonoLoopCombinator.while_loop`.
+    unfold rust_primitives.hax.while_loop
+    -- Step 1: build a Hoare triple for the loop with the multiplicative
+    -- binomial invariant. Initial state is ⟨1, n, 1⟩; we carry:
+    --   1 ≤ d.toNat  (loop counter)
+    --   d.toNat ≤ k.toNat + 1  (bounded by loop condition + 1)
+    --   n'.toNat = n.toNat - (d.toNat - 1)  (n decremented in lock-step with d)
+    --   r.toNat = natChoose n.toNat (d.toNat - 1)  (running binomial value)
+    have h_loop :
+        ⦃⌜ 1 ≤ (1 : u64).toNat ∧ (1 : u64).toNat ≤ k.toNat + 1 ∧
+            n.toNat = n.toNat - ((1 : u64).toNat - 1) ∧
+            (1 : u64).toNat = natChoose n.toNat ((1 : u64).toNat - 1) ⌝⦄
+          Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk
+            (fun b : rust_primitives.hax.Tuple3 u64 u64 u64 =>
+                decide (b._0.toNat ≤ k.toNat))
+            (rust_primitives.hax.Tuple3.mk (1 : u64) n (1 : u64))
+            (fun x : rust_primitives.hax.Tuple3 u64 u64 u64 => do
+              let r ← binomial_u64.multiply_and_divide x._2 x._1 x._0
+              let n ← x._1 -? 1
+              let d ← x._0 +? 1
+              pure (rust_primitives.hax.Tuple3.mk d n r))
+        ⦃⇓ b => ⌜ (1 ≤ b._0.toNat ∧ b._0.toNat ≤ k.toNat + 1 ∧
+                  b._1.toNat = n.toNat - (b._0.toNat - 1) ∧
+                  b._2.toNat = natChoose n.toNat (b._0.toNat - 1)) ∧
+                ¬ decide (b._0.toNat ≤ k.toNat) = true ⌝⦄ := by
+      apply Std.Do.Spec.MonoLoopCombinator.while_loop
+        (rust_primitives.hax.Tuple3.mk (1 : u64) n (1 : u64))
+        Lean.Loop.mk
+        (fun b => decide (b._0.toNat ≤ k.toNat))
+        _
+        (fun s : rust_primitives.hax.Tuple3 u64 u64 u64 =>
+            1 ≤ s._0.toNat ∧ s._0.toNat ≤ k.toNat + 1 ∧
+            s._1.toNat = n.toNat - (s._0.toNat - 1) ∧
+            s._2.toNat = natChoose n.toNat (s._0.toNat - 1))
+        (fun s => k.toNat + 1 - s._0.toNat)
+      -- Body step: under cond + invariant, the body preserves the invariant
+      -- and strictly decreases the termination measure.
+      --
+      -- Stuck sub-goal: after destructuring `b = ⟨d, n', r⟩`, the goal
+      -- splits into Hoare triples for `multiply_and_divide r n' d`,
+      -- `n' -? 1`, and `d +? 1`, with the conjunction `term < init ∧ inv`
+      -- as the conclusion. The latter two are routine (no-underflow /
+      -- no-overflow follow from the invariant). The blocking sub-goal is
+      -- the first call: we need
+      --   `binomial_u64.multiply_and_divide r n' d = RustM.ok r_new`
+      --   with `r_new.toNat = natChoose n.toNat d.toNat`
+      -- given `r.toNat = natChoose n.toNat (d.toNat - 1)` and
+      -- `n'.toNat = n.toNat - (d.toNat - 1)`. This unfolds to a triple
+      -- about `gcd_u64 r d` (Stein's binary algorithm) followed by two
+      -- u64 divisions; the gcd correctness is the structural prerequisite.
+      --
+      -- Structural unblock: separately-verified
+      --   gcd_u64_postcondition : ∀ x y, binomial_u64.gcd_u64 x y
+      --                         = RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat))
+      -- proved as its own pipeline target (Stein's binary GCD over u64),
+      -- combined with the Nat-level multiplicative recurrence
+      --   natChoose n d * d = natChoose n (d-1) * (n - d + 1)
+      -- (a routine Nat induction).
+      sorry
+    -- Step 2: strengthen post — from invariant + ¬cond, derive
+    --   b._2 = UInt64.ofNat (natChoose n.toNat k.toNat).
+    have h_loop' :
+        ⦃⌜ 1 ≤ (1 : u64).toNat ∧ (1 : u64).toNat ≤ k.toNat + 1 ∧
+            n.toNat = n.toNat - ((1 : u64).toNat - 1) ∧
+            (1 : u64).toNat = natChoose n.toNat ((1 : u64).toNat - 1) ⌝⦄
+          Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk
+            (fun b : rust_primitives.hax.Tuple3 u64 u64 u64 =>
+                decide (b._0.toNat ≤ k.toNat))
+            (rust_primitives.hax.Tuple3.mk (1 : u64) n (1 : u64))
+            (fun x : rust_primitives.hax.Tuple3 u64 u64 u64 => do
+              let r ← binomial_u64.multiply_and_divide x._2 x._1 x._0
+              let n ← x._1 -? 1
+              let d ← x._0 +? 1
+              pure (rust_primitives.hax.Tuple3.mk d n r))
+        ⦃⇓ b => ⌜ b._2 = UInt64.ofNat (natChoose n.toNat k.toNat) ⌝⦄ := by
+      apply Triple.of_entails_right _ _ _ _ h_loop
+      apply PostCond.entails.of_left_entails
+      intro b ⟨⟨h_d_pos, h_d_le, h_n_eq, h_r_eq⟩, hncond⟩
+      -- From ¬cond: b._0.toNat > k.toNat. Combined with h_d_le: b._0.toNat = k+1.
+      have h_d_gt : k.toNat < b._0.toNat := by
+        rcases Nat.lt_or_ge k.toNat b._0.toNat with h | h
+        · exact h
+        · exfalso; apply hncond; exact decide_eq_true h
+      have h_d_eq : b._0.toNat = k.toNat + 1 := by omega
+      -- So r.toNat = natChoose n.toNat k.toNat.
+      have h_r_at_k : b._2.toNat = natChoose n.toNat k.toNat := by
+        rw [h_r_eq, h_d_eq]
+        show natChoose n.toNat (k.toNat + 1 - 1) = natChoose n.toNat k.toNat
+        rw [show k.toNat + 1 - 1 = k.toNat from rfl]
+      -- We need: b._2 = UInt64.ofNat (natChoose n.toNat k.toNat).
+      -- This requires natChoose n.toNat k.toNat < 2^64, which is the tight
+      -- overflow bound the docstring identifies.
+      --
+      -- Stuck sub-goal: `natChoose n.toNat k.toNat < 2^64` for `n.toNat ≤
+      -- 67` and `k.toNat ≤ n.toNat / 2` (from `2 * k.toNat ≤ n.toNat`).
+      -- The maximum is `natChoose 67 33 ≈ 1.42 * 10^19 < 2^64 ≈
+      -- 1.84 * 10^19`. The available `natChoose_le_two_pow` gives `≤ 2^n
+      -- = 2^67`, too weak. A finite-table `native_decide` over `n ≤ 67`,
+      -- `k ≤ n` times out the lake build (300s) because `natChoose` is
+      -- doubly recursive without memoization.
+      --
+      -- Structural unblock: either (a) a Mathlib-style unimodality lemma
+      -- `natChoose n k ≤ natChoose n (n/2)` combined with a single
+      -- `decide`-checked fact `natChoose 67 33 < 2^64` (the latter still
+      -- needs memoization to be tractable), or (b) a separately-derived
+      -- `Nat.choose_le_two_pow_of_le` from a future Hax prelude extension.
+      apply UInt64.toNat_inj.mp
+      rw [h_r_at_k]
+      sorry
+    -- Step 3: weaken pre — initial state trivially satisfies the invariant.
+    have h_loop'' :
+        ⦃⌜ True ⌝⦄
+          Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk
+            (fun b : rust_primitives.hax.Tuple3 u64 u64 u64 =>
+                decide (b._0.toNat ≤ k.toNat))
+            (rust_primitives.hax.Tuple3.mk (1 : u64) n (1 : u64))
+            (fun x : rust_primitives.hax.Tuple3 u64 u64 u64 => do
+              let r ← binomial_u64.multiply_and_divide x._2 x._1 x._0
+              let n ← x._1 -? 1
+              let d ← x._0 +? 1
+              pure (rust_primitives.hax.Tuple3.mk d n r))
+        ⦃⇓ b => ⌜ b._2 = UInt64.ofNat (natChoose n.toNat k.toNat) ⌝⦄ := by
+      apply Triple.of_entails_left _ _ _ _ h_loop'
+      intro _
+      refine ⟨?_, ?_, ?_, ?_⟩
+      · show 1 ≤ (1 : u64).toNat
+        rfl
+      · show (1 : u64).toNat ≤ k.toNat + 1
+        change 1 ≤ k.toNat + 1
+        omega
+      · show n.toNat = n.toNat - ((1 : u64).toNat - 1)
+        change n.toNat = n.toNat - 0
+        omega
+      · show (1 : u64).toNat = natChoose n.toNat ((1 : u64).toNat - 1)
+        change 1 = natChoose n.toNat 0
+        rw [natChoose_zero_right]
+    -- Step 4: bind the loop with `pure r` to extract the third tuple component.
+    apply Triple.bind _ _ h_loop''
+    intro s
+    cases s with
+    | mk d' n'' r' =>
+      refine Triple.pure r' ?_
+      intro h
+      exact h
+>>> REPLACE

@@ -1,0 +1,434 @@
+Log: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260513-181107_009_rolling_max.log
+Model: claude-opus-4-7
+Attempt logs: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever/009_rolling_max/attempted_changes/20260513-181107
+Stages: [1, 2, 3, 4, 5, 6, 7, 8]
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Read({"file_path": "src/lib.rs"})
+Looking at the contract for `rolling_max`:
+
+**Preconditions:** None — total function on any `&[i64]`.
+**Postconditions:**
+- Output length equals input length.
+- For each index `i`, `result[i]` is the maximum of `numbers[0..=i]`.
+- Empty input yields empty output (boundary case).
+
+**Failure conditions:** None — function never panics or fails.
+
+I'll write a minimal property-based test suite that pins down these clauses without piling on derived facts.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n/// From a given list of integers, generate a list of the rolling maximum\n/// element found until each position in... [+2953 chars])
+[tool] run_cargo_test({})
+All 3 tests pass.
+
+## Summary
+
+### Tests included and the contract clauses they capture
+
+| Test | Clause type | What it pins down |
+|---|---|---|
+| `empty_input_yields_empty_output` | Boundary postcondition | `rolling_max(&[])` returns an empty `Vec` (no panic, no spurious elements). |
+| `output_length_equals_input_length` | Postcondition (shape) | `result.len() == numbers.len()`. Catches off-by-one bugs, dropped/duplicated elements. |
+| `each_element_is_prefix_max` | Core postcondition (value) | For every `i`, `result[i] == max(numbers[0..=i])`. This is the defining spec of the function. |
+
+There are no preconditions to test (the function is total over `&[i64]`) and no failure modes to test (it never panics, returns `Option`, or returns `Result`).
+
+### Properties I considered and deliberately omitted
+
+- **Monotonic non-decreasing** (`result[i] <= result[i+1]`): derived from the prefix-max postcondition — if every element is `max(numbers[0..=i])`, monotonicity follows immediately.
+- **`result[i] >= numbers[i]`**: derived — `numbers[i] ∈ numbers[0..=i]`, so the prefix max dominates it.
+- **`result[i] ∈ numbers[0..=i]`** (membership): derived — the max of a non-empty slice is always one of its elements.
+- **Last element equals overall maximum**: a special case of the prefix-max property at `i = len-1`.
+- **Idempotence / behavior on sorted, reversed, or constant arrays**: all special cases of the core spec; a buggy implementation that breaks them would already fail `each_element_is_prefix_max`.
+
+Keeping the suite tight matters here because each test becomes a proof obligation downstream — the three above already over-determine the function's behavior, so a correct implementation must pass them and any buggy variant (rolling min, identity, off-by-one shift, etc.) will fail at least one.
+
+make_pbt
+[tool] Glob({"pattern": "**/*.rs"})
+[tool] Read({"file_path": "src/lib.rs"})
+Looking at the source, I can identify these Hax-incompatibility patterns:
+1. `for &n in numbers` over a slice → matches `for_loop_over_slice_to_recursion.rs`
+2. `result.push(...)` → matches `vec_push_to_extend_from_slice_typed_chunk.rs`
+3. `i64::MIN` → matches `primitive_int_assoc_const.rs`
+
+I'll combine these into a single rewrite: a tail-recursive helper that uses `extend_from_slice` with a typed 1-element chunk, and avoids `i64::MIN` by special-casing `i == 0`.
+[tool] write_working_file({"path": "src/lib.rs", "overwrite": true, "error_message": "Rewriting to address three known Hax-incompatibility patterns simultaneously: (1) `for &n in numbers... [+4470 chars])
+[tool] run_cargo_test({})
+Tests pass. Now extraction:
+[tool] run_cargo_hax_into_lean({})
+Extraction succeeded. Now lake build:
+[tool] run_lake_build({})
+All three stages pass. Let me verify the extracted Lean for Hax-degenerate patterns:
+[tool] Read({"file_path": "proofs/lean/extraction/clever_009_rolling_max.lean"})
+The extraction is clean. The recursive function `rolling_max_at` is extracted as `partial_fixpoint`, which the proof stage handles via `Nat.strongRecOn` on the recursion measure. No `while` loops, no `loop_invariant!` macros, no constant-`0` decreases measures, no auto-spec failures.
+
+## Summary
+
+### Hax / `lake build` errors that drove changes
+
+The original `src/lib.rs` had three known Hax-incompatibility patterns triggered simultaneously:
+
+1. **`for &n in numbers` over a slice** — desugars to `Iterator::fold` over `IntoIterator (RustSlice i64)`, and neither `core.slice.iter.Iter` nor `Iterator::fold` is modeled in the Hax Lean prelude. Matched archive pattern `for_loop_over_slice_to_recursion.rs`.
+
+2. **`Vec::push`** — `alloc.vec.Impl_1.push` is undefined in `Hax/core_models/epilogue/alloc.lean`. Only `Vec::new`, `Vec::len`, and `Vec::extend_from_slice` are modeled. Matched archive pattern `vec_push_to_extend_from_slice_typed_chunk.rs`.
+
+3. **`i64::MIN`** — associated constant on a primitive integer; extracts to `core_models.num.Impl_*.MIN` which the prelude does not define. Matched archive pattern `primitive_int_assoc_const.rs`.
+
+### Rewrite applied
+
+All three folded into one tail-recursive helper (`rolling_max_at`) that:
+- Walks `numbers` by index with measure `numbers.len() - i` (decreasing).
+- Carries `max_so_far` and the partial `Vec<i64>` accumulator as parameters.
+- Uses a **typed let binding** `let chunk: [i64; 1] = [new_max]` so Hax emits `RustArray i64 1` (the `1` literal in the type) and `unsize` can resolve the size metavariable.
+- Eliminates the need for `i64::MIN` by special-casing `i == 0`: the first element unconditionally becomes the running max.
+
+### Library calls inlined
+
+None — the original `Vec::push` was replaced by the Hax-modeled `Vec::extend_from_slice` with a 1-element typed chunk (not a primitive replacement).
+
+### Patterns considered but not changed
+
+- `iter().max().unwrap()` on lines 53 in tests — tests are excluded from Hax extraction (`#[cfg(test)]`), so iterator chains there are safe to leave.
+
+### Semantics
+
+The new implementation is observationally identical to the original on any non-empty input (special-casing `i == 0` to take `numbers[0]` directly is exactly what `max_so_far = i64::MIN` followed by `if n > max_so_far` would have computed). On empty input both versions return `Vec::new()`. All 3 tests (1 unit + 2 proptest) pass.
+
+### Hax-degenerate patterns
+
+None remaining. The function is extracted as `partial_fixpoint`, which the proof stage proves via `Nat.strongRecOn` per `proof_patterns/recursion_example`. No `while` loops, no `loop_invariant!`, no `#[requires]` clauses, no auto-spec to worry about.
+
+rust_hax_lean
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever/009_rolling_max/attempted_changes/20260513... [+34 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever/009_rolling_max/attempted_changes/20260513... [+12 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever/009_rolling_max/attempted_changes/202605... [+59 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever/009_rolling_max/attempted_changes/202605... [+63 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever/009_rolling_max/attempted_changes/202605... [+55 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever/009_rolling_max/attempted_changes/202605... [+54 chars])
+I walked the run's attempt log. Only one `stage2_rust_hax_lean` attempt is present.
+
+## Findings
+
+**Attempts inspected:**
+
+- `0002_stage2_rust_hax_lean_written` (`src/lib.rs`) — **skipped, fully covered by existing patterns.**
+  - Status is `written` (initial rewrite, `change_count: 0`), not `patched`, so it doesn't meet the skill's "landed cleanly" criterion to begin with.
+  - More importantly, both the `trigger_error` and the rewritten file's own doc comments explicitly cite three already-archived patterns as the root causes addressed:
+    1. `for_loop_over_slice_to_recursion.rs` — converting `for &n in numbers` over a slice to index-based tail recursion.
+    2. `vec_push_to_extend_from_slice_typed_chunk.rs` — replacing `Vec::push` with `extend_from_slice` of a typed `[i64; 1]` chunk.
+    3. `primitive_int_assoc_const.rs` — eliminating `i64::MIN` by special-casing `i == 0`.
+  - Nothing in the before/after diff is novel relative to these three.
+
+**Patterns written:** none.
+
+**Anything for a human to look at:** the only `stage2_rust_hax_lean` entry in this log is the initial `written` rewrite — there are no follow-up `patched` attempts. That's consistent with the rewrite agent pre-emptively applying the three known patterns up-front rather than discovering them via Hax/lake failure feedback, so this run produced no new pattern material.
+
+harvest_rewrite_patterns
+## Summary
+
+The rewrite converts an iterative `for` loop with a `i64::MIN` sentinel and `Vec::push` into a tail-recursive helper that:
+1. Uses index-based recursion instead of slice iteration (to avoid Hax's missing `IntoIterator` / `Iterator::fold` model).
+2. Replaces `Vec::push` with `extend_from_slice` on a typed `[i64; 1]` chunk (to avoid Hax's missing `Vec::push`).
+3. Eliminates the `i64::MIN` sentinel by special-casing `i == 0` so the running max is unconditionally seeded from the first element.
+
+## Reasoning per change
+
+**Recursion vs loop.** The recursive function `rolling_max_at(numbers, i, max_so_far, acc)` advances `i` by 1 each call and terminates when `i >= numbers.len()`. The accumulator `acc` is grown by one element per call, in the same order as the original `push`. For any finite slice (modulo stack-depth, which is a resource concern not a semantic one) this produces the same sequence.
+
+**`i64::MIN` sentinel removed.** In the original, at index 0:
+- If `numbers[0] > i64::MIN` (i.e. `numbers[0] != i64::MIN`), then `max_so_far` becomes `numbers[0]` and `numbers[0]` is pushed.
+- If `numbers[0] == i64::MIN`, the `if` is false, `max_so_far` stays `i64::MIN`, and `i64::MIN` is pushed — which equals `numbers[0]`.
+
+So in both cases `result[0] = numbers[0]`. In the rewrite, `new_max = n` unconditionally when `i == 0`, giving `result[0] = numbers[0]`. The initial `max_so_far = 0` placeholder is unused at `i == 0` and overwritten before being read at `i >= 1`. Equivalent on every input, including `i64::MIN`.
+
+**`extend_from_slice(&[new_max])` vs `push(new_max)`.** Both append exactly one element with the same value to the same `Vec`. Behaviorally identical.
+
+**Subsequent indices.** From `i = 1` onward, `max_so_far` carries the previously computed `new_max`, which equals the prefix-max of `numbers[0..i]`. The check `n > max_so_far` matches the original. So `result[i]` is the prefix-max for every `i`, matching the original spec.
+
+No edge case (empty, single element, `i64::MIN` first or anywhere, monotone, anti-monotone) diverges between the two versions.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+I'll inspect the strongest manifest matches before finalizing.
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/src/lib.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/sum_product_modified/src/lib.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/contains_u64_modified/src/lib.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Below... [+43 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/*.lean"... [+1 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Cleve... [+47 chars])
+I have enough context now. The target's proof obstacles are clear: tail-recursive scan over an i64 slice via `partial_fixpoint`, threading a running max accumulator plus a growing Vec, with index increment requiring `usize-add-no-overflow`. The defining postcondition (`out[i] = max(numbers[0..=i])`) and the length postcondition both need strong induction with a strengthened invariant, plus slice-indexing discharge.
+
+---
+
+**Selected examples:**
+
+```
+proof_patterns/below_zero_modified
+proof_patterns/sum_product_modified
+proof_patterns/contains_u64_modified
+proof_patterns/000_has_close_elements_modified
+proof_patterns/recursion_example
+```
+
+**Per pick — rationale:**
+
+- `proof_patterns/below_zero_modified` — Tail-recursive scan over an **i64 slice** with a **running i64 accumulator** threaded through the recursion, `partial_fixpoint` style, strong induction on `size - i.toNat`, `usize+1` no-overflow via `usize_add_one_toNat`, slice indexing, and a Lean-side prefix oracle (`prefix_sum_int`). Direct structural twin of `rolling_max_at` — replace "running balance" with "running max" and "prefix sum" with "prefix max" and the proof skeleton (step lemmas: oob / found / recurse, plus `RustM.ok` bind simp) transfers almost verbatim. **Closest single match.**
+
+- `proof_patterns/sum_product_modified` — Tail-recursive over an **i64 slice** with a **paired accumulator** (sum, product) and a *single combined* strong-induction invariant that simultaneously discharges multiple postconditions. The target also carries paired state (`max_so_far`, `acc` Vec) and must prove *both* length-correctness and pointwise prefix-max correctness — this is the canonical "one invariant, multiple top-level theorems specialised at i=0" pattern.
+
+- `proof_patterns/contains_u64_modified` — The canonical recursive-scan proof skeleton: `iff-decomposition`, `recursive-equation-unfold`, three step lemmas (oob / found / recurse), strong induction on `arr.val.size - i.toNat`, `usize-add-no-overflow` via `BitVec.uaddOverflow`. The target's `rolling_max_at` shares the same `if i >= len then … else …` recursion shape; this example is the cleanest reference for the unfold/step-lemma idiom.
+
+- `proof_patterns/000_has_close_elements_modified` — `partial_fixpoint` + strong induction + `recursive-equation-unfold` + slice indexing with an existential-style postcondition. Most useful as a second reference for `partial_fixpoint` scaffolding when the simpler `recursion_example` falls short.
+
+- `proof_patterns/recursion_example` — Minimal `partial_fixpoint` + strong-induction template on `n.toNat`. Useful as a baseline for the recursion proof setup itself before layering on the slice / accumulator machinery from the other four.
+
+---
+
+**Gaps (target features not covered by any example):**
+
+- **Vec construction in the recursion** (`alloc.vec.Impl_2.extend_from_slice` with a typed `RustArray i64 1` chunk): no example builds an output `Vec` element-by-element through the recursion. Reasoning about `acc.val` growing by exactly one entry per step — and stating "the i-th entry equals `max numbers[0..=i]`" — has no precedent in the library.
+- **Prefix-max oracle on `i64`**: `below_zero_modified` defines a `prefix_sum_int` over `Int`; nothing defines a `prefix_max` oracle. The proof author will need to introduce one analogous to `prefix_sum_int`, but with the `i==0` sentinel case (target uses `i==0 || n > max_so_far` rather than `i64::MIN`) — that boundary handling is novel.
+- **No arithmetic overflow concerns** in the target body (only `usize+1`), so the heavy `signed-overflow` / `Int64.addOverflow` / `Int64.mulOverflow` machinery from `below_zero_modified` and `sum_product_modified` is partly relevant only for the index increment, not for the data.
+
+---
+
+**Rejections:**
+
+- `abs_diff_i64_modified`, `add_one_modified`, `square_modified`, `factorial_modified`, `sum_to_n_modified` — purely arithmetic / not a slice scan.
+- `average_ceil_u64_modified`, `average_floor_u64_modified` — bit-manipulation oracles, no recursion or slice.
+- `gcd_while_modified`, `while_example` — while-loop / `triple-to-equation` style; target is recursion, not loop.
+- `clamp_modified`, `is_zero_modified`, `min_modified`, `saturating_sub_modified` — single-binop totality proofs, no recursion.
+- `slice_get_u64_modified` — slice indexing, but single in/out-of-bounds split rather than a full scan; no recursion or accumulator threading.
+- `truncate_number_modified` — division/mod arithmetic, no recursion or slice.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Clever_009_rolling_maxObligations.lean
+[scaffold] registered Clever_009_rolling_maxObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Cleve... [+34 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/sum_product_modified/proofs/lean/extraction/Clev... [+36 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Con... [+27 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/recursion_example/proofs/lean/extraction/Recursi... [+28 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/000_has_close_elements_modified/proofs/lean/extrac... [+13 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/sum_product_modified/proofs/lean/extraction/clev... [+25 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/000_has_close_elements_modified/proofs/lean/extr... [+54 chars])
+Now let me explore the Hax prelude to understand how `Vec`, `extend_from_slice`, and `RustArray.ofVec` work for stating the postconditions correctly.
+[tool] Grep({"pattern": "extend_from_slice", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6", "output_mode": "files_with_matches... [+2 chars])
+[tool] Grep({"pattern": "alloc.vec.Impl_2.extend_from_slice", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6", "output_mode": "f... [+19 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/epilogue/alloc.lean"})
+[tool] Grep({"pattern": "RustArray.ofVec|RustArray |def RustArray|abbrev RustArray|rust_primitives.unsize", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof... [+57 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/hax/array.lean"})
+Let me check the intersperse_modified obligations - it uses `extend_from_slice` and has a Vec output:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/claude-opus-4-7/clever/005_intersperse_modified/proo... [+59 chars])
+Let me check the Seq definition:
+[tool] Grep({"pattern": "structure Seq|def Seq|abbrev Seq", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content"})
+[tool] Grep({"pattern": "Seq", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/sequence.lean", "output_mode": "content", "hea... [+13 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/sequence.lean", "limit": 15})
+Now I have enough understanding. Let me check what `i64`'s `.toInt` looks like and confirm `max` over `Int` is available:
+[tool] Grep({"pattern": "^abbrev i64|^def i64|^abbrev Int64", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content"})
+Now I have all I need. Let me write the obligations file:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "patch": "<<< SEARCH\nnamespace Clever_009_rolling_maxObligations\n\n-- Add `theorem` ... [+5695 chars])
+Now let me verify the file type-checks via `lake build`:
+[tool] run_lake_build({})
+There's a type mismatch — let me fix it. The `numbers.val[0]'h` proof is for index `k`, not literal `0`. Use `numbers.val[k]'h` since at that branch `k = 0`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "patch": "<<< SEARCH\n  | k + 1 =>\n      if h : k < numbers.val.size then\n        if... [+713 chars])
+[tool] run_lake_build({})
+Build succeeds. All four theorem statements are well-typed; the only remaining diagnostics are the expected `sorry` warnings on each `theorem`.
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Clever_009_rolling_maxObligations.lean`
+
+**Spec helper added:**
+- `prefix_max_int (numbers : RustSlice i64) : Nat → Int` — integer-valued prefix-max oracle. `prefix_max_int numbers (i + 1) = max(numbers[0..=i])` as an `Int`, with the boundary case `i = 0` returning the element itself (mirroring the Rust code's `i == 0 || n > max_so_far` short-circuit that replaces the missing `i64::MIN` sentinel).
+
+**Theorems added — one per contract clause:**
+
+| Theorem | Contract clause |
+|---|---|
+| `rolling_max_total` | Totality baseline — `rolling_max numbers = RustM.ok v` for some `v`. Without this, every postcondition below would be vacuously satisfied by a function that always failed. (Not a property test in isolation, but the implicit precondition every other property test relies on.) |
+| `rolling_max_empty` | Captures `empty_input_yields_empty_output`: `numbers.val.size = 0 → v.val.size = 0`. |
+| `rolling_max_length` | Captures `output_length_equals_input_length`: `v.val.size = numbers.val.size`. |
+| `rolling_max_prefix_max` | Captures `each_element_is_prefix_max`: `(v.val[i]).toInt = prefix_max_int numbers (i + 1)` for every `i < numbers.val.size`. |
+
+**Property tests classified as derived facts (skipped):** None — every property test in `src/lib.rs` is a contract clause and appears as at least one theorem above.
+
+**Uncertain framings:**
+- `rolling_max_total` could alternatively be folded into each postcondition by stating the conditional `∃ v, … = RustM.ok v ∧ post v` rather than introducing a separate `hres` hypothesis. I followed the `intersperse_modified` reference's style (separate totality + hypothesis-conditional postconditions) because it cleanly separates the totality obligation from the value-level postconditions and matches the strong-induction structure the proof stage will most likely build.
+- `rolling_max_empty` is mildly redundant with `rolling_max_length` (since `length = 0` follows from `numbers.val.size = 0` via the general length theorem). I kept it as a separate theorem because the Rust source dedicates a separate `#[test]` to it as a boundary case — and the rule says "every contract-style property test … MUST appear as at least one theorem." A future proof author who wishes to specialise the empty case directly via `intersperse_at_oob`-style mechanical reduction (without going through the strong-induction invariant) has a dedicated statement to target.
+
+make_lean_obligations
+
+[make_proof] attempt 1/2
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Cleve... [+34 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/sum_product_modified/proofs/lean/extraction/Clev... [+36 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/recursion_example/proofs/lean/extraction/Recursi... [+28 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Con... [+27 chars])
+[tool] Glob({"pattern": "**/proof_patterns/recursion_example/README.md"})
+[tool] Glob({"pattern": "**/proof_patterns/while_example/README.md"})
+[tool] Grep({"pattern": "extend_from_slice", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6", "output_mode": "files_with_matches... [+2 chars])
+[tool] Grep({"pattern": "extend_from_slice", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proofs/lean/extraction/.lake/package... [+61 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/**/alloc.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/epilogue/alloc.lean"})
+[tool] Grep({"pattern": "RustArray.ofVec|def RustArray|abbrev RustArray", "path": "proofs/lean/extraction/.lake/packages/Hax", "glob": "*.lean", "output_mode": "content", "... [+10 chars])
+[tool] Grep({"pattern": "RustArray", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "-n": true, "head_limit": 50})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/hax/array.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/sequence.lean"})
+[tool] Grep({"pattern": "\\|\\|\\?|or\\?|hax.\\|\\||def or", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "-n": tr... [+21 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/hax/logical_op.lean"})
+[tool] Grep({"pattern": "def gt|>\\?|cmp\\.gt|cmp.lt", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops", "output_mode": "... [+39 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/**/*.lean"})
+[tool] Grep({"pattern": "cmp\\.gt|cmp\\.lt|cmp\\.le|cmp\\.ge|cmp\\.eq|gt\\?|lt\\?", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_prim... [+55 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean"})
+[tool] Grep({"pattern": "lt_iff_toInt_lt", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "content", "-n": true, "head_limit": 10})
+Let me look at the existing file structure and check for any other helpful prelude info:
+[tool] Grep({"pattern": "Vector.toArray|Array.append|Array.push|Array.size_append", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "content", "-n": tru... [+20 chars])
+[tool] Grep({"pattern": "USize64.toNat_ofNat_of_lt'|size_lt_usizeSize", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content... [+32 chars])
+[tool] Grep({"pattern": "#v\\[|Vector.toArray|Vector.size", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "content", "-n": true, "head_limit": 15})
+Now I have enough understanding. Let me write the proof. I'll do it incrementally, starting with the helpers and step lemmas.
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "overwrite": true, "error_message": "Replacing the obligations file with a closed-proo... [+21975 chars])
+[tool] run_lake_build({})
+The build failed with several issues. Let me investigate the structure of `partial_fixpoint` more, since my `unfold` step isn't reducing the goal cleanly:
+[tool] Grep({"pattern": "partial_fixpoint|partial_fix|\\.eq_def", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns"... [+57 chars])
+[tool] Grep({"pattern": "core_models.slice.Impl.len|slice_length", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "-... [+9 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/slice.lean"})
+[tool] Grep({"pattern": "simpa", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns", "output_mode": "files_with_matc... [+23 chars])
+[tool] Grep({"pattern": "core_models.slice.Impl.len|def Impl.len", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "-... [+9 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/core_models.lean", "offset": 1935, "limit": 10})
+Let me read what I actually wrote and look for the line that triggered "unknown tactic":
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "offset": 155, "limit": 15})
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "offset": 265, "limit": 15})
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "offset": 385, "limit": 15})
+[tool] Grep({"pattern": "^macro_rules.*set|^syntax.*set.*tactic|^elab.*set", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "files_with_matches"})
+I see the issue — `set` isn't available without Mathlib. Let me rewrite the proof more carefully:
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "overwrite": true, "error_message": "Rewriting: avoid `set` tactic (unavailable withou... [+9459 chars])
+Let me take a different approach. I'll consult an existing successful proof for `partial_fixpoint` that handles a Vec/accumulator. Let me check `000_has_close_elements`:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/000_has_close_elements_modified/proofs/lean/extr... [+54 chars])
+Now I see clearly what works. Let me write a cleaner version using the pattern from `000_has_close_elements`:
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "overwrite": true, "error_message": "Rewriting with style from 000_has_close_elements:... [+19329 chars])
+[tool] run_lake_build({})
+Let me search for the right `max_eq_right` lemma name and fix multiple issues:
+[tool] Grep({"pattern": "max_eq_left|max_eq_right|theorem max_eq", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "content", "-n": true, "head_limit": ... [+3 chars])
+[tool] Grep({"pattern": "split_ifs", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "content", "-n": true, "head_limit": 5})
+[tool] Grep({"pattern": "Int.max|max_def|max_self", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "-n": true, "head... [+12 chars])
+[tool] Grep({"pattern": "Int.max_|max.*: .*Int.*=", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "files_with_matches", "head_limit": 10})
+Let me rewrite using `if/then/else` instead of `max` (avoiding Mathlib lemmas) and fixing the other issues:
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "overwrite": true, "error_message": "Rewriting: use if/then/else instead of max (no Ma... [+22595 chars])
+[tool] run_lake_build({})
+Let me take a step back and rewrite more carefully:
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "overwrite": true, "error_message": "Cleaner rewrite: match simp's bool forms (i == 0,... [+24656 chars])
+[tool] run_lake_build({})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Fix usize_beq_zero_eq, remove unused simp, fix push_one h argument; ... [+1069 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Remove the `simp made no progress` lines.", "patch": "<<< SEARCH\n  ... [+617 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Remove the second `simp made no progress` line.", "patch": "<<< SEAR... [+723 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Fix dependent rewrite in the i.toNat=0 case using subst-via-eqn patt... [+1453 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Fix lt_of_not_ge to use Int64.not_lt or direct computation.", "patch... [+1122 chars])
+Now fix the IH application by expanding the `have new_max := ...; ...`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Use `show` to expand the let in the goal, so we can apply ih.", "pat... [+1523 chars])
+[tool] run_lake_build({})
+[tool] Grep({"pattern": "Array.getElem_append_left|getElem_append_right", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "content", "-n": true, "head_limit... [+6 chars])
+[tool] Grep({"pattern": "Array.getElem_append", "path": "/Users/tobiaskrogh/.elan/toolchains", "output_mode": "files_with_matches", "head_limit": 5})
+[tool] Grep({"pattern": "getElem_append", "path": "/Users/tobiaskrogh/.elan/toolchains/leanprover--lean4---v4.29.0/src/lean/Init/Data/Array", "output_mode": "content", "-n"... [+25 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Fix usize_beq_zero_eq for the i=0 case using rfl instead of decide+s... [+959 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Fix the i.toNat=0 case using subst to avoid dependent rewrite issue.... [+1709 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Fix Array.getElem_append_left signature usage (hlt is positional, no... [+1836 chars])
+Now let me also remove the second pair of "simp made no progress" lines:
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "offset": 195, "limit": 60})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Remove simp made no progress at lines 201 and 249.", "patch": "<<< S... [+345 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Remove simp made no progress before unsize for max_so_far case.", "p... [+440 chars])
+[tool] run_lake_build({})
+[tool] Grep({"pattern": "Array.size_singleton|size_mk|size_singleton", "path": "/Users/tobiaskrogh/.elan/toolchains/leanprover--lean4---v4.29.0/src/lean", "output_mode": "c... [+38 chars])
+Let me fix the multiple issues - the `decide` problem with free variables and other issues:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Fix usize_beq_zero_eq's i=0 case using decide directly.", "patch": "... [+876 chars])
+Now let me add a singleton-size helper and use it instead of `by decide` for Seq constructions:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Add singleton_lt helper and replace `by decide` proofs with it (avoi... [+303 chars])
+Now replace all the `by decide` proofs in the Seq constructors:
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "offset": 200, "limit": 80})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Replace `by decide` Seq proofs with one_lt_usize_size to avoid free-... [+2471 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Same replacement for the max_so_far branch.", "patch": "<<< SEARCH\n... [+2144 chars])
+Now fix the `subst hj_eq` + `Nat.sub_self` issue at line 428:
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "offset": 410, "limit": 35})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Use simp only [Nat.sub_self] to handle the dependent rewrite, instea... [+494 chars])
+[tool] run_lake_build({})
+I need to add `simp` to reduce the bind, and use `unfold` in the extend_from_slice rewrite:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Add simp before the extend rewrite and unfold extend_from_slice in t... [+2228 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "error_message": "Same fix for max_so_far branch.", "patch": "<<< SEARCH\n    rw [show... [+1933 chars])
+[tool] run_lake_build({})
+The build succeeded. Let me verify there are no `sorry`s remaining:
+[tool] Grep({"pattern": "sorry|admit", "path": "proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "output_mode": "content", "-n": true})
+[tool] run_lake_build({})
+All four obligations are closed with no `sorry`s and a clean build.
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Clever_009_rolling_maxObligations.lean`
+
+**All four top-level obligations closed (no `sorry`s):**
+
+| Theorem | Status |
+|---|---|
+| `rolling_max_total` — totality (∃ v, rolling_max numbers = ok v) | ✅ closed |
+| `rolling_max_empty` — empty input → empty output | ✅ closed |
+| `rolling_max_length` — length postcondition (`v.val.size = numbers.val.size`) | ✅ closed |
+| `rolling_max_prefix_max` — `(v.val[i]).toInt = prefix_max_int numbers (i+1)` | ✅ closed |
+
+**Helper machinery added (all proved, no `sorry`s):**
+
+- `prefix_max_int_one` / `prefix_max_int_succ` — recursion lemmas for the prefix-max oracle (using `if/then/else` form to avoid Mathlib's `max_eq_*` lemmas).
+- `usize_beq_zero_eq` — bridges `i == 0 : Bool` (the `BEq` form simp produces) to `decide (i.toNat = 0)`.
+- `usize_one_toNat`, `usize_add_one_toNat`, `usize_size_eq`, `one_lt_usize_size` — usize arithmetic.
+- `RustM_ok_bind` — `RustM.ok x >>= f = f x` simp lemma.
+- `push_one` — definitionally appends one element to the accumulator Vec.
+- `rolling_max_at_oob` — out-of-bounds step (returns `ok acc`).
+- `rolling_max_at_step` — recursion step, with the inner `if (i == 0 || decide(n > max))` branch case-split inside.
+- `rolling_max_at_correct` — strong-induction lemma on the measure `numbers.val.size - i.toNat`. Threads three invariants in lockstep:
+  - `acc.val.size = i.toNat` (Vec grows in step with the index);
+  - per-entry prefix-max property on `acc`;
+  - `max_so_far.toInt = prefix_max_int numbers i.toNat` for `i ≥ 1`.
+- `rolling_max_aux` — specialises the strong induction at `i := 0, max_so_far := 0, acc := empty Vec`. All four top-level theorems destructure its `∃` to recover their individual postconditions.
+
+**Sub-goals that were difficult and how resolved:**
+
+1. **`decide` failing on propositions with free variables** (`#[x].size < USize64.size`). The `decide` tactic refused to elaborate because of "free variables in expected type". Resolved by introducing `private theorem one_lt_usize_size : (1 : Nat) < USize64.size := by decide` as a closed lemma and providing it as the Seq's `size_lt_usizeSize` proof — `#[x].size = 1` definitionally, so Lean accepts a `1 < USize64.size` proof for `#[x].size < USize64.size`.
+
+2. **Reducing the inner `if (i ==? 0) ||? (n >? max)` body** that `simp` left behind as `if (i == 0 || decide (n > max_so_far)) = true then ... else ...`. Resolved by case-splitting on this boolean *inside* `rolling_max_at_step`, then collapsing each branch via two `rw`s with manual `unfold` of `extend_from_slice` (the prelude's `if dif_pos` form).
+
+3. **Boolean-form mismatches** — simp produces `i == 0` (the `BEq` form), not `decide (i = 0)`. Bridged via the helper `usize_beq_zero_eq`.
+
+4. **Dependent-rewrite failures**: rewriting `i.toNat → 0` in `numbers.val[i.toNat]'hi_lt` failed because `hi_lt` depended on the index. Resolved by deriving `i = (0 : usize)` via `USize64.toNat_inj.mp hi_zero` and then `subst`, which substitutes uniformly.
+
+5. **Strong-induction body** — handling the new accumulator's per-entry property required case-splitting on `j < acc.val.size` (existing entries inherited via `Array.getElem_append_left`) versus `j = acc.val.size` (the new entry, equal to `new_max`, whose toInt matches `prefix_max_int numbers (i.toNat + 1)`).
+
+**Obligations left as `sorry`:** None.
+[make_proof] attempt 1 done — 0 sorry remain
+[make_proof] closed after 1 attempt(s)
+
+make_proof
+Looking at this proof, I need to compare its obstacles against the existing library.
+
+**Existing tail-recursive slice scans** (`below_zero_modified`, `sum_product_modified`, `contains_u64_modified`, `000_has_close_elements_modified`) all use strong induction on `size - i.toNat` with running accumulators, but they return **scalars** (Bool / i64 / (i64,i64) tuple) — never a Vec with a per-element specification.
+
+**What's structurally new here:**
+1. **Vec output construction** via `extend_from_slice` / `unsize` of `RustArray i64 1` / a custom `push_one` helper — none of the existing entries reason about Vec mutation in the step lemma.
+2. **Elementwise output invariant** — the strong-induction hypothesis carries `∀ j, (acc.val[j]).toInt = prefix_max_int numbers (j+1)`, and the inductive step uses `Array.getElem_append_left/right` to extend the property to the appended slot.
+3. **First-iteration short-circuit via `(i == 0)`** — the implementation avoids needing `i64::MIN` by special-casing index 0; the proof bridges `(i == (0 : usize))` to `decide (i.toNat = 0)` via a dedicated `usize_beq_zero_eq` lemma.
+4. **Recursive oracle (`prefix_max_int : Nat → Int`)** for prefix-max with an explicit `k = 0` arm — similar in spirit to `below_zero`'s `prefix_sum_int` but with the first-element special case baked in.
+
+This is a meaningfully different obstacle set from anything in the library — the Vec-output / elementwise invariant pattern is not covered. Adding.
+[tool] add_proof_pattern({"name": "009_rolling_max_modified", "features": ["recursion", "strong-induction", "recursive-equation-unfold", "slice-indexing", "existential-postcondition", "... [+943 chars])
+The name validator requires a leading letter. I'll prefix with `clever_`.
+[tool] add_proof_pattern({"name": "clever_009_rolling_max_modified", "features": ["recursion", "strong-induction", "recursive-equation-unfold", "slice-indexing", "existential-postcondit... [+950 chars])
+**ADDED `clever_009_rolling_max_modified`**
+
+Features (14): `recursion`, `strong-induction`, `recursive-equation-unfold`, `slice-indexing`, `existential-postcondition`, `signed-int-toInt-bridge`, `usize-add-no-overflow`, `bv-nat-bridge`, `vec-output-construction`, `extend-from-slice-step`, `elementwise-output-invariant`, `recursive-oracle-spec`, `first-iteration-special-case`, `usize-beq-zero-bridge`.
+
+Summary: Tail-recursive prefix-max scan over an i64 slice building a Vec output via extend_from_slice; strong induction on size − i.toNat with an elementwise output invariant — step lemma discharges unsize/extend_from_slice/push_one, Array.getElem_append_left/right closes the per-index property at the appended slot, usize_beq_zero_eq bridges the (i == 0) short-circuit to avoid an i64::MIN sentinel.
+
+**Observations for human reviewers:**
+- This is the first library entry that exercises a **Vec-output postcondition** — prior tail-recursive scans (`below_zero`, `sum_product`, `contains_u64`, `has_close_elements`) all returned scalars/Bool/tuples. Future targets that emit lists/Vecs (`make_a_pile`, `cumsum`, `parse_paren_groups`, etc.) should look here.
+- The `extend_from_slice` step is fiddly: the proof uses a typed `let chunk: [i64; 1]` in Rust so `unsize` resolves the `RustArray` size parameter cleanly, then in Lean reduces `unsize` to a `RustM.ok` of a literal `RustSlice` and unfolds `Impl_2.extend_from_slice` with `dif_pos h_app_size`.
+- The first-iteration special case (no `i64::MIN` sentinel) is interesting: rather than threading a `Option`/sentinel through the accumulator, the implementation makes the running max meaningless at `i=0` and the proof reflects this with a conditional invariant `(1 ≤ i.toNat → max_so_far.toInt = prefix_max_int numbers i.toNat)`. Worth copying for any "running aggregate with no neutral element" problem.
+
+harvest_proof_patterns
+Stage notes: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260513-181107_009_rolling_max_stage_notes.json
+[cleanup] freed 350.9MB from benchmarks/claude-opus-4-7/clever/009_rolling_max_modified

@@ -1,0 +1,39 @@
+
+-- Experimental lean backend for Hax
+-- The Hax prelude library can be found in hax/proof-libs/lean
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+
+
+namespace clever_042_pairs_sum_to_zero
+
+--  Return true iff two distinct positions in `numbers` hold values that
+--  sum to zero.
+-- 
+--  Note: with the `u64` type pinned by CLEVER, the only pair summing to 0
+--  is two zero entries. A richer formulation requires `&[i64]`.
+@[spec]
+def count_zeros_at (numbers : (RustSlice u64)) (i : usize) (acc : u64) :
+    RustM u64 := do
+  if (← (i >=? (← (core_models.slice.Impl.len u64 numbers)))) then do
+    (pure acc)
+  else do
+    if (← ((← numbers[i]_?) ==? (0 : u64))) then do
+      (count_zeros_at numbers (← (i +? (1 : usize))) (← (acc +? (1 : u64))))
+    else do
+      (count_zeros_at numbers (← (i +? (1 : usize))) acc)
+partial_fixpoint
+
+@[spec]
+def pairs_sum_to_zero (numbers : (RustSlice u64)) : RustM Bool := do
+  ((← (count_zeros_at numbers (0 : usize) (0 : u64))) >=? (2 : u64))
+
+end clever_042_pairs_sum_to_zero
+

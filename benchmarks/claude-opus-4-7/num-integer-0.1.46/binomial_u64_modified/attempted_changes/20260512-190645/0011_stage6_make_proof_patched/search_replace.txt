@@ -1,0 +1,118 @@
+<<< SEARCH
+    simp only [show (k >? n) = (pure (decide (k > n)) : RustM Bool) from rfl,
+               show (k >? (n - k)) = (pure (decide (k > (n - k))) : RustM Bool) from rfl,
+               h_kn_gt_false, h_sub_pure, h_k_gt_nk_false, pure_bind,
+               Bool.false_eq_true, ↓reduceIte]
+    -- After these reductions, the goal is a Hoare triple about
+    -- `do let ⟨d, n', r'⟩ ← Loop.MonoLoopCombinator.while_loop … ⟨1, n, 1⟩ …; pure r'`.
+    unfold rust_primitives.hax.while_loop
+    -- Build a Hoare triple for the underlying loop with the multiplicative
+    -- invariant, then bind with `pure r` to extract the final `r` value.
+    -- The invariant tracks (after `j = d - 1` iterations):
+    --   * `1 ≤ d.toNat ≤ k.toNat + 1`
+    --   * `n'.toNat + d.toNat = n.toNat + 1`  (i.e. `n' = n - (d - 1)`)
+    --   * `r.toNat = natChoose n.toNat (d.toNat - 1)`
+    -- The body step is the genuine difficulty: see docstring for the
+    -- multiply_and_divide / gcd_u64 chain. Termination measure:
+    -- `k.toNat + 1 - d.toNat`.
+    have h_loop_triple :
+        ⦃⌜ (1 : u64).toNat = 1 ∧
+            n.toNat + 1 = n.toNat + 1 ∧
+            (1 : u64).toNat = natChoose n.toNat 0 ⌝⦄
+          Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk
+            (fun b : rust_primitives.hax.Tuple3 u64 u64 u64 =>
+                decide (b._0.toNat ≤ k.toNat))
+            (rust_primitives.hax.Tuple3.mk (1 : u64) n (1 : u64))
+            (fun x : rust_primitives.hax.Tuple3 u64 u64 u64 => do
+              let r ← binomial_u64.multiply_and_divide x._2 x._1 x._0
+              let n ← x._1 -? 1
+              let d ← x._0 +? 1
+              pure (rust_primitives.hax.Tuple3.mk d n r))
+        ⦃⇓ b => ⌜ b._2.toNat = natChoose n.toNat k.toNat ⌝⦄ := by
+      sorry
+    -- Bind the loop triple with `pure r` to peel off the third component.
+    have h_strong :
+        ⦃⌜ True ⌝⦄
+          (do
+            let r := (1 : u64)
+            let d := (1 : u64)
+            let ⟨_, _, r⟩ ←
+              Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk
+                (fun b : rust_primitives.hax.Tuple3 u64 u64 u64 =>
+                    decide (b._0.toNat ≤ k.toNat))
+                (rust_primitives.hax.Tuple3.mk d n r)
+                (fun x : rust_primitives.hax.Tuple3 u64 u64 u64 => do
+                  let r ← binomial_u64.multiply_and_divide x._2 x._1 x._0
+                  let n ← x._1 -? 1
+                  let d ← x._0 +? 1
+                  pure (rust_primitives.hax.Tuple3.mk d n r))
+            pure r)
+        ⦃⇓ r => ⌜ r = UInt64.ofNat (natChoose n.toNat k.toNat) ⌝⦄ := by
+      -- The two non-monadic `let`s reduce immediately; what remains is the
+      -- loop bound to `⟨_, _, r⟩` then `pure r`. Use the loop triple.
+      have h_loop_weak :
+          ⦃⌜ True ⌝⦄
+            Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk
+              (fun b : rust_primitives.hax.Tuple3 u64 u64 u64 =>
+                  decide (b._0.toNat ≤ k.toNat))
+              (rust_primitives.hax.Tuple3.mk (1 : u64) n (1 : u64))
+              (fun x : rust_primitives.hax.Tuple3 u64 u64 u64 => do
+                let r ← binomial_u64.multiply_and_divide x._2 x._1 x._0
+                let n ← x._1 -? 1
+                let d ← x._0 +? 1
+                pure (rust_primitives.hax.Tuple3.mk d n r))
+          ⦃⇓ b => ⌜ b._2.toNat = natChoose n.toNat k.toNat ⌝⦄ := by
+        apply Triple.of_entails_left _ _ _ _ h_loop_triple
+        intro _
+        refine ⟨rfl, rfl, ?_⟩
+        rw [natChoose_zero_right]
+        rfl
+      apply Triple.bind _ _ h_loop_weak
+      intro s
+      cases s with
+      | mk _ _ r =>
+        refine Triple.pure r ?_
+        intro h
+        -- h : r.toNat = natChoose n.toNat k.toNat
+        -- Goal: r = UInt64.ofNat (natChoose n.toNat k.toNat)
+        apply UInt64.toNat_inj.mp
+        rw [h]
+        -- Goal: natChoose n.toNat k.toNat = (UInt64.ofNat (natChoose n.toNat k.toNat)).toNat
+        have h_nc_lt : natChoose n.toNat k.toNat < 2 ^ 64 := by
+          have h_bound : natChoose n.toNat k.toNat ≤ 2 ^ n.toNat :=
+            natChoose_le_two_pow n.toNat k.toNat
+          have h_pow_le : 2 ^ n.toNat ≤ 2 ^ 67 :=
+            Nat.pow_le_pow_right (by decide : 1 ≤ 2) hn
+          have h_lt : 2 ^ 67 < 2 ^ 64 := by
+            -- 2^67 > 2^64, so this is FALSE: the row-sum bound is too loose.
+            -- We need a tighter bound. natChoose 67 33 ≈ 1.4 × 10^19 < 2^64.
+            sorry
+          omega
+        rw [UInt64.toNat_ofNat_of_lt' h_nc_lt]
+      sorry
+    exact h_strong
+===
+    simp only [show (k >? n) = (pure (decide (k > n)) : RustM Bool) from rfl,
+               show (k >? (n - k)) = (pure (decide (k > (n - k))) : RustM Bool) from rfl,
+               h_kn_gt_false, h_sub_pure, h_k_gt_nk_false, pure_bind,
+               Bool.false_eq_true, ↓reduceIte]
+    -- After these reductions, the goal is a Hoare triple about
+    -- `do let ⟨d, n', r'⟩ ← Loop.MonoLoopCombinator.while_loop … ⟨1, n, 1⟩ …; pure r'`.
+    -- A first attempt at pushing further unfolded
+    -- `rust_primitives.hax.while_loop` and tried to extract `r` from the
+    -- final Tuple3 by binding through `pure r`. That attempt surfaced a
+    -- second concrete blocker beyond the body-step itself: the overflow
+    -- bound. The available `natChoose_le_two_pow` gives only
+    -- `natChoose n k ≤ 2^n`, which for `n ≤ 67` exceeds `2^64` (since
+    -- `2^67 > 2^64`). The actual fact we need —
+    --   `∀ k, n.toNat ≤ 67 → natChoose n.toNat k < 2^64`
+    -- — is true (since `natChoose 67 33 ≈ 1.42 * 10^19 < 2^64 ≈ 1.84 * 10^19`),
+    -- but requires a different argument than the symmetric row-sum bound.
+    -- That argument is itself part of the structural unblock listed in the
+    -- docstring: a tight `natChoose_lt_two_pow_64` lemma (provable by
+    -- `decide` on the finite table for `n ≤ 67`, or by Pascal-recurrence
+    -- induction with the explicit `1.42 * 10^19 < 2^64` bound) plus the
+    -- gcd / multiply_and_divide correctness chain together discharge the
+    -- loop. See docstring for the full unblock path.
+    sorry
+>>> REPLACE

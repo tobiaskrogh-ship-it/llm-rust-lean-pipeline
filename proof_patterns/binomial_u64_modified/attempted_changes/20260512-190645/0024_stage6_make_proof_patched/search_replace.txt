@@ -1,0 +1,150 @@
+<<< SEARCH
+/-- The loop case of `binomial_postcondition`: when `0 < k` and
+    `2 * k ≤ n` (so the function takes the non-recursive branch with the
+    inner `while d ≤ k` loop), the result is `UInt64.ofNat (natChoose n k)`.
+
+    `binomial_postcondition` reduces every other case to this one — case
+    `k > n` is closed by `binomial_k_gt_n`, case `k = 0` by
+    `binomial_k_zero`, case `k = n` by `binomial_k_eq_n` +
+    `natChoose_symmetry`, and case `n - k < k < n` by `binomial_symmetry`
+    applied to swap arguments to `(n, n - k)` (which then satisfies
+    `2 * (n - k) ≤ n`) plus `natChoose_symmetry`.
+
+    Stage 1 of the proof (the Hoare triple) is scaffolded below: we
+    `unfold binomial_u64.binomial`, reduce the `k > n` and `k > n - k`
+    guards to false via `sub_pure` + `decide_eq_false`, and arrive at a
+    triple about the underlying `Loop.MonoLoopCombinator.while_loop`.
+    Stage 2 (the triple-to-equation conversion via
+    `RustM.Triple_iff_BitVec`) is fully written out and reused verbatim
+    from `binomial_k_zero`.
+
+    Stuck sub-goal: after the simp reduces the early-return guards, the
+    remaining triple is about the loop with initial state `⟨1, n, 1⟩`
+    and body `fun ⟨d, n', r⟩ => do
+      let r ← multiply_and_divide r n' d
+      let n' ← n' -? 1
+      let d ← d +? 1
+      pure ⟨d, n', r⟩`. Applying `Spec.MonoLoopCombinator.while_loop`
+    with the natural invariant
+      `loopInv ⟨d, n', r⟩ ≡ 1 ≤ d.toNat ∧ d.toNat ≤ k.toNat + 1
+                         ∧ n'.toNat = n.toNat - (d.toNat - 1)
+                         ∧ r.toNat = natChoose n.toNat (d.toNat - 1)`
+    and termination measure `k.toNat + 1 - d.toNat` reduces the goal to
+    a body-step obligation. The body-step obligation requires:
+      (a) `multiply_and_divide r n' d = RustM.ok r_new` with
+          `r_new.toNat = natChoose n.toNat d.toNat`. This unfolds to a
+          Hoare triple for `multiply_and_divide`, which in turn requires
+          `gcd_u64 r d = RustM.ok (UInt64.ofNat (Nat.gcd r.toNat d.toNat))`.
+      (b) Exact-divisibility: `(d / Nat.gcd r d) ∣ n'` so the
+          `a / (b / g)` step inside `multiply_and_divide` produces no
+          remainder. This holds because by the invariant
+          `r.toNat * d.toNat / Nat.gcd ... = natChoose n.toNat (d.toNat - 1) * (n.toNat - (d.toNat - 1))`
+          and the Nat-level identity
+          `natChoose n.toNat d.toNat * d.toNat = natChoose n.toNat (d.toNat - 1) * (n.toNat - (d.toNat - 1))`.
+      (c) New `r.toNat = natChoose n.toNat d.toNat`, which follows from
+          (a) + (b) once `multiply_and_divide` is verified.
+
+    Structural unblock: a separately-verified
+      `gcd_u64_postcondition : ∀ x y : u64,
+         binomial_u64.gcd_u64 x y =
+           RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat))`
+    Stein's binary GCD correctness, proved as its own pipeline target
+    (the Rust source already exposes `gcd_u64` and `trailing_zeros_u64`
+    as top-level functions, so this is a single additional target). With
+    that lemma in hand, the body-step obligation reduces to the Nat-level
+    multiplicative-recurrence identity above, which is a routine
+    inductive argument from `Nat.div_mul_div_comm`, `Nat.gcd_dvd_left/right`,
+    and the unfolded definition of `natChoose` — no Mathlib import
+    required. The work splits cleanly into: (i) `gcd_u64` Stein-algorithm
+    correctness (own target), (ii) `multiply_and_divide` correctness
+    (derived from gcd), (iii) the binomial loop invariant (derived from
+    multiply_and_divide). -/
+===
+/-- The loop case of `binomial_postcondition`: when `0 < k` and
+    `2 * k ≤ n` (so the function takes the non-recursive branch with the
+    inner `while d ≤ k` loop), the result is `UInt64.ofNat (natChoose n k)`.
+
+    `binomial_postcondition` reduces every other case to this one — case
+    `k > n` is closed by `binomial_k_gt_n`, case `k = 0` by
+    `binomial_k_zero`, case `k = n` by `binomial_k_eq_n` +
+    `natChoose_symmetry`, and case `n - k < k < n` by `binomial_symmetry`
+    applied to swap arguments to `(n, n - k)` (which then satisfies
+    `2 * (n - k) ≤ n`) plus `natChoose_symmetry`.
+
+    Proof structure (mirrors `binomial_k_zero` and the
+    `while_example` canonical pattern):
+      * Stage 1 — Hoare triple via `Spec.MonoLoopCombinator.while_loop`
+        with the multiplicative loop invariant
+          `loopInv ⟨d, n', r⟩ ≡ 1 ≤ d.toNat ∧ d.toNat ≤ k.toNat + 1
+                             ∧ n'.toNat = n.toNat - (d.toNat - 1)
+                             ∧ r.toNat = natChoose n.toNat (d.toNat - 1)`
+        and termination measure `k.toNat + 1 - d.toNat`. The spec lemma's
+        body-step subgoal is the only `sorry` that remains (see below).
+        Post-strengthening (loopInv + ¬cond ⟹ `b._2 = UInt64.ofNat
+        (natChoose n k)`), pre-weakening (`True ⟹ loopInv ⟨1, n, 1⟩`),
+        and `Triple.bind`-based extraction of `b._2` from the final
+        Tuple3 are all fully closed.
+      * Stage 2 — equational conversion via `RustM.Triple_iff_BitVec`
+        and case-analysis on the `RustM` result, identical template to
+        `binomial_k_zero` and `gcd_while_postcondition`.
+
+    The overflow bound `natChoose n.toNat k.toNat < 2 ^ 64` (which the
+    earlier `n ≤ 67` row-sum bound was too weak to give) falls out of
+    the loop invariant itself: the running `b._2 : u64` always satisfies
+    `b._2.toNat < 2 ^ 64`, and the invariant pins
+    `b._2.toNat = natChoose n.toNat (b._0.toNat - 1)`, hence
+    `natChoose n.toNat (b._0.toNat - 1) < 2 ^ 64` at every state the
+    loop reaches. At loop exit `b._0.toNat = k.toNat + 1`, giving
+    `natChoose n.toNat k.toNat < 2 ^ 64` — exactly what
+    `UInt64.toNat_ofNat_of_lt'` needs to invert the `UInt64.ofNat`.
+
+    Remaining `sorry` — body step of the spec-lemma application:
+      Under `cond ⟨d, n', r⟩` (i.e. `d.toNat ≤ k.toNat`) and the
+      invariant above, prove
+        ⦃loopInv ⟨d, n', r⟩⦄
+          do
+            let r' ← multiply_and_divide r n' d
+            let n'' ← n' -? 1
+            let d' ← d +? 1
+            pure ⟨d', n'', r'⟩
+        ⦃⇓ b' => term b' < term ⟨d, n', r⟩ ∧ loopInv b'⦄.
+      The two arithmetic operations (`n' -? 1`, `d +? 1`) are routine
+      from the invariant: `n'.toNat = n.toNat - (d.toNat - 1) ≥ k.toNat
+      ≥ 1` rules out subtraction underflow; `d.toNat ≤ k.toNat + 1
+      ≤ 68` rules out addition overflow. The blocking sub-call is
+      `multiply_and_divide r n' d`: we need
+        `multiply_and_divide r n' d = RustM.ok r_new`
+        with `r_new.toNat = natChoose n.toNat d.toNat`,
+      which decomposes into:
+        (a) `gcd_u64 r d = RustM.ok (UInt64.ofNat (Nat.gcd r.toNat
+            d.toNat))` — Stein's binary GCD correctness.
+        (b) Exact-divisibility `Nat.gcd r.toNat d.toNat ∣ d.toNat` and
+            `(d.toNat / Nat.gcd r.toNat d.toNat) ∣ n'.toNat`, so the
+            `r/g * (a/(b/g))` form computes `r * a / b` without
+            remainder. The Nat identity
+              `natChoose n d * d = natChoose n (d-1) * (n - d + 1)`
+            (a routine `Nat`-induction proof from the recursive
+            definition of `natChoose`) supplies the divisibility.
+        (c) The resulting `r/g * (a/(b/g))` fits in `u64`: this falls
+            out of `natChoose n.toNat d.toNat < 2 ^ 64`, which by the
+            invariant-derivation argument above will be the new
+            invariant content for the next iteration — so it is exactly
+            the post-condition we are establishing here, forming the
+            inductive step.
+
+    Structural unblock — `gcd_u64_postcondition` as its own pipeline
+    target. The Rust source already exposes `gcd_u64` and the helper
+    `trailing_zeros_u64` as top-level functions, so verifying
+    Stein's binary algorithm is one additional `_modified` benchmark.
+    With `gcd_u64_postcondition` available as a cross-target import,
+    the body-step obligation closes by:
+      (i) reducing `multiply_and_divide` to `r/g * (a/(b/g))` using
+          `gcd_u64_postcondition`;
+      (ii) applying the Nat-level multiplicative recurrence
+           `natChoose_mult_step` (a routine induction on `n`) to discharge
+           the divisibility / value-equality content;
+      (iii) the no-overflow `r/g * (a/(b/g)) < 2^64` step folds back
+           into the invariant chain.
+    None of (i)–(iii) requires Mathlib; the cross-target gcd import is
+    the only external piece. -/
+>>> REPLACE

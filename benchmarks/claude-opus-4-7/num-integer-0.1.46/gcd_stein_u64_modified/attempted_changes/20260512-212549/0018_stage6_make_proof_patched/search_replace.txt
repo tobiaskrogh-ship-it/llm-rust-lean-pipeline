@@ -1,0 +1,244 @@
+<<< SEARCH
+/-! ## Helper lemmas the next pass will need
+
+These are the *exact* lemma statements the main-case proof will use.
+Each is left as `sorry` with its own structural-unblock docstring so a
+future pass attacks them in isolation rather than rediscovering the
+shape. -/
+
+/-- **Trailing-zero counter — totality.** For every `u64`, `trailing_zeros_u64`
+returns *some* value in `RustM` (it never panics or diverges).
+
+* When `x = 0` the function short-circuits to `pure 64` (no loop), so
+  this is trivial.
+* When `x ≠ 0` the inner `while y & 1 == 0` loop terminates because
+  the loop measure `y.toNat` strictly halves each iteration (`y` even
+  ⟹ `(y >>> 1).toNat = y.toNat / 2 < y.toNat`), and the loop only
+  iterates while `y & 1 == 0`.  Termination requires the body's `>>>?`
+  shift to succeed — the shift amount `(1 : i32)` is fixed, so the
+  `0 ≤ y < 64` shift-amount check is `true` by computation.
+
+Structural unblock: prove this via the `while_example` two-stage
+template (Stage 1: `Spec.MonoLoopCombinator.while_loop` with invariant
+`count.toNat < 64 ∧ y.toNat * 2^count.toNat = x.toNat` and measure
+`y.toNat`; Stage 2: not needed for the existence claim — just project
+the witness via `Exists.intro`). -/
+private theorem trailing_zeros_u64_total (x : u64) :
+    ∃ k : u32, gcd_stein_u64.trailing_zeros_u64 x = RustM.ok k := by
+  -- x = 0 branch closes inline (short-circuit to pure 64).
+  by_cases hx : x = 0
+  · subst hx
+    refine ⟨64, ?_⟩
+    simp only [gcd_stein_u64.trailing_zeros_u64, rust_primitives.cmp.eq,
+               pure_bind, beq_self_eq_true, ↓reduceIte]
+    rfl
+  · -- x ≠ 0 branch needs the inner while-loop's termination argument.
+    -- Stuck sub-goal: after unfolding `trailing_zeros_u64` and entering the
+    -- else-branch, the goal contains `rust_primitives.hax.while_loop` with
+    -- cond `(y &&& 1) ==? 0`, body `do y ← (y >>>? 1); count ← (count +? 1); …`,
+    -- and we need to project a witness for the loop result.
+    -- The while_loop's partial_fixpoint definition does not reduce
+    -- definitionally past one iteration, so a direct `refine` cannot supply
+    -- the witness — we need to apply `Spec.MonoLoopCombinator.while_loop`
+    -- with the invariant `count.toNat + Nat.log2 y.toNat ≤ 64 ∧ y.toNat > 0`
+    -- and measure `y.toNat`, then peel back via `RustM.Triple_iff_BitVec`.
+    -- See file-level docstring for the full structural unblock.
+    exact sorry
+===
+/-! ## Loop infrastructure for `trailing_zeros_u64`
+
+Mirroring the `gcd_while_modified` two-stage template: define the loop
+explicitly as `Loop.MonoLoopCombinator.while_loop`, prove a Hoare triple
+with a strong invariant, then peel back to an existence/equation.  The
+strong invariant is `y > 0 ∧ count < 64`, the termination measure is
+`y.toNat`.  Because `y &&& 1 = 0` (the loop guard) forces `y` to be
+even, and `y > 0 ∧ even ⟹ y ≥ 2`, the body's right-shift halves `y`
+strictly — giving the strict decrease for the measure. -/
+
+open rust_primitives.hax (Tuple2) in
+private abbrev tzCond : Tuple2 u32 u64 → Bool :=
+  fun s => decide ((s._1 &&& (1 : u64)).toNat = (0 : u64).toNat)
+
+open rust_primitives.hax (Tuple2) in
+private abbrev tzBody : Tuple2 u32 u64 → RustM (Tuple2 u32 u64) :=
+  fun s =>
+    match s with
+    | ⟨count, y⟩ =>
+      (do
+        let y : u64 ← (y >>>? (1 : i32))
+        let count : u32 ← (count +? (1 : u32))
+        pure (rust_primitives.hax.Tuple2.mk count y) :
+        RustM (rust_primitives.hax.Tuple2 u32 u64))
+
+open rust_primitives.hax (Tuple2) in
+private abbrev tzLoop (x : u64) : RustM (Tuple2 u32 u64) :=
+  Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk tzCond
+    (rust_primitives.hax.Tuple2.mk (0 : u32) x) tzBody
+
+open rust_primitives.hax (Tuple2) in
+/-- Strong invariant: `y` is positive and `count < 64`.  The count bound
+is generous — the loop runs at most 63 times on a u64 — but it suffices
+to discharge the `count +? 1` no-overflow obligation. -/
+private def tzInv (s : Tuple2 u32 u64) : Prop :=
+  s._1.toNat > 0 ∧ s._0.toNat < 64
+
+private def tzTerm (s : Tuple2 u32 u64) : Nat := s._1.toNat
+
+/-- **Trailing-zero counter — totality.** For every `u64`, `trailing_zeros_u64`
+returns *some* value in `RustM` (it never panics or diverges).
+
+* When `x = 0` the function short-circuits to `pure 64` (no loop), so
+  this is trivial.
+* When `x ≠ 0`, we apply `Spec.MonoLoopCombinator.while_loop` to the
+  underlying `Loop.MonoLoopCombinator.while_loop` with the strong
+  invariant `tzInv` (y > 0, count < 64) and measure `tzTerm` (y.toNat).
+  The body step relies on: (a) `(y &&& 1).toNat = 0 ⟹ y even`, (b)
+  `y > 0 ∧ even ⟹ y ≥ 2`, hence `y >>> 1 = y / 2 ≥ 1 > 0`; (c) the
+  i32 shift `0 ≤ 1 < 64` doesn't fail; (d) `count < 64 ⟹ count + 1 ≤
+  64 < 2^32`, so no `count +? 1` overflow.  Existence is then read off
+  via `RustM.Triple_iff_BitVec` (the triple `⦃True⦄ _ ⦃⇓ _ => True⦄`
+  implies `.toBVRustM.ok = true`, i.e. the result is `RustM.ok _`). -/
+private theorem trailing_zeros_u64_total (x : u64) :
+    ∃ k : u32, gcd_stein_u64.trailing_zeros_u64 x = RustM.ok k := by
+  by_cases hx : x = 0
+  · subst hx
+    refine ⟨64, ?_⟩
+    simp only [gcd_stein_u64.trailing_zeros_u64, rust_primitives.cmp.eq,
+               pure_bind, beq_self_eq_true, ↓reduceIte]
+    rfl
+  · -- x ≠ 0: prove the Hoare triple for the loop, then derive existence.
+    have h_x_pos : 0 < x.toNat := by
+      rcases Nat.eq_zero_or_pos x.toNat with h | h
+      · exfalso; apply hx; apply UInt64.toNat_inj.mp; rw [h]; rfl
+      · exact h
+    -- Stage 1: Hoare triple for the inner loop with strong invariant.
+    have h_loop :
+        ⦃⌜ tzInv ⟨(0 : u32), x⟩ ⌝⦄
+          tzLoop x
+        ⦃⇓ r => ⌜ tzInv r ∧ ¬ tzCond r = true ⌝⦄ := by
+      apply Std.Do.Spec.MonoLoopCombinator.while_loop
+        ⟨(0 : u32), x⟩ Lean.Loop.mk tzCond tzBody tzInv tzTerm
+      intro s hcond hinv
+      cases s with
+      | mk count y =>
+        obtain ⟨hy_pos, hcount_lt⟩ := hinv
+        -- Unpack the loop guard: (y &&& 1).toNat = 0.
+        have hcond_eq : (y &&& (1 : u64)).toNat = (0 : u64).toNat := by
+          have := hcond
+          unfold tzCond at this
+          exact of_decide_eq_true this
+        have h_one_uint64_toNat : (1 : u64).toNat = 1 := rfl
+        have h_zero_uint64_toNat : (0 : u64).toNat = 0 := rfl
+        -- y is even.
+        have h_y_mod_2 : y.toNat % 2 = 0 := by
+          have h := hcond_eq
+          rw [UInt64.toNat_and, h_one_uint64_toNat, h_zero_uint64_toNat,
+              Nat.and_one_is_mod] at h
+          exact h
+        -- y ≥ 2.
+        have h_y_ge_2 : 2 ≤ y.toNat := by
+          rcases Nat.lt_or_ge y.toNat 2 with h | h
+          · interval_cases y.toNat
+            · omega
+            · simp at h_y_mod_2
+          · exact h
+        -- The shift y >>>? 1 succeeds because 0 ≤ 1 < 64 over i32.
+        have h_y_shr_eq :
+            (y >>>? (1 : i32) : RustM u64) =
+              pure (y >>> ((1 : i32).toNatClampNeg.toUInt64)) := by
+          show (rust_primitives.ops.bit.Shr.shr y (1 : i32) : RustM u64) = _
+          show (if (0 : Int32) ≤ (1 : i32) && (1 : i32) < 64
+                then pure (y >>> ((1 : i32).toNatClampNeg.toUInt64))
+                else (.fail .integerOverflow : RustM u64)) = _
+          rw [show ((0 : Int32) ≤ (1 : i32) && (1 : i32) < 64) = true from rfl]
+          rfl
+        have h_shift_amount : ((1 : i32).toNatClampNeg.toUInt64 : u64) = (1 : u64) := rfl
+        set y' : u64 := y >>> ((1 : i32).toNatClampNeg.toUInt64) with hy'_def
+        have h_y'_toNat : y'.toNat = y.toNat / 2 := by
+          rw [hy'_def, h_shift_amount, UInt64.toNat_shiftRight]
+          rw [h_one_uint64_toNat, Nat.shiftRight_eq_div_pow, Nat.pow_one]
+          have h_lt : 1 % 64 = 1 := rfl
+          rw [h_lt]
+        have h_y'_pos : 0 < y'.toNat := by rw [h_y'_toNat]; omega
+        have h_y'_lt : y'.toNat < y.toNat := by rw [h_y'_toNat]; omega
+        -- count + 1 doesn't overflow.
+        have h_count_add_eq :
+            (count +? (1 : u32) : RustM u32) = pure (count + 1) := by
+          show (rust_primitives.ops.arith.Add.add count (1 : u32) : RustM u32) = _
+          show (if BitVec.uaddOverflow count.toBitVec (1 : u32).toBitVec
+                then (.fail .integerOverflow : RustM u32)
+                else pure (count + 1)) = _
+          have h_no_ovf : BitVec.uaddOverflow count.toBitVec (1 : u32).toBitVec = false := by
+            cases h_eq : BitVec.uaddOverflow count.toBitVec (1 : u32).toBitVec
+            · rfl
+            · exfalso
+              have h_ovf : UInt32.addOverflow count (1 : u32) = true := h_eq
+              rw [UInt32.addOverflow_iff] at h_ovf
+              have h1 : (1 : u32).toNat = 1 := rfl
+              rw [h1] at h_ovf
+              omega
+          rw [h_no_ovf]; rfl
+        have h_count_succ_nat : (count + 1).toNat = count.toNat + 1 := by
+          rw [UInt32.toNat_add_of_lt]
+          · rfl
+          · have h1 : (1 : u32).toNat = 1 := rfl
+            rw [h1]; omega
+        -- Now compose the body.
+        dsimp only [tzBody]
+        rw [h_y_shr_eq, pure_bind]
+        rw [show (y >>> ((1 : i32).toNatClampNeg.toUInt64) : u64) = y' from rfl]
+        rw [h_count_add_eq, pure_bind]
+        refine Std.Do.Triple.pure _ ?_
+        refine ⟨?_, ?_, ?_⟩
+        · show y'.toNat < y.toNat
+          exact h_y'_lt
+        · show 0 < y'.toNat
+          exact h_y'_pos
+        · show (count + 1).toNat < 64
+          rw [h_count_succ_nat]; omega
+    -- Stage 2: Weaken to ⦃True⦄ _ ⦃⇓ _ => True⦄ and extract existence.
+    have h_init_inv : tzInv ⟨(0 : u32), x⟩ := by
+      refine ⟨h_x_pos, ?_⟩
+      show (0 : u32).toNat < 64
+      decide
+    have h_triple_true : ⦃⌜True⌝⦄ tzLoop x ⦃⇓ _ => ⌜True⌝⦄ := by
+      have h_weak : ⦃⌜ tzInv ⟨(0 : u32), x⟩ ⌝⦄ tzLoop x ⦃⇓ _ => ⌜True⌝⦄ := by
+        apply Std.Do.Triple.of_entails_right _ _ _ _ h_loop
+        apply Std.Do.PostCond.entails.of_left_entails
+        intro r _
+        trivial
+      apply Std.Do.Triple.of_entails_left _ _ _ _ h_weak
+      intro _
+      exact h_init_inv
+    rw [RustM.Triple_iff_BitVec] at h_triple_true
+    simp only [decide_true, Bool.not_true, Bool.false_or,
+               Bool.and_true] at h_triple_true
+    -- Case-split on the loop result.
+    have h_loop_ok : ∃ r : Tuple2 u32 u64, tzLoop x = RustM.ok r := by
+      cases hf : tzLoop x with
+      | none => rw [hf] at h_triple_true; simp [RustM.toBVRustM] at h_triple_true
+      | some result =>
+        cases result with
+        | ok v => exact ⟨v, rfl⟩
+        | error e =>
+          rw [hf] at h_triple_true
+          cases e <;> simp [RustM.toBVRustM] at h_triple_true
+    obtain ⟨r, hr⟩ := h_loop_ok
+    refine ⟨r._0, ?_⟩
+    -- Final step: unfold trailing_zeros_u64 and use hr.
+    show gcd_stein_u64.trailing_zeros_u64 x = RustM.ok r._0
+    unfold gcd_stein_u64.trailing_zeros_u64
+    simp only [rust_primitives.cmp.eq, pure_bind]
+    have h_x_ne_beq : (x == (0 : u64)) = false := by
+      apply Bool.eq_false_of_ne_true
+      intro h
+      apply hx
+      exact beq_iff_eq.mp h
+    rw [h_x_ne_beq]
+    simp only [↓reduceIte]
+    unfold rust_primitives.hax.while_loop
+    show (tzLoop x >>= fun s => match s with | ⟨c, _⟩ => pure c) = RustM.ok r._0
+    rw [hr]
+    cases r with
+    | mk c y => rfl
+>>> REPLACE

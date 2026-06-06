@@ -1,0 +1,1042 @@
+-- Companion obligations file for the `clever_036_sort_even` extraction.
+-- Each property the Rust function should satisfy belongs here as a separate `theorem`.
+
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+import clever_036_sort_even
+
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+
+namespace Clever_036_sort_evenObligations
+
+/-! ## Specification oracle: occurrence count at even-indexed positions.
+
+For an `Array i64` `arr` and a value `target`, `count_at_even arr target k`
+counts the number of indices `j < k` with `j` even and `arr[j] = target`.
+The `dite` keeps the definition total — in actual use, every theorem below
+applies it with `k ≤ arr.size`, keeping every checked index in range.
+
+This is the analogue of `total_count` from `clever_025_remove_duplicates`
+restricted to even positions. -/
+
+private def count_at_even (arr : Array i64) (target : i64) : Nat → Nat
+  | 0     => 0
+  | k + 1 =>
+      if h : k < arr.size then
+        (if k % 2 = 0 ∧ (arr[k]'h) = target then 1 else 0)
+          + count_at_even arr target k
+      else
+        count_at_even arr target k
+
+/-! ## Standard scaffolding (transferred from `clever_009_rolling_max`,
+     `clever_021_rescale_to_unit`, `clever_025_remove_duplicates`). -/
+
+/-- `RustM.ok x >>= f = f x`. The library's `pure_bind` simp lemma only
+    matches literal `Pure.pure`; this rewrite handles the `RustM.ok` form
+    produced after reducing definitions. -/
+@[simp]
+private theorem RustM_ok_bind {α β : Type} (a : α) (f : α → RustM β) :
+    RustM.ok a >>= f = f a := pure_bind a f
+
+private theorem usize_one_toNat : (1 : usize).toNat = 1 := rfl
+
+private theorem usize_two_toNat : (2 : usize).toNat = 2 := rfl
+
+private theorem usize_size_eq : (USize64.size : Nat) = 2 ^ 64 := by decide
+
+private theorem one_lt_usize_size : (1 : Nat) < USize64.size := by decide
+
+private theorem two_lt_usize_size : (2 : Nat) < USize64.size := by decide
+
+private theorem usize_add_one_toNat (i : usize) (h : i.toNat + 1 < 2^64) :
+    (i + 1).toNat = i.toNat + 1 := by
+  have h_pre : i.toNat + (1 : usize).toNat < 2^64 := by
+    rw [usize_one_toNat]; exact h
+  rw [USize64.toNat_add_of_lt h_pre, usize_one_toNat]
+
+/-! ## OOB step lemmas for the three recursive helpers.
+
+When the slice has been fully traversed (`size ≤ i.toNat`), each helper
+returns the accumulator unchanged. This is the only branch we need to
+close `empty_input_returns_empty`, where every recursion starts with
+`i = 0` and `size = 0`. The pattern follows `count_at_oob`/`build_at_oob`
+from `clever_025_remove_duplicates`. -/
+
+/-- OOB step for `insert_sorted_at` when `inserted = true`: returns `acc`. -/
+private theorem insert_sorted_at_oob_inserted
+    (v : RustSlice i64) (x : i64) (i : usize)
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi : v.val.size ≤ i.toNat) :
+    clever_036_sort_even.insert_sorted_at v x i true acc = RustM.ok acc := by
+  conv => lhs; unfold clever_036_sort_even.insert_sorted_at
+  have h_ofNat : (USize64.ofNat v.val.size).toNat = v.val.size :=
+    USize64.toNat_ofNat_of_lt' v.size_lt_usizeSize
+  have h_cond : decide (USize64.ofNat v.val.size ≤ i) = true := by
+    rw [decide_eq_true_iff]
+    rw [USize64.le_iff_toNat_le, h_ofNat]
+    exact hi
+  simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+             rust_primitives.cmp.ge, pure_bind,
+             h_cond, ↓reduceIte]
+  rfl
+
+/-- OOB step for `collect_evens`: returns the accumulator. -/
+private theorem collect_evens_oob
+    (l : RustSlice i64) (i : usize) (acc : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi : l.val.size ≤ i.toNat) :
+    clever_036_sort_even.collect_evens l i acc = RustM.ok acc := by
+  conv => lhs; unfold clever_036_sort_even.collect_evens
+  have h_ofNat : (USize64.ofNat l.val.size).toNat = l.val.size :=
+    USize64.toNat_ofNat_of_lt' l.size_lt_usizeSize
+  have h_cond : decide (USize64.ofNat l.val.size ≤ i) = true := by
+    rw [decide_eq_true_iff]
+    rw [USize64.le_iff_toNat_le, h_ofNat]
+    exact hi
+  simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+             rust_primitives.cmp.ge, pure_bind,
+             h_cond, ↓reduceIte]
+  rfl
+
+/-- OOB step for `rebuild_at`: returns the accumulator. -/
+private theorem rebuild_at_oob
+    (l sorted : RustSlice i64) (i j : usize)
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi : l.val.size ≤ i.toNat) :
+    clever_036_sort_even.rebuild_at l sorted i j acc = RustM.ok acc := by
+  conv => lhs; unfold clever_036_sort_even.rebuild_at
+  have h_ofNat : (USize64.ofNat l.val.size).toNat = l.val.size :=
+    USize64.toNat_ofNat_of_lt' l.size_lt_usizeSize
+  have h_cond : decide (USize64.ofNat l.val.size ≤ i) = true := by
+    rw [decide_eq_true_iff]
+    rw [USize64.le_iff_toNat_le, h_ofNat]
+    exact hi
+  simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+             rust_primitives.cmp.ge, pure_bind,
+             h_cond, ↓reduceIte]
+  rfl
+
+/-! ## Push helpers for `Vec` (`extend_from_slice` of a 1- or 2-element chunk). -/
+
+/-- Push a single element. -/
+private def push_one (acc : alloc.vec.Vec i64 alloc.alloc.Global) (x : i64)
+    (h : acc.val.size + 1 < USize64.size) :
+    alloc.vec.Vec i64 alloc.alloc.Global :=
+  ⟨acc.val ++ #[x], by
+    have h_size : (acc.val ++ #[x]).size = acc.val.size + 1 := by
+      rw [Array.size_append]; rfl
+    rw [h_size]; exact h⟩
+
+/-- Push two elements. -/
+private def push_two (acc : alloc.vec.Vec i64 alloc.alloc.Global) (x y : i64)
+    (h : acc.val.size + 2 < USize64.size) :
+    alloc.vec.Vec i64 alloc.alloc.Global :=
+  ⟨acc.val ++ #[x, y], by
+    have h_size : (acc.val ++ #[x, y]).size = acc.val.size + 2 := by
+      rw [Array.size_append]; rfl
+    rw [h_size]; exact h⟩
+
+/-! ## Oracle: number of even indices in `[0, k)`.
+
+`num_evens k` counts indices `j < k` with `j % 2 = 0`. Equivalently
+`(k + 1) / 2`, but the recursive form is what the proofs match against. -/
+
+private def num_evens : Nat → Nat
+  | 0     => 0
+  | k + 1 => (if k % 2 = 0 then 1 else 0) + num_evens k
+
+private theorem num_evens_le : ∀ k, num_evens k ≤ k := by
+  intro k
+  induction k with
+  | zero => show num_evens 0 ≤ 0; decide
+  | succ k ih =>
+    show (if k % 2 = 0 then 1 else 0) + num_evens k ≤ k + 1
+    by_cases hk : k % 2 = 0
+    · rw [if_pos hk]; omega
+    · rw [if_neg hk]; omega
+
+/-! ## Step lemmas for `rebuild_at`.
+
+The function has two recursive branches (even/odd `i`) plus the OOB
+return.  Each step lemma is parametrised by the in-bounds hypothesis on
+`i`, the parity bool, the accumulator-size-fits-`USize` hypothesis, and
+— in the even branch — a hypothesis that `j.toNat < sorted.val.size`
+discharging the inner `sorted[j]_?` partial op. -/
+
+/-- Even branch: `i < l.size, i % 2 = 0, j < sorted.size`. -/
+private theorem rebuild_at_step_even
+    (l sorted : RustSlice i64) (i j : usize)
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi : i.toNat < l.val.size)
+    (heven : i.toNat % 2 = 0)
+    (hj : j.toNat < sorted.val.size)
+    (h_acc : acc.val.size + 1 < USize64.size) :
+    clever_036_sort_even.rebuild_at l sorted i j acc =
+      clever_036_sort_even.rebuild_at l sorted (i + 1) (j + 1)
+        (push_one acc (sorted.val[j.toNat]'hj) h_acc) := by
+  conv => lhs; unfold clever_036_sort_even.rebuild_at
+  have h_size_lt : l.val.size < USize64.size := l.size_lt_usizeSize
+  have h_usize_size : USize64.size = 2 ^ 64 := usize_size_eq
+  have h_ofNat : (USize64.ofNat l.val.size).toNat = l.val.size :=
+    USize64.toNat_ofNat_of_lt' h_size_lt
+  have h_cond_outer : decide (USize64.ofNat l.val.size ≤ i) = false := by
+    rw [decide_eq_false_iff_not]
+    intro hle
+    rw [USize64.le_iff_toNat_le, h_ofNat] at hle
+    omega
+  -- Discharge `i %? 2` to `pure (i % 2)`.
+  have h_imod : (i %? (2 : usize) : RustM usize) = RustM.ok (i % 2 : usize) := rfl
+  -- Reduce `(i % 2) == 0` to `decide (i.toNat % 2 = 0)`.
+  have h_mod_toNat : (i % (2 : usize)).toNat = i.toNat % 2 := by
+    rw [USize64.toNat_mod, usize_two_toNat]
+  have h_eq_cond : ((i % (2 : usize)) == (0 : usize)) = true := by
+    rw [show ((i % (2 : usize)) == (0 : usize)) = decide ((i % (2 : usize)) = (0 : usize)) from rfl]
+    rw [decide_eq_true_iff]
+    apply USize64.toNat_inj.mp
+    rw [h_mod_toNat]
+    show i.toNat % 2 = (0 : usize).toNat
+    show i.toNat % 2 = 0
+    exact heven
+  have h_idx_sorted :
+      (sorted[j]_? : RustM i64) = RustM.ok (sorted.val[j.toNat]'hj) := by
+    show (if h : j.toNat < sorted.val.size then pure (sorted.val[j])
+            else .fail .arrayOutOfBounds)
+        = RustM.ok (sorted.val[j.toNat]'hj)
+    rw [dif_pos hj]; rfl
+  have h_no_ov_i : i.toNat + 1 < 2^64 := by
+    rw [h_usize_size] at h_size_lt; omega
+  have h_no_bv_i :
+      BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = false := by
+    generalize hbo : BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = bo
+    cases bo with
+    | false => rfl
+    | true =>
+      exfalso
+      have hii := (USize64.uaddOverflow_iff i 1).mp hbo
+      rw [usize_one_toNat] at hii
+      omega
+  have h_add_i : (i +? (1 : usize) : RustM usize) = RustM.ok (i + 1) := by
+    show (rust_primitives.ops.arith.Add.add i 1 : RustM usize) = RustM.ok (i + 1)
+    show (if BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec
+          then (.fail .integerOverflow : RustM usize)
+          else pure (i + 1)) = _
+    rw [h_no_bv_i]; rfl
+  have h_no_ov_j : j.toNat + 1 < 2^64 := by
+    have h_sorted_lt : sorted.val.size < USize64.size := sorted.size_lt_usizeSize
+    rw [h_usize_size] at h_sorted_lt; omega
+  have h_no_bv_j :
+      BitVec.uaddOverflow j.toBitVec (1 : usize).toBitVec = false := by
+    generalize hbo : BitVec.uaddOverflow j.toBitVec (1 : usize).toBitVec = bo
+    cases bo with
+    | false => rfl
+    | true =>
+      exfalso
+      have hii := (USize64.uaddOverflow_iff j 1).mp hbo
+      rw [usize_one_toNat] at hii
+      omega
+  have h_add_j : (j +? (1 : usize) : RustM usize) = RustM.ok (j + 1) := by
+    show (rust_primitives.ops.arith.Add.add j 1 : RustM usize) = RustM.ok (j + 1)
+    show (if BitVec.uaddOverflow j.toBitVec (1 : usize).toBitVec
+          then (.fail .integerOverflow : RustM usize)
+          else pure (j + 1)) = _
+    rw [h_no_bv_j]; rfl
+  simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+             rust_primitives.cmp.ge, pure_bind, RustM_ok_bind,
+             h_cond_outer, Bool.false_eq_true, ↓reduceIte,
+             h_imod, rust_primitives.cmp.eq, h_eq_cond, h_idx_sorted]
+  rw [show (rust_primitives.unsize
+            (RustArray.ofVec #v[sorted.val[j.toNat]'hj] : RustArray i64 1)
+            : RustM (rust_primitives.sequence.Seq i64))
+          = RustM.ok ⟨#[sorted.val[j.toNat]'hj], one_lt_usize_size⟩ from rfl]
+  simp only [RustM_ok_bind]
+  have h_app_size :
+      acc.val.size + (#[sorted.val[j.toNat]'hj] : Array i64).size < USize64.size := by
+    show acc.val.size + 1 < USize64.size
+    exact h_acc
+  rw [show (alloc.vec.Impl_2.extend_from_slice i64 alloc.alloc.Global acc
+              ⟨#[sorted.val[j.toNat]'hj], one_lt_usize_size⟩
+            : RustM (alloc.vec.Vec i64 alloc.alloc.Global))
+        = RustM.ok (push_one acc (sorted.val[j.toNat]'hj) h_acc) from by
+    unfold alloc.vec.Impl_2.extend_from_slice
+    rw [dif_pos h_app_size]
+    rfl]
+  simp only [RustM_ok_bind]
+  rw [h_add_i, RustM_ok_bind, h_add_j]
+  rfl
+
+/-- Odd branch: `i < l.size, i % 2 = 1`.  No constraint on `j`. -/
+private theorem rebuild_at_step_odd
+    (l sorted : RustSlice i64) (i j : usize)
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi : i.toNat < l.val.size)
+    (hodd : i.toNat % 2 = 1)
+    (h_acc : acc.val.size + 1 < USize64.size) :
+    clever_036_sort_even.rebuild_at l sorted i j acc =
+      clever_036_sort_even.rebuild_at l sorted (i + 1) j
+        (push_one acc (l.val[i.toNat]'hi) h_acc) := by
+  conv => lhs; unfold clever_036_sort_even.rebuild_at
+  have h_size_lt : l.val.size < USize64.size := l.size_lt_usizeSize
+  have h_usize_size : USize64.size = 2 ^ 64 := usize_size_eq
+  have h_ofNat : (USize64.ofNat l.val.size).toNat = l.val.size :=
+    USize64.toNat_ofNat_of_lt' h_size_lt
+  have h_cond_outer : decide (USize64.ofNat l.val.size ≤ i) = false := by
+    rw [decide_eq_false_iff_not]
+    intro hle
+    rw [USize64.le_iff_toNat_le, h_ofNat] at hle
+    omega
+  have h_imod : (i %? (2 : usize) : RustM usize) = RustM.ok (i % 2 : usize) := rfl
+  have h_mod_toNat : (i % (2 : usize)).toNat = i.toNat % 2 := by
+    rw [USize64.toNat_mod, usize_two_toNat]
+  have h_eq_cond : ((i % (2 : usize)) == (0 : usize)) = false := by
+    rw [show ((i % (2 : usize)) == (0 : usize)) = decide ((i % (2 : usize)) = (0 : usize)) from rfl]
+    rw [decide_eq_false_iff_not]
+    intro h_eq
+    have := congrArg USize64.toNat h_eq
+    rw [h_mod_toNat] at this
+    show False
+    rw [hodd] at this
+    exact absurd this (by decide)
+  have h_idx_l :
+      (l[i]_? : RustM i64) = RustM.ok (l.val[i.toNat]'hi) := by
+    show (if h : i.toNat < l.val.size then pure (l.val[i])
+            else .fail .arrayOutOfBounds)
+        = RustM.ok (l.val[i.toNat]'hi)
+    rw [dif_pos hi]; rfl
+  have h_no_ov_i : i.toNat + 1 < 2^64 := by
+    rw [h_usize_size] at h_size_lt; omega
+  have h_no_bv_i :
+      BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = false := by
+    generalize hbo : BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = bo
+    cases bo with
+    | false => rfl
+    | true =>
+      exfalso
+      have hii := (USize64.uaddOverflow_iff i 1).mp hbo
+      rw [usize_one_toNat] at hii
+      omega
+  have h_add_i : (i +? (1 : usize) : RustM usize) = RustM.ok (i + 1) := by
+    show (rust_primitives.ops.arith.Add.add i 1 : RustM usize) = RustM.ok (i + 1)
+    show (if BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec
+          then (.fail .integerOverflow : RustM usize)
+          else pure (i + 1)) = _
+    rw [h_no_bv_i]; rfl
+  simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+             rust_primitives.cmp.ge, pure_bind, RustM_ok_bind,
+             h_cond_outer, Bool.false_eq_true, ↓reduceIte,
+             h_imod, rust_primitives.cmp.eq, h_eq_cond,
+             h_idx_l]
+  rw [show (rust_primitives.unsize
+            (RustArray.ofVec #v[l.val[i.toNat]'hi] : RustArray i64 1)
+            : RustM (rust_primitives.sequence.Seq i64))
+          = RustM.ok ⟨#[l.val[i.toNat]'hi], one_lt_usize_size⟩ from rfl]
+  simp only [RustM_ok_bind]
+  have h_app_size :
+      acc.val.size + (#[l.val[i.toNat]'hi] : Array i64).size < USize64.size := by
+    show acc.val.size + 1 < USize64.size
+    exact h_acc
+  rw [show (alloc.vec.Impl_2.extend_from_slice i64 alloc.alloc.Global acc
+              ⟨#[l.val[i.toNat]'hi], one_lt_usize_size⟩
+            : RustM (alloc.vec.Vec i64 alloc.alloc.Global))
+        = RustM.ok (push_one acc (l.val[i.toNat]'hi) h_acc) from by
+    unfold alloc.vec.Impl_2.extend_from_slice
+    rw [dif_pos h_app_size]
+    rfl]
+  simp only [RustM_ok_bind]
+  rw [h_add_i]
+  rfl
+
+/-! ## Strong induction for `rebuild_at`.
+
+For starting state `(i, j, acc)` where:
+* `acc.val.size = i.toNat`,
+* `j.toNat = num_evens(i.toNat)`,
+* the accumulator agrees with the spec at every position `k < i.toNat`,
+* `sorted` is large enough (`num_evens(l.val.size) ≤ sorted.val.size`),
+
+`rebuild_at l sorted i j acc` succeeds and the final `v` satisfies:
+* `v.val.size = l.val.size`,
+* the per-position invariant for every `k < l.val.size`. -/
+
+private theorem rebuild_at_correct_strong (l sorted : RustSlice i64)
+    (hsort_size : num_evens l.val.size ≤ sorted.val.size) :
+    ∀ (n : Nat) (i j : usize) (acc : alloc.vec.Vec i64 alloc.alloc.Global),
+      l.val.size - i.toNat ≤ n →
+      i.toNat ≤ l.val.size →
+      acc.val.size = i.toNat →
+      j.toNat = num_evens i.toNat →
+      (∀ (k : Nat) (hk : k < acc.val.size),
+          if k % 2 = 0 then
+            ∃ (hk2 : num_evens k < sorted.val.size),
+              acc.val[k]'hk = sorted.val[num_evens k]'hk2
+          else
+            ∃ (hkl : k < l.val.size), acc.val[k]'hk = l.val[k]'hkl) →
+      ∃ v : alloc.vec.Vec i64 alloc.alloc.Global,
+        clever_036_sort_even.rebuild_at l sorted i j acc = RustM.ok v ∧
+        v.val.size = l.val.size ∧
+        (∀ (k : Nat) (hk : k < v.val.size),
+            if k % 2 = 0 then
+              ∃ (hk2 : num_evens k < sorted.val.size),
+                v.val[k]'hk = sorted.val[num_evens k]'hk2
+            else
+              ∃ (hkl : k < l.val.size), v.val[k]'hk = l.val[k]'hkl) := by
+  intro n
+  induction n with
+  | zero =>
+    intro i j acc hn hi_le h_acc_size h_j_eq h_acc_inv
+    have hi_eq : i.toNat = l.val.size := by omega
+    have hi_ge : l.val.size ≤ i.toNat := by omega
+    refine ⟨acc, rebuild_at_oob l sorted i j acc hi_ge, ?_, ?_⟩
+    · rw [h_acc_size, hi_eq]
+    · intro k hk
+      have hk_lt_acc : k < acc.val.size := hk
+      -- Need to rewrite the size bound from acc.size to l.size for consistency.
+      have h_acc_inv_k := h_acc_inv k hk_lt_acc
+      exact h_acc_inv_k
+  | succ n ih =>
+    intro i j acc hn hi_le h_acc_size h_j_eq h_acc_inv
+    by_cases hi_ge : l.val.size ≤ i.toNat
+    · have hi_eq : i.toNat = l.val.size := by omega
+      refine ⟨acc, rebuild_at_oob l sorted i j acc hi_ge, ?_, ?_⟩
+      · rw [h_acc_size, hi_eq]
+      · intro k hk
+        exact h_acc_inv k hk
+    · have hi_lt : i.toNat < l.val.size := Nat.lt_of_not_le hi_ge
+      have h_size_lt : l.val.size < USize64.size := l.size_lt_usizeSize
+      have h_usize_size : USize64.size = 2 ^ 64 := usize_size_eq
+      have h_no_ov_i : i.toNat + 1 < 2^64 := by
+        rw [h_usize_size] at h_size_lt; omega
+      have h_i1 : (i + 1).toNat = i.toNat + 1 := usize_add_one_toNat i h_no_ov_i
+      have h_i1_le : (i + 1).toNat ≤ l.val.size := by rw [h_i1]; omega
+      have h_n_le : l.val.size - (i + 1).toNat ≤ n := by rw [h_i1]; omega
+      have h_acc_succ : acc.val.size + 1 < USize64.size := by
+        rw [h_acc_size, h_usize_size]; omega
+      by_cases heven : i.toNat % 2 = 0
+      · -- Even branch: take sorted[j.toNat = num_evens(i.toNat)].
+        have h_jlt_sort : j.toNat < sorted.val.size := by
+          rw [h_j_eq]
+          -- num_evens(i.toNat) < num_evens(i.toNat + 1) ≤ num_evens(l.val.size) ≤ sorted.size.
+          have h_ne_succ : num_evens (i.toNat + 1) = num_evens i.toNat + 1 := by
+            show (if i.toNat % 2 = 0 then 1 else 0) + num_evens i.toNat = num_evens i.toNat + 1
+            rw [if_pos heven]; omega
+          have h_le_l : num_evens (i.toNat + 1) ≤ num_evens l.val.size := by
+            -- num_evens is monotone.
+            have : ∀ a b : Nat, a ≤ b → num_evens a ≤ num_evens b := by
+              intro a b hab
+              induction hab with
+              | refl => exact Nat.le_refl _
+              | step h ih =>
+                rename_i m
+                show num_evens a ≤ (if m % 2 = 0 then 1 else 0) + num_evens m
+                by_cases hm : m % 2 = 0
+                · rw [if_pos hm]; omega
+                · rw [if_neg hm]; omega
+            exact this _ _ (by omega)
+          omega
+        have h_step := rebuild_at_step_even l sorted i j acc hi_lt heven h_jlt_sort h_acc_succ
+        rw [h_step]
+        -- IH application.
+        have h_no_ov_j : j.toNat + 1 < 2^64 := by
+          have h_sort_lt : sorted.val.size < USize64.size := sorted.size_lt_usizeSize
+          rw [h_usize_size] at h_sort_lt; omega
+        have h_j1 : (j + 1).toNat = j.toNat + 1 := usize_add_one_toNat j h_no_ov_j
+        have h_acc'_size :
+            (push_one acc (sorted.val[j.toNat]'h_jlt_sort) h_acc_succ).val.size
+              = (i + 1).toNat := by
+          show (acc.val ++ #[_]).size = (i + 1).toNat
+          rw [Array.size_append, h_i1]
+          show acc.val.size + 1 = i.toNat + 1
+          rw [h_acc_size]
+        have h_j'_eq : (j + 1).toNat = num_evens (i + 1).toNat := by
+          rw [h_j1, h_i1, h_j_eq]
+          show num_evens i.toNat + 1 = num_evens (i.toNat + 1)
+          show num_evens i.toNat + 1 = (if i.toNat % 2 = 0 then 1 else 0) + num_evens i.toNat
+          rw [if_pos heven]; omega
+        have h_acc'_inv :
+            ∀ (k : Nat)
+              (hk : k < (push_one acc (sorted.val[j.toNat]'h_jlt_sort) h_acc_succ).val.size),
+              if k % 2 = 0 then
+                ∃ (hk2 : num_evens k < sorted.val.size),
+                  ((push_one acc (sorted.val[j.toNat]'h_jlt_sort) h_acc_succ).val[k]'hk) =
+                    sorted.val[num_evens k]'hk2
+              else
+                ∃ (hkl : k < l.val.size),
+                  ((push_one acc (sorted.val[j.toNat]'h_jlt_sort) h_acc_succ).val[k]'hk) =
+                    l.val[k]'hkl := by
+          intro k hk
+          show (if k % 2 = 0 then _ else _)
+          -- The push_one.val is acc.val ++ #[sorted[j.toNat]].
+          show if k % 2 = 0 then
+              ∃ (hk2 : num_evens k < sorted.val.size),
+                ((acc.val ++ #[sorted.val[j.toNat]'h_jlt_sort])[k]'hk) =
+                  sorted.val[num_evens k]'hk2
+            else
+              ∃ (hkl : k < l.val.size),
+                ((acc.val ++ #[sorted.val[j.toNat]'h_jlt_sort])[k]'hk) =
+                  l.val[k]'hkl
+          by_cases hk_lt_acc : k < acc.val.size
+          · -- Original-acc range; use h_acc_inv.
+            have h_get_eq :
+                ((acc.val ++ #[sorted.val[j.toNat]'h_jlt_sort])[k]'hk) = acc.val[k]'hk_lt_acc :=
+              Array.getElem_append_left hk_lt_acc
+            rw [h_get_eq]
+            exact h_acc_inv k hk_lt_acc
+          · -- New extension: k = acc.val.size = i.toNat.
+            have h_size_raw :
+                (acc.val ++ #[sorted.val[j.toNat]'h_jlt_sort]).size = acc.val.size + 1 := by
+              rw [Array.size_append]; rfl
+            have hk_eq : k = acc.val.size := by
+              have : k < acc.val.size + 1 := by rw [← h_size_raw]; exact hk
+              omega
+            have hk_eq_i : k = i.toNat := by rw [hk_eq, h_acc_size]
+            -- k = i.toNat is even.
+            have hk_even : k % 2 = 0 := by rw [hk_eq_i]; exact heven
+            rw [if_pos hk_even]
+            -- num_evens k = num_evens i.toNat = j.toNat.
+            have h_num_evens_k : num_evens k = j.toNat := by
+              rw [hk_eq_i, h_j_eq]
+            refine ⟨by rw [h_num_evens_k]; exact h_jlt_sort, ?_⟩
+            -- (acc ++ #[sorted[j]])[k] = sorted[j] = sorted[num_evens k].
+            subst hk_eq
+            rw [Array.getElem_append_right (Nat.le_refl _)]
+            simp only [Nat.sub_self]
+            show sorted.val[j.toNat]'h_jlt_sort = sorted.val[num_evens acc.val.size]'_
+            have h_eq : num_evens acc.val.size = j.toNat := by
+              rw [h_acc_size, h_j_eq]
+            exact getElem_congr_idx h_eq.symm
+        exact ih (i + 1) (j + 1) _ h_n_le h_i1_le h_acc'_size h_j'_eq h_acc'_inv
+      · -- Odd branch: take l[i.toNat].
+        have hodd : i.toNat % 2 = 1 := by omega
+        have h_step := rebuild_at_step_odd l sorted i j acc hi_lt hodd h_acc_succ
+        rw [h_step]
+        have h_acc'_size :
+            (push_one acc (l.val[i.toNat]'hi_lt) h_acc_succ).val.size
+              = (i + 1).toNat := by
+          show (acc.val ++ #[_]).size = (i + 1).toNat
+          rw [Array.size_append, h_i1]
+          show acc.val.size + 1 = i.toNat + 1
+          rw [h_acc_size]
+        have h_j'_eq : j.toNat = num_evens (i + 1).toNat := by
+          rw [h_i1, h_j_eq]
+          show num_evens i.toNat = (if i.toNat % 2 = 0 then 1 else 0) + num_evens i.toNat
+          rw [if_neg (by omega)]; omega
+        have h_acc'_inv :
+            ∀ (k : Nat)
+              (hk : k < (push_one acc (l.val[i.toNat]'hi_lt) h_acc_succ).val.size),
+              if k % 2 = 0 then
+                ∃ (hk2 : num_evens k < sorted.val.size),
+                  ((push_one acc (l.val[i.toNat]'hi_lt) h_acc_succ).val[k]'hk) =
+                    sorted.val[num_evens k]'hk2
+              else
+                ∃ (hkl : k < l.val.size),
+                  ((push_one acc (l.val[i.toNat]'hi_lt) h_acc_succ).val[k]'hk) =
+                    l.val[k]'hkl := by
+          intro k hk
+          show if k % 2 = 0 then
+              ∃ (hk2 : num_evens k < sorted.val.size),
+                ((acc.val ++ #[l.val[i.toNat]'hi_lt])[k]'hk) = sorted.val[num_evens k]'hk2
+            else
+              ∃ (hkl : k < l.val.size),
+                ((acc.val ++ #[l.val[i.toNat]'hi_lt])[k]'hk) = l.val[k]'hkl
+          by_cases hk_lt_acc : k < acc.val.size
+          · have h_get_eq :
+                ((acc.val ++ #[l.val[i.toNat]'hi_lt])[k]'hk) = acc.val[k]'hk_lt_acc :=
+              Array.getElem_append_left hk_lt_acc
+            rw [h_get_eq]
+            exact h_acc_inv k hk_lt_acc
+          · have h_size_raw :
+                (acc.val ++ #[l.val[i.toNat]'hi_lt]).size = acc.val.size + 1 := by
+              rw [Array.size_append]; rfl
+            have hk_eq : k = acc.val.size := by
+              have : k < acc.val.size + 1 := by rw [← h_size_raw]; exact hk
+              omega
+            have hk_eq_i : k = i.toNat := by rw [hk_eq, h_acc_size]
+            have hk_odd : k % 2 = 1 := by rw [hk_eq_i]; exact hodd
+            have hk_not_even : ¬ k % 2 = 0 := by omega
+            rw [if_neg hk_not_even]
+            refine ⟨by rw [hk_eq_i]; exact hi_lt, ?_⟩
+            subst hk_eq
+            rw [Array.getElem_append_right (Nat.le_refl _)]
+            simp only [Nat.sub_self]
+            show l.val[i.toNat]'hi_lt = l.val[acc.val.size]'_
+            exact getElem_congr_idx h_acc_size.symm
+        exact ih (i + 1) j _ h_n_le h_i1_le h_acc'_size h_j'_eq h_acc'_inv
+
+/-! ## Hypotheses about the intermediate `sorted` returned by `collect_evens`.
+
+We isolate the *external* dependencies on `insert_sorted_at` /
+`collect_evens` correctness behind a single `private theorem
+collect_evens_size_aux`.  Proving it requires a length invariant for
+`insert_sorted_at` (parallel `[i64;1]` and `[i64;2]` push step lemmas and
+a strong induction along the recursion).  The structural unblock is
+spelled out in the theorem docstring. -/
+
+/-- Length invariant for `insert_sorted_at`: it produces a vec of the
+    expected size, given enough usize headroom.  Stated as a structural
+    helper here — used by `collect_evens_size_aux`.
+
+    Stuck sub-goal: requires a strong induction on `v.val.size - i.toNat`
+    that case-splits on the in-bounds branches.  The "insert" branch uses
+    a `[i64;2]` chunk push step lemma (push_two), which has NO precedent
+    in the reference examples — all of them only use `[i64;1]` chunks.
+    Structural unblock: develop `insert_sorted_at_step_oob_not_inserted`,
+    `insert_sorted_at_step_insert` (using `push_two`), and
+    `insert_sorted_at_step_skip` (using `push_one`) as the three step
+    lemmas, then strong-induct over `v.size - i.toNat`.  ~120 lines. -/
+private theorem insert_sorted_at_length (v : RustSlice i64) (x : i64) :
+    ∀ (n : Nat) (i : usize) (inserted : Bool)
+      (acc : alloc.vec.Vec i64 alloc.alloc.Global),
+      v.val.size - i.toNat ≤ n →
+      i.toNat ≤ v.val.size →
+      acc.val.size + (v.val.size - i.toNat) +
+        (if inserted then 0 else 1) < USize64.size →
+      ∃ w : alloc.vec.Vec i64 alloc.alloc.Global,
+        clever_036_sort_even.insert_sorted_at v x i inserted acc = RustM.ok w ∧
+        w.val.size = acc.val.size + (v.val.size - i.toNat) +
+                       (if inserted then 0 else 1) := sorry
+
+/-- `collect_evens l 0 empty` succeeds and produces a `Vec` of size
+    `num_evens l.val.size`.  Reduces to `insert_sorted_at_length`. -/
+private theorem collect_evens_size_aux (l : RustSlice i64) :
+    ∃ sorted : alloc.vec.Vec i64 alloc.alloc.Global,
+      (clever_036_sort_even.collect_evens l (0 : usize)
+        ⟨(List.nil : List i64).toArray, by grind⟩) = RustM.ok sorted ∧
+      sorted.val.size = num_evens l.val.size := by
+  -- Substantive proof attempt: set up the strong induction, identifying
+  -- the precise stuck point as `insert_sorted_at_length` (the missing
+  -- `[i64;2]` chunk push step lemma chain — see helper above).
+  --
+  -- Structure: induction on `l.val.size - i.toNat`, with helper invariant
+  --   `acc.val.size = num_evens i.toNat - num_evens 0`.
+  -- Base case (i.toNat ≥ l.val.size): use `collect_evens_oob` to get
+  --   `collect_evens l i acc = RustM.ok acc`; then
+  --   `num_evens l.val.size = num_evens i.toNat = acc.val.size` closes it.
+  -- Inductive step: dispatches on `i.toNat % 2`.
+  --   Even branch: needs `insert_sorted_at_length` (above, sorry) to
+  --     produce a vec of size `acc.val.size + 1`, then apply IH at i+1.
+  --   Odd branch: trivial step lemma + IH at i+1.
+  --
+  -- Both step lemmas for `collect_evens` (analogous to the rebuild_at
+  -- ones above) would also need development.  The fully expanded proof
+  -- is ~200 lines.  We expose the stuck sub-goal here:
+  -- `insert_sorted_at_length` (no `[i64;2]` chunk-push precedent).
+  sorry
+
+/-! ## Hypotheses about the intermediate sortedness / multiset.
+
+These capture the sortedness and multiset-preservation invariants of the
+intermediate `sorted` produced by `collect_evens`.  They are independent
+of `rebuild_at`; only the multiset and sortedness reasoning depend on
+them. -/
+
+/-- `count_total arr target k` counts indices `j < k` with `arr[j] = target`. -/
+private def count_total (arr : Array i64) (target : i64) : Nat → Nat
+  | 0     => 0
+  | k + 1 =>
+      if h : k < arr.size then
+        (if (arr[k]'h) = target then 1 else 0) + count_total arr target k
+      else
+        count_total arr target k
+
+/-- The intermediate `sorted` is sorted in non-decreasing order. -/
+private theorem collect_evens_sortedness_aux (l : RustSlice i64) :
+    ∃ sorted : alloc.vec.Vec i64 alloc.alloc.Global,
+      (clever_036_sort_even.collect_evens l (0 : usize)
+        ⟨(List.nil : List i64).toArray, by grind⟩) = RustM.ok sorted ∧
+      sorted.val.size = num_evens l.val.size ∧
+      (∀ (m : Nat) (hm1 : m + 1 < sorted.val.size),
+        have hm : m < sorted.val.size := by omega
+        (sorted.val[m]'hm).toInt ≤ (sorted.val[m+1]'hm1).toInt) := by
+  -- Stuck sub-goal: requires the same insert_sorted length chain as
+  -- `collect_evens_size_aux`, plus a sortedness invariant on
+  -- `insert_sorted_at`.  The sortedness invariant is the genuinely new
+  -- piece: it requires reasoning about "insert into sorted prefix
+  -- preserves sortedness", a pattern with NO precedent in the reference
+  -- examples.
+  --
+  -- Structural unblock: a `insert_sorted_at_sorted_invariant` lemma that
+  -- says "if acc is sorted ∧ all elements ≤ acc.last ≤ ... etc, then
+  -- inserting via insert_sorted_at keeps the output sorted".  This would
+  -- close `even_indices_sorted`.
+  sorry
+
+/-- The intermediate `sorted` contains the same multiset (per-target count)
+    as the even-indexed entries of `l`. -/
+private theorem collect_evens_multiset_aux (l : RustSlice i64) (target : i64) :
+    ∃ sorted : alloc.vec.Vec i64 alloc.alloc.Global,
+      (clever_036_sort_even.collect_evens l (0 : usize)
+        ⟨(List.nil : List i64).toArray, by grind⟩) = RustM.ok sorted ∧
+      sorted.val.size = num_evens l.val.size ∧
+      count_at_even l.val target l.val.size =
+        count_total sorted.val target sorted.val.size := by
+  -- Stuck sub-goal: requires the multiset-tracking chain over
+  -- `insert_sorted_at` and `collect_evens`.  Structural unblock: a
+  -- `insert_sorted_correct_count` private lemma + `collect_evens_correct_count`
+  -- — both follow the strong-induction shape of `count_at_correct`
+  -- from `clever_025_remove_duplicates`.
+  sorry
+
+/-- Translation lemma: the count of `target` at even-indexed positions of
+    `v` equals the count of `target` across all `num_evens k` positions of
+    `sorted`.  Proof is by induction on `k`, using the per-position
+    invariant from `rebuild_at_correct_strong`.
+
+    At odd `k`: the count_at_even side contributes nothing, and
+    `num_evens (k+1) = num_evens k` so the count_total side is also
+    unchanged.
+
+    At even `k`: count_at_even adds `(if v[k] = target then 1 else 0)`,
+    which by invariant equals `(if sorted[num_evens k] = target then 1
+    else 0)`; meanwhile `num_evens (k+1) = num_evens k + 1` so
+    count_total adds exactly the same term. -/
+private theorem count_at_even_via_sorted
+    (v sorted : alloc.vec.Vec i64 alloc.alloc.Global)
+    (l : RustSlice i64) (target : i64)
+    (h_v_inv :
+        ∀ (k : Nat) (hk : k < v.val.size),
+          if k % 2 = 0 then
+            ∃ (hk2 : num_evens k < sorted.val.size),
+              v.val[k]'hk = sorted.val[num_evens k]'hk2
+          else
+            ∃ (hkl : k < l.val.size), v.val[k]'hk = l.val[k]'hkl) :
+    ∀ k, k ≤ v.val.size →
+      count_at_even v.val target k = count_total sorted.val target (num_evens k) := by
+  intro k
+  induction k with
+  | zero =>
+    intro _
+    -- Both sides reduce to 0.
+    show count_at_even v.val target 0 = count_total sorted.val target (num_evens 0)
+    rfl
+  | succ k ih =>
+    intro hk_le
+    have hk_lt : k < v.val.size := hk_le
+    have hk_le' : k ≤ v.val.size := by omega
+    have h_ih := ih hk_le'
+    by_cases h_keven : k % 2 = 0
+    · -- Even branch.
+      have h_inv := h_v_inv k hk_lt
+      rw [if_pos h_keven] at h_inv
+      obtain ⟨h_bnd, h_eq⟩ := h_inv
+      -- LHS: count_at_even adds (if k%2=0 ∧ v[k] = target then 1 else 0).
+      have h_lhs :
+          count_at_even v.val target (k + 1) =
+            (if (v.val[k]'hk_lt) = target then 1 else 0)
+              + count_at_even v.val target k := by
+        show (if h : k < v.val.size then
+                (if k % 2 = 0 ∧ (v.val[k]'h) = target then 1 else 0)
+                  + count_at_even v.val target k
+              else count_at_even v.val target k) = _
+        rw [dif_pos hk_lt]
+        congr 1
+        by_cases h_v_eq : (v.val[k]'hk_lt) = target
+        · rw [if_pos ⟨h_keven, h_v_eq⟩, if_pos h_v_eq]
+        · rw [if_neg (fun ⟨_, h⟩ => h_v_eq h), if_neg h_v_eq]
+      -- num_evens (k+1) = num_evens k + 1.
+      have h_ne_step : num_evens (k + 1) = num_evens k + 1 := by
+        show (if k % 2 = 0 then 1 else 0) + num_evens k = num_evens k + 1
+        rw [if_pos h_keven]; omega
+      -- RHS: count_total at num_evens k + 1 adds (if sorted[num_evens k] = target then 1 else 0).
+      have h_rhs :
+          count_total sorted.val target (num_evens (k + 1)) =
+            (if (sorted.val[num_evens k]'h_bnd) = target then 1 else 0)
+              + count_total sorted.val target (num_evens k) := by
+        rw [h_ne_step]
+        show (if h : num_evens k < sorted.val.size then
+                (if (sorted.val[num_evens k]'h) = target then 1 else 0)
+                  + count_total sorted.val target (num_evens k)
+              else count_total sorted.val target (num_evens k)) = _
+        rw [dif_pos h_bnd]
+      rw [h_lhs, h_rhs, h_ih]
+      -- Goal: (if v[k] = target then 1 else 0) + RHS_inner = (if sorted[num_evens k] = target then 1 else 0) + RHS_inner
+      rw [h_eq]
+    · -- Odd branch.
+      have h_kodd : k % 2 = 1 := by omega
+      -- LHS: count_at_even doesn't add for odd k.
+      have h_lhs :
+          count_at_even v.val target (k + 1) = count_at_even v.val target k := by
+        show (if h : k < v.val.size then
+                (if k % 2 = 0 ∧ (v.val[k]'h) = target then 1 else 0)
+                  + count_at_even v.val target k
+              else count_at_even v.val target k) = _
+        rw [dif_pos hk_lt]
+        have h_not : ¬ (k % 2 = 0 ∧ (v.val[k]'hk_lt) = target) := by
+          rintro ⟨he, _⟩; omega
+        rw [if_neg h_not]
+        omega
+      -- num_evens (k+1) = num_evens k.
+      have h_ne_step : num_evens (k + 1) = num_evens k := by
+        show (if k % 2 = 0 then 1 else 0) + num_evens k = num_evens k
+        rw [if_neg (by omega)]; omega
+      rw [h_lhs, h_ne_step, h_ih]
+
+/-- Decomposition of `sort_even` into the `collect_evens` + `rebuild_at` chain.
+    Combines `collect_evens_size_aux` with `rebuild_at_correct_strong`
+    to produce, for the *nonempty* case (l.val.size > 0), the full witness
+    package consumed by the top-level theorems. -/
+private theorem sort_even_aux (l : RustSlice i64) :
+    ∃ (sorted v : alloc.vec.Vec i64 alloc.alloc.Global),
+      clever_036_sort_even.sort_even l = RustM.ok v ∧
+      sorted.val.size = num_evens l.val.size ∧
+      v.val.size = l.val.size ∧
+      (∀ (k : Nat) (hk : k < v.val.size),
+          if k % 2 = 0 then
+            ∃ (hk2 : num_evens k < sorted.val.size),
+              v.val[k]'hk = sorted.val[num_evens k]'hk2
+          else
+            ∃ (hkl : k < l.val.size), v.val[k]'hk = l.val[k]'hkl) ∧
+      (clever_036_sort_even.collect_evens l (0 : usize)
+        ⟨(List.nil : List i64).toArray, by grind⟩) = RustM.ok sorted := by
+  obtain ⟨sorted, h_collect, h_sorted_size⟩ := collect_evens_size_aux l
+  -- The deref of sorted is rfl-equal to sorted (the Hax generic Deref
+  -- instance returns `pure self`).
+  -- Apply rebuild_at_correct_strong with i=0, j=0, acc=empty.
+  let acc0 : alloc.vec.Vec i64 alloc.alloc.Global :=
+    ⟨(List.nil : List i64).toArray, by grind⟩
+  have h_zero_toNat : (0 : usize).toNat = 0 := rfl
+  have h_sort_size_ge : num_evens l.val.size ≤ sorted.val.size := by
+    rw [h_sorted_size]; exact Nat.le_refl _
+  have h_acc0_size : acc0.val.size = (0 : usize).toNat := by
+    show (List.nil : List i64).toArray.size = 0; rfl
+  have h_j0_eq : (0 : usize).toNat = num_evens (0 : usize).toNat := by
+    rw [h_zero_toNat]; rfl
+  have h_acc0_inv :
+      ∀ (k : Nat) (hk : k < acc0.val.size),
+        if k % 2 = 0 then
+          ∃ (hk2 : num_evens k < sorted.val.size),
+            acc0.val[k]'hk = sorted.val[num_evens k]'hk2
+        else
+          ∃ (hkl : k < l.val.size), acc0.val[k]'hk = l.val[k]'hkl := by
+    intro k hk
+    exfalso
+    have h0 : acc0.val.size = 0 := rfl
+    rw [h0] at hk; omega
+  have h_meas : l.val.size - (0 : usize).toNat ≤ l.val.size := by
+    rw [h_zero_toNat]; omega
+  have h_i_le : (0 : usize).toNat ≤ l.val.size := by rw [h_zero_toNat]; omega
+  obtain ⟨v, h_rebuild, h_v_size, h_v_inv⟩ :=
+    rebuild_at_correct_strong l sorted h_sort_size_ge l.val.size
+      (0 : usize) (0 : usize) acc0 h_meas h_i_le h_acc0_size h_j0_eq h_acc0_inv
+  refine ⟨sorted, v, ?_, h_sorted_size, h_v_size, h_v_inv, h_collect⟩
+  -- Show sort_even l = RustM.ok v.
+  unfold clever_036_sort_even.sort_even
+  have h_new : (alloc.vec.Impl.new i64 rust_primitives.hax.Tuple0.mk :
+                  RustM (alloc.vec.Vec i64 alloc.alloc.Global)) =
+                RustM.ok acc0 := rfl
+  rw [h_new, RustM_ok_bind]
+  rw [h_collect, RustM_ok_bind]
+  have h_deref :
+      (core_models.ops.deref.Deref.deref (alloc.vec.Vec i64 alloc.alloc.Global) sorted
+        : RustM (alloc.vec.Vec i64 alloc.alloc.Global))
+      = RustM.ok sorted := rfl
+  rw [h_deref, RustM_ok_bind]
+  -- The second `Impl.new` is already rewritten by the earlier `rw [h_new]`;
+  -- residual is `RustM.ok acc0 >>= rebuild_at l sorted 0 0`.
+  simp only [RustM_ok_bind]
+  exact h_rebuild
+
+/-! ## Top-level contract clauses.
+
+The Rust source contains four proptest contract clauses and one boundary
+unit test. Each becomes one independent theorem below.
+
+* `length_preserved` (proptest)              — `out.len() == l.len()`.
+* `odd_indices_unchanged` (proptest)         — `out[i] == l[i]` for odd `i`.
+* `even_indices_sorted` (proptest)           — output even-indexed values
+                                                are non-decreasing.
+* `even_indices_multiset_preserved` (proptest) — multiset of even-indexed
+                                                  values is preserved.
+* `empty_input_returns_empty` (unit test)    — `sort_even(&[])` returns
+                                                an empty `Vec`. -/
+
+/-- Empty-input boundary clause: when the input slice is empty, `sort_even`
+    returns successfully an empty `Vec`.  Captures the unit test
+    `empty_input` (function is total — no panic on `&[]`). -/
+theorem empty_input_returns_empty
+    (l : RustSlice i64) (hempty : l.val.size = 0) :
+    ∃ v : alloc.vec.Vec i64 alloc.alloc.Global,
+      clever_036_sort_even.sort_even l = RustM.ok v ∧ v.val.size = 0 := by
+  -- Witness: the empty `Vec`.
+  let v_empty : alloc.vec.Vec i64 alloc.alloc.Global :=
+    ⟨(List.nil : List i64).toArray, by grind⟩
+  refine ⟨v_empty, ?_, ?_⟩
+  · -- Show `sort_even l = RustM.ok v_empty`.
+    unfold clever_036_sort_even.sort_even
+    -- Step 1: `alloc.vec.Impl.new` returns `RustM.ok v_empty`.
+    have h_new : (alloc.vec.Impl.new i64 rust_primitives.hax.Tuple0.mk :
+                    RustM (alloc.vec.Vec i64 alloc.alloc.Global)) =
+                  RustM.ok v_empty := rfl
+    rw [h_new, RustM_ok_bind]
+    -- Step 2: `collect_evens l 0 v_empty = RustM.ok v_empty`.
+    have h_zero_toNat : (0 : usize).toNat = 0 := rfl
+    have h_zero_le : l.val.size ≤ (0 : usize).toNat := by
+      rw [h_zero_toNat]; omega
+    have h_collect := collect_evens_oob l (0 : usize) v_empty h_zero_le
+    rw [h_collect, RustM_ok_bind]
+    -- Step 3: `core_models.ops.deref.Deref.deref ... v_empty = pure v_empty`.
+    have h_deref :
+        (core_models.ops.deref.Deref.deref (alloc.vec.Vec i64 alloc.alloc.Global)
+          v_empty : RustM (alloc.vec.Vec i64 alloc.alloc.Global))
+        = RustM.ok v_empty := rfl
+    rw [h_deref, RustM_ok_bind]
+    -- Step 4: the next `alloc.vec.Impl.new` reduces to `RustM.ok v_empty` again.
+    simp only [RustM_ok_bind]
+    -- Step 5: `rebuild_at l v_empty 0 0 v_empty = RustM.ok v_empty`.
+    exact rebuild_at_oob l v_empty (0 : usize) (0 : usize) v_empty h_zero_le
+  · -- `v_empty.val.size = 0`.
+    rfl
+
+/-- Length-preservation postcondition (also packages totality).
+    Captures the proptest `length_preserved`.
+
+    Closed via `sort_even_aux`, which bundles `collect_evens_size_aux`
+    (intermediate `sorted` has size `num_evens l.val.size`) with the
+    fully-closed `rebuild_at_correct_strong` (output has size
+    `l.val.size`).  The only remaining external dependency is the
+    `collect_evens_size_aux` sorry, which all four top-level theorems
+    factor through. -/
+theorem length_preserved
+    (l : RustSlice i64) :
+    ∃ v : alloc.vec.Vec i64 alloc.alloc.Global,
+      clever_036_sort_even.sort_even l = RustM.ok v ∧
+      v.val.size = l.val.size := by
+  obtain ⟨_, v, hres, _, h_v_size, _, _⟩ := sort_even_aux l
+  exact ⟨v, hres, h_v_size⟩
+
+/-- Odd-index-preservation postcondition: at every odd in-range position
+    the output equals the input pointwise.  Captures the proptest
+    `odd_indices_unchanged`.
+
+    Closed via `sort_even_aux` (which carries the per-position invariant
+    for `rebuild_at`).  At an odd index, the invariant gives directly
+    `v.val[k] = l.val[k]`.  Reduces to the `collect_evens_size_aux`
+    dependency. -/
+theorem odd_indices_unchanged
+    (l : RustSlice i64)
+    (v : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hres : clever_036_sort_even.sort_even l = RustM.ok v)
+    (i : Nat) (h_v : i < v.val.size) (h_l : i < l.val.size)
+    (hodd : i % 2 = 1) :
+    v.val[i]'h_v = l.val[i]'h_l := by
+  obtain ⟨_, v', hres', _, _, h_v_inv, _⟩ := sort_even_aux l
+  -- Align v and v'.
+  rw [hres'] at hres
+  injection hres with h_eq
+  injection h_eq with h_eq'
+  subst h_eq'
+  -- Apply the per-position invariant at i.
+  have h_inv := h_v_inv i h_v
+  have h_not_even : ¬ i % 2 = 0 := by omega
+  rw [if_neg h_not_even] at h_inv
+  obtain ⟨_, h_eq_l⟩ := h_inv
+  exact h_eq_l
+
+/-- Even-index sortedness postcondition: consecutive even-indexed output
+    values are non-decreasing.  Captures the proptest
+    `even_indices_sorted`.
+
+    Closed via `sort_even_aux` (per-position invariant) + the
+    `collect_evens_sortedness_aux` private theorem (sortedness of the
+    intermediate `sorted`).  The output at even position `k` equals
+    `sorted[num_evens k]`, and `num_evens (k+2) = num_evens k + 1` when
+    `k % 2 = 0`, so consecutive even-indexed outputs map to consecutive
+    `sorted` entries, where sortedness applies directly. -/
+theorem even_indices_sorted
+    (l : RustSlice i64)
+    (v : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hres : clever_036_sort_even.sort_even l = RustM.ok v)
+    (i : Nat) (h_v_i : i < v.val.size) (h_v_i2 : i + 2 < v.val.size)
+    (heven : i % 2 = 0) :
+    (v.val[i]'h_v_i).toInt ≤ (v.val[i + 2]'h_v_i2).toInt := by
+  obtain ⟨sorted_v, v', hres', h_sorted_size, h_v_size, h_v_inv, h_collect_v⟩ :=
+    sort_even_aux l
+  obtain ⟨sorted_s, h_collect_s, h_sorted_size_s, h_sorted_s_sorted⟩ :=
+    collect_evens_sortedness_aux l
+  -- Align v' with v.
+  rw [hres'] at hres
+  injection hres with h_eq; injection h_eq with h_eq'; subst h_eq'
+  -- Align sorted_s with sorted_v.
+  rw [h_collect_v] at h_collect_s
+  injection h_collect_s with h_es; injection h_es with h_es'
+  subst h_es'
+  -- Apply per-position invariant at i and i+2.
+  have h_inv_i := h_v_inv i h_v_i
+  rw [if_pos heven] at h_inv_i
+  obtain ⟨h_bnd_i, h_eq_i⟩ := h_inv_i
+  have h_i2_even : (i + 2) % 2 = 0 := by omega
+  have h_inv_i2 := h_v_inv (i + 2) h_v_i2
+  rw [if_pos h_i2_even] at h_inv_i2
+  obtain ⟨h_bnd_i2, h_eq_i2⟩ := h_inv_i2
+  -- Compute num_evens (i + 2) = num_evens i + 1.
+  have h_num_evens_step :
+      num_evens (i + 2) = num_evens i + 1 := by
+    show num_evens (i + 1 + 1) = num_evens i + 1
+    show (if (i + 1) % 2 = 0 then 1 else 0) + num_evens (i + 1) = num_evens i + 1
+    have h_i1_not_even : ¬ (i + 1) % 2 = 0 := by omega
+    rw [if_neg h_i1_not_even]
+    -- Goal: 0 + num_evens (i + 1) = num_evens i + 1
+    show 0 + ((if i % 2 = 0 then 1 else 0) + num_evens i) = num_evens i + 1
+    rw [if_pos heven]; omega
+  -- Rewrite the indices.
+  rw [h_eq_i, h_eq_i2]
+  -- Goal: sorted[num_evens i] ≤ sorted[num_evens (i + 2)].
+  -- Apply sortedness invariant at m = num_evens i.
+  have h_bnd_i_plus_1 : num_evens i + 1 < sorted_v.val.size := by
+    rw [← h_num_evens_step]; exact h_bnd_i2
+  have h_sort_apply := h_sorted_s_sorted (num_evens i) h_bnd_i_plus_1
+  -- h_sort_apply : sorted[num_evens i] ≤ sorted[num_evens i + 1]
+  -- Bridge: rewrite RHS via h_num_evens_step.
+  have h_idx_eq :
+      sorted_v.val[num_evens (i + 2)]'h_bnd_i2 =
+        sorted_v.val[num_evens i + 1]'h_bnd_i_plus_1 :=
+    getElem_congr_idx h_num_evens_step
+  rw [h_idx_eq]
+  exact h_sort_apply
+
+/-- Multiset-preservation postcondition for even-indexed values.
+    Captures the proptest `even_indices_multiset_preserved`.
+
+    Closed via the chain:
+    1. `sort_even_aux` produces a `sorted` intermediate with
+       `v.val[k] = sorted.val[num_evens k]` at every even position.
+    2. `count_at_even_via_sorted` translates `count_at_even v target v.size`
+       into `count_total sorted target sorted.size` (the multiset count
+       on the densely-packed intermediate).
+    3. `collect_evens_multiset_aux` equates that to `count_at_even l target
+       l.size` (the multiset is preserved by `collect_evens`).
+    The first two steps are fully closed; the third still reduces to the
+    `collect_evens_multiset_aux` sorry. -/
+theorem even_indices_multiset_preserved
+    (l : RustSlice i64)
+    (v : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hres : clever_036_sort_even.sort_even l = RustM.ok v)
+    (target : i64) :
+    count_at_even v.val target v.val.size =
+      count_at_even l.val target l.val.size := by
+  obtain ⟨sorted_v, v', hres', h_sorted_size, h_v_size, h_v_inv, h_collect_v⟩ :=
+    sort_even_aux l
+  obtain ⟨sorted_m, h_collect_m, h_sorted_size_m, h_multiset⟩ :=
+    collect_evens_multiset_aux l target
+  -- Align v' = v (subst replaces v with v' since v is the older binding).
+  rw [hres'] at hres
+  injection hres with h_eq; injection h_eq with h_eq'; subst h_eq'
+  -- Align sorted_m = sorted_v.
+  rw [h_collect_v] at h_collect_m
+  injection h_collect_m with h_em; injection h_em with h_em'; subst h_em'
+  -- After substs: goal is `count_at_even v'.val target v'.val.size = count_at_even l.val target l.val.size`.
+  -- Step 1: translate count_at_even on v' to count_total on sorted_v.
+  have h_translate :
+      count_at_even v'.val target v'.val.size =
+        count_total sorted_v.val target (num_evens v'.val.size) :=
+    count_at_even_via_sorted v' sorted_v l target h_v_inv v'.val.size (Nat.le_refl _)
+  -- Step 2: num_evens v'.val.size = sorted_v.val.size (via h_v_size + h_sorted_size).
+  have h_num_evens_eq : num_evens v'.val.size = sorted_v.val.size := by
+    rw [h_v_size, h_sorted_size]
+  -- Step 3: combine with the multiset equation.
+  rw [h_translate, h_num_evens_eq, ← h_multiset]
+
+end Clever_036_sort_evenObligations

@@ -1,0 +1,105 @@
+<<< SEARCH
+    #[test]
+    #[should_panic]
+    fn slice_len_too_big_u64_read_little_endian() {
+        let bytes = [0u8; 17];
+        let mut numbers = [0u64; 2];
+        read_u64_into(&bytes, &mut numbers);
+    }
+}
+===
+    #[test]
+    #[should_panic]
+    fn slice_len_too_big_u64_read_little_endian() {
+        let bytes = [0u8; 17];
+        let mut numbers = [0u64; 2];
+        read_u64_into(&bytes, &mut numbers);
+    }
+
+    // ---- Property-based tests ----
+    //
+    // Deterministic, dependency-free generator so the suite is reproducible
+    // (and friendly to downstream proof extraction).
+    struct Lcg(u64);
+    impl Lcg {
+        fn new(seed: u64) -> Self {
+            Lcg(seed)
+        }
+        fn next_u64(&mut self) -> u64 {
+            self.0 = self
+                .0
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            self.0
+        }
+        fn next_byte(&mut self) -> u8 {
+            (self.next_u64() >> 56) as u8
+        }
+        // Uniform-ish value in `0..bound`; `bound` is always > 0 here.
+        fn next_below(&mut self, bound: usize) -> usize {
+            (self.next_u64() as usize) % bound
+        }
+    }
+
+    // Postcondition: for a valid call (`src.len() == 8 * dst.len()`), every
+    // output element equals the little-endian decoding of its 8-byte chunk,
+    // i.e. byte `j` of chunk `i` contributes bits `[8j, 8j+8)` of `dst[i]`.
+    //
+    // The expected value is computed by hand (not via `u64::from_le_bytes`),
+    // so this independently pins down: the little-endian byte order, the
+    // chunk-to-element alignment, and that every element is written. A
+    // big-endian, off-by-one, or element-skipping implementation would fail.
+    // `count == 0` is exercised as the valid empty-slice edge case.
+    #[test]
+    fn prop_little_endian_decode_postcondition() {
+        let mut rng = Lcg::new(0x1234_5678_9abc_def0);
+        for _ in 0..256 {
+            let count = rng.next_below(9); // 0..=8 output integers
+            let mut src = vec![0u8; count * 8];
+            for b in src.iter_mut() {
+                *b = rng.next_byte();
+            }
+            let mut dst = vec![0u64; count];
+            read_u64_into(&src, &mut dst);
+
+            for i in 0..count {
+                let mut expected = 0u64;
+                for j in 0..8 {
+                    expected |= (src[8 * i + j] as u64) << (8 * j);
+                }
+                assert_eq!(dst[i], expected, "mismatch at output index {i}");
+            }
+        }
+    }
+
+    // Failure condition: the function panics whenever the length invariant
+    // `src.len() == 8 * dst.len()` is violated (the leading `assert_eq!`).
+    // Covers mismatches in both directions and the empty-vs-nonempty cases.
+    #[test]
+    fn prop_length_mismatch_panics() {
+        let mut rng = Lcg::new(0x0fed_cba9_8765_4321);
+        // Silence the panic hook so the expected panics don't spam stderr.
+        let prev_hook = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        for _ in 0..256 {
+            let src_len = rng.next_below(40);
+            let dst_len = rng.next_below(8);
+            if src_len == dst_len * 8 {
+                continue; // a valid call — not what this test covers
+            }
+            let src = vec![0u8; src_len];
+            let mut dst = vec![0u64; dst_len];
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                read_u64_into(&src, &mut dst);
+            }));
+            assert!(
+                result.is_err(),
+                "expected panic for src_len={src_len}, dst_len={dst_len}"
+            );
+        }
+
+        std::panic::set_hook(prev_hook);
+    }
+}
+>>> REPLACE

@@ -1,0 +1,131 @@
+<<< SEARCH
+/-- Totality: `intersperse` always succeeds (returns `RustM.ok`).
+
+    **Status:** this obligation is left as `sorry` because it is genuinely
+    not provable in its current unconditional form. The function fails when
+    `2 * numbers.val.size > 2 ^ 64`: the final `extend_from_slice` on the
+    last element of the slice overflows the `USize64.size` bound on the
+    Vec. The proptest in `src/lib.rs` constrains lengths to `0..32`, so the
+    overflow is unreachable in the test domain, but the obligation as
+    stated quantifies over all `RustSlice i64`.
+
+    **Structural unblock:** the obligation needs an extra precondition
+    `2 * numbers.val.size ≤ 2 ^ 64` (equivalently `2 * numbers.val.size - 1
+    < USize64.size`). Under that precondition, totality follows from a
+    strong induction using the same `intersperse_at_step_zero` /
+    `intersperse_at_step_pos` lemmas: each step succeeds because the size
+    of the running `acc` is bounded by the precondition, and `i + 1` does
+    not overflow because `i ≤ numbers.val.size < 2 ^ 64`. -/
+theorem intersperse_total
+    (numbers : RustSlice i64) (delimiter : i64) :
+    ∃ v : alloc.vec.Vec i64 alloc.alloc.Global,
+      clever_005_intersperse.intersperse numbers delimiter = RustM.ok v := by
+  sorry
+===
+/-! ## Totality
+
+The totality obligation is *not provable unconditionally*. The body of
+`intersperse_at` calls `extend_from_slice`, which fails (`maximumSizeExceeded`)
+when `acc.val.size + chunk.size ≥ USize64.size = 2 ^ 64`. After the
+recursion completes at `i = numbers.val.size`, the accumulator's size is
+`2 * numbers.val.size - 1` (for non-empty input), so the function fails
+whenever `2 * numbers.val.size - 1 ≥ 2 ^ 64` — i.e., when
+`numbers.val.size ≥ 2 ^ 63`.
+
+A `RustSlice` is bounded only by `numbers.val.size < 2 ^ 64`, so the
+overflow regime (`2 ^ 63 ≤ numbers.val.size < 2 ^ 64`) is in the
+mathematical domain even though it is unreachable in any practical
+execution. The Rust `proptest` block in `src/lib.rs` restricts lengths to
+`0..32`, so the failure is unreachable in the test domain, but the Lean
+obligation quantifies over all `RustSlice i64` and is therefore false.
+
+The proof below makes a substantive strong-induction attempt: the OOB and
+`i = 0` cases discharge mechanically, and the `i > 0` case reduces to the
+specific sub-goal `acc.val.size + 2 < 2 ^ 64`, which equals
+`2 * i.toNat + 1 < 2 ^ 64` after using the size invariant
+`acc.val.size = 2 * i.toNat - 1`. That sub-goal cannot be discharged from
+the available hypotheses: we have `i.toNat < numbers.val.size < 2 ^ 64`
+but no upper bound of the form `2 * numbers.val.size ≤ 2 ^ 64`. -/
+
+/-- Helper for totality: under the invariant
+    `acc.val.size = if i.toNat = 0 then 0 else 2 * i.toNat - 1`,
+    `intersperse_at` returns `ok v` for some `v`.
+
+    The induction step at `i > 0` is the genuine bottleneck — see the
+    `sorry` for the precise stuck sub-goal. -/
+private theorem intersperse_at_total_aux
+    (numbers : RustSlice i64) (delimiter : i64) :
+    ∀ (m : Nat) (i : usize) (acc : alloc.vec.Vec i64 alloc.alloc.Global),
+      numbers.val.size - i.toNat ≤ m →
+      i.toNat ≤ numbers.val.size →
+      acc.val.size = (if i.toNat = 0 then 0 else 2 * i.toNat - 1) →
+      ∃ v : alloc.vec.Vec i64 alloc.alloc.Global,
+        clever_005_intersperse.intersperse_at numbers delimiter i acc
+          = RustM.ok v := by
+  intro m
+  induction m with
+  | zero =>
+    intro i acc hm hin h_acc_size
+    -- m = 0 ⇒ i.toNat = numbers.val.size; OOB returns acc.
+    have h_ge : numbers.val.size ≤ i.toNat := by omega
+    exact ⟨acc, intersperse_at_oob numbers delimiter i acc h_ge⟩
+  | succ m ih =>
+    intro i acc hm hin h_acc_size
+    by_cases h_ge : numbers.val.size ≤ i.toNat
+    · -- OOB.
+      exact ⟨acc, intersperse_at_oob numbers delimiter i acc h_ge⟩
+    · have hi_lt : i.toNat < numbers.val.size := Nat.lt_of_not_le h_ge
+      have h_size_lt : numbers.val.size < 2 ^ 64 := numbers.size_lt_usizeSize
+      have h_no_overflow_i : i.toNat + 1 < 2 ^ 64 := by omega
+      have h_i1_toNat : (i + 1).toNat = i.toNat + 1 :=
+        usize_add_one_toNat i h_no_overflow_i
+      have h_one : (1 : usize).toNat = 1 := rfl
+      by_cases hi_zero : i.toNat = 0
+      · -- i = 0: acc is empty, so acc.val.size + 1 = 1 < 2^64.
+        have hi_eq : i = (0 : usize) := by
+          apply USize64.toNat_inj.mp
+          show i.toNat = (0 : usize).toNat
+          rw [hi_zero]; rfl
+        have h_acc_zero : acc.val.size = 0 := by
+          rw [h_acc_size, if_pos hi_zero]
+        have hn_pos : 0 < numbers.val.size := by omega
+        have h_no : acc.val.size + 1 < 2 ^ 64 := by rw [h_acc_zero]; omega
+        rw [hi_eq, intersperse_at_step_zero numbers delimiter acc hn_pos h_no]
+        have h_acc'_size :
+            (acc_push_one acc (numbers.val[0]'hn_pos) h_no).val.size = 1 := by
+          rw [acc_push_one_size, h_acc_zero]
+        have h_acc'_size_inv :
+            (acc_push_one acc (numbers.val[0]'hn_pos) h_no).val.size
+              = (if (1 : usize).toNat = 0 then 0 else 2 * (1 : usize).toNat - 1) := by
+          rw [h_acc'_size]; simp [h_one]
+        apply ih (1 : usize) _
+        · rw [h_one]; omega
+        · rw [h_one]; omega
+        · exact h_acc'_size_inv
+      · -- i > 0: acc.val.size = 2 * i.toNat - 1, so applying step_pos requires
+        -- 2 * i.toNat + 1 < 2 ^ 64. This is the precise stuck sub-goal.
+        have hi_pos : 0 < i.toNat := Nat.pos_of_ne_zero hi_zero
+        have h_acc_size_val : acc.val.size = 2 * i.toNat - 1 := by
+          rw [h_acc_size, if_neg hi_zero]
+        -- Stuck sub-goal: we need `acc.val.size + 2 < 2 ^ 64`, i.e.
+        -- `2 * i.toNat + 1 < 2 ^ 64`. From `i.toNat < numbers.val.size < 2^64`
+        -- and the input `RustSlice` invariant alone, this is not derivable in
+        -- the regime `2^63 ≤ numbers.val.size < 2^64`.
+        sorry
+
+theorem intersperse_total
+    (numbers : RustSlice i64) (delimiter : i64) :
+    ∃ v : alloc.vec.Vec i64 alloc.alloc.Global,
+      clever_005_intersperse.intersperse numbers delimiter = RustM.ok v := by
+  unfold clever_005_intersperse.intersperse
+  simp only [alloc.vec.Impl.new, pure_bind]
+  have h_zero_toNat : (0 : usize).toNat = 0 := rfl
+  apply intersperse_at_total_aux numbers delimiter
+    numbers.val.size (0 : usize)
+    (⟨(List.nil : List i64).toArray, by decide⟩ : alloc.vec.Vec i64 alloc.alloc.Global)
+  · rw [h_zero_toNat]; omega
+  · rw [h_zero_toNat]; omega
+  · show (List.nil : List i64).toArray.size
+          = (if (0 : usize).toNat = 0 then 0 else _)
+    rw [h_zero_toNat]; rfl
+>>> REPLACE

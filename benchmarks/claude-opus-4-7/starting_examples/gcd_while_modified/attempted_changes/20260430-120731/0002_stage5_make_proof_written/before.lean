@@ -1,0 +1,61 @@
+-- Companion obligations file for the `gcd_while` extraction.
+-- Each property the Rust function should satisfy belongs here as a separate `theorem`.
+-- Proofs use `sorry` placeholders at this stage; they are filled in by the proof stage.
+
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+import gcd_while
+
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+
+namespace Gcd_whileObligations
+
+/-- Totality / no-panic.
+    For every pair of `u64` inputs, `gcd_while` returns a value (it never
+    panics and never diverges in the `RustM` sense).
+
+    The only Rust operation in the body that could panic is `a % b`,
+    which would fail with `divisionByZero` if `b = 0`. The loop guard
+    `b !=? 0` excludes that case, so the modulo is always well-defined.
+    Termination is witnessed by the `loop_decreases!(b)` measure: after
+    one iteration, the new `b` equals `a % b₀ < b₀` whenever `b₀ > 0`. -/
+theorem gcd_while_total (a b : u64) :
+    ∃ r : u64, gcd_while.gcd_while a b = pure r := by
+  sorry
+
+/-- Postcondition (common divisor).
+    Whenever `gcd_while a b` returns a value `r`, that value divides both
+    inputs (taken as `Nat`s via `.toNat`). At the boundary `a = b = 0`
+    the result is `0` and the claim `0 ∣ 0` holds trivially.
+
+    This captures only the *common-divisor* half of the contract; the
+    *greatest* part is a separate, independent theorem below — a function
+    that always returned `1` would satisfy this clause but fail the next. -/
+theorem gcd_while_divides_both (a b r : u64)
+    (h : gcd_while.gcd_while a b = pure r) :
+    r.toNat ∣ a.toNat ∧ r.toNat ∣ b.toNat := by
+  sorry
+
+/-- Postcondition (greatest, in the divides ordering).
+    Any common divisor `d` of the two inputs also divides the returned
+    result `r`. This is the strongest form of "greatest common divisor"
+    and it is well-defined even at the `(0, 0)` boundary (where `r = 0`
+    and `d ∣ 0` holds for every `d`).
+
+    Together with `gcd_while_divides_both`, this pins the result down
+    uniquely (up to associates in `Nat`, which are equal): a function
+    that always returned `a` would satisfy this clause but fail the
+    divides-both clause whenever `a` does not divide `b`. -/
+theorem gcd_while_greatest (a b r : u64)
+    (h : gcd_while.gcd_while a b = pure r)
+    (d : u64) (hda : d.toNat ∣ a.toNat) (hdb : d.toNat ∣ b.toNat) :
+    d.toNat ∣ r.toNat := by
+  sorry
+
+end Gcd_whileObligations

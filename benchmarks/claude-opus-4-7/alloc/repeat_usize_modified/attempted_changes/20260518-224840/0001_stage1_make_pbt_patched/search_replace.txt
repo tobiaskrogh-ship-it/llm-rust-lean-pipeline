@@ -1,0 +1,121 @@
+<<< SEARCH
+        assert!(repeat(layout, align_max).is_ok());
+        assert!(repeat(layout, align_max + 1).is_err());
+    }
+}
+===
+        assert!(repeat(layout, align_max).is_ok());
+        assert!(repeat(layout, align_max + 1).is_err());
+    }
+
+    // ---- Property-based tests -------------------------------------------
+    //
+    // Preconditions respected by every generated input: `align` is a
+    // power of two with `align >= 1` (a `Layout` invariant), and the
+    // inlined `size + (align - 1)` in `size_rounded_up_to_custom_align`
+    // must not overflow `usize`. Sizes are kept `<= isize::MAX as usize`
+    // and alignments `<= 1 << 30`, so `size + align - 1 < usize::MAX`.
+
+    const ALIGNS: [usize; 7] = [1, 2, 4, 8, 16, 4096, 1 << 30];
+
+    fn sizes() -> [usize; 12] {
+        let imax = isize::MAX as usize;
+        [0, 1, 2, 3, 5, 6, 7, 8, 13, 4097, imax / 2, imax]
+    }
+
+    fn ns() -> [usize; 9] {
+        let imax = isize::MAX as usize;
+        [0, 1, 2, 3, 7, 1 << 20, imax, imax + 1, usize::MAX]
+    }
+
+    // Smallest multiple of `align` that is `>= size`, computed via
+    // remainder/division rather than the implementation's bitmask trick,
+    // so it is an *independent* oracle for the padded element stride.
+    fn round_up(size: usize, align: usize) -> usize {
+        let r = size % align;
+        if r == 0 { size } else { size + (align - r) }
+    }
+
+    // Postcondition on the returned stride (second tuple component): it is
+    // the element size padded up to `align` — a multiple of `align`, at
+    // least `size`, with a gap strictly smaller than `align`. This is the
+    // "suitable padding between each" clause of the contract. A buggy
+    // implementation that under-pads, over-pads, or misaligns the stride
+    // would be caught here.
+    #[test]
+    fn prop_stride_is_correct_padding() {
+        for &align in &ALIGNS {
+            for size in sizes() {
+                for n in ns() {
+                    let layout = Layout { size, align };
+                    if let Ok((_, offs)) = repeat(layout, n) {
+                        assert_eq!(offs % align, 0, "stride not a multiple of align");
+                        assert!(offs >= size, "stride smaller than element size");
+                        assert!(offs - size < align, "stride over-padded");
+                    }
+                }
+            }
+        }
+    }
+
+    // Postcondition relating the array layout to the stride: the array
+    // size is exactly `n` strides, and the input alignment is preserved.
+    // Independent of `prop_stride_is_correct_padding` (which pins the
+    // stride value itself): an implementation could return a correct
+    // stride yet a wrong total size, or drop the alignment.
+    #[test]
+    fn prop_array_size_is_stride_times_n() {
+        for &align in &ALIGNS {
+            for size in sizes() {
+                for n in ns() {
+                    let layout = Layout { size, align };
+                    if let Ok((arr, offs)) = repeat(layout, n) {
+                        assert_eq!(arr.align(), align, "alignment not preserved");
+                        let expected = offs
+                            .checked_mul(n)
+                            .expect("success implies stride * n does not overflow");
+                        assert_eq!(arr.size(), expected, "array size != stride * n");
+                    }
+                }
+            }
+        }
+    }
+
+    // Failure condition: `repeat` succeeds exactly when the padded stride
+    // times `n` neither overflows `usize` nor exceeds
+    // `max_size_for_align(align) = (isize::MAX as usize + 1) - align`.
+    // `round_up` is an independent reimplementation of the padding, so
+    // this pins the precise Ok/Err boundary on its own.
+    #[test]
+    fn prop_success_iff_fits() {
+        let mut saw_ok = false;
+        let mut saw_err = false;
+        for &align in &ALIGNS {
+            for size in sizes() {
+                for n in ns() {
+                    let layout = Layout { size, align };
+                    let stride = round_up(size, align);
+                    let max = (isize::MAX as usize + 1) - align;
+                    let should_fit = match stride.checked_mul(n) {
+                        Some(total) => total <= max,
+                        None => false,
+                    };
+                    let got = repeat(layout, n);
+                    assert_eq!(
+                        got.is_ok(),
+                        should_fit,
+                        "Ok/Err boundary mismatch for size={size}, align={align}, n={n}"
+                    );
+                    if should_fit {
+                        saw_ok = true;
+                    } else {
+                        saw_err = true;
+                    }
+                }
+            }
+        }
+        // Guard against the input grid degenerating to a single branch.
+        assert!(saw_ok && saw_err, "inputs must exercise both Ok and Err");
+    }
+}
+>>> REPLACE

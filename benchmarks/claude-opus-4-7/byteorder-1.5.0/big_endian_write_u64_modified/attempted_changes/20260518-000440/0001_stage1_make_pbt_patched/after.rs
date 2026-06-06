@@ -1,0 +1,112 @@
+//! Extracted from `byteorder` 1.5.0: `BigEndian::write_u64`.
+//!
+//! Source: src/lib.rs:1987-1990, inside `impl ByteOrder for BigEndian`.
+//! `BigEndian` is a zero-sized marker type and `write_u64` takes no `&self`
+//! receiver, so the function is rewritten as a free `pub fn` with identical
+//! signature and body.
+
+#[inline]
+pub fn write_u64(buf: &mut [u8], n: u64) {
+    buf[..8].copy_from_slice(&n.to_be_bytes());
+}
+
+#[cfg(test)]
+mod tests {
+    use super::write_u64;
+    use std::panic::{self, AssertUnwindSafe};
+
+    // Transferred from src/lib.rs: `too_small!(small_u64, 7, 0, read_u64, write_u64);`
+    // expansion of the `write_big_endian` arm. The `too_small!` macro generates
+    // a `#[should_panic]` test that calls `BigEndian::write_u64(&mut [0; 7], 0)`
+    // to ensure the function panics when the buffer is too small.
+    #[test]
+    #[should_panic]
+    fn write_big_endian() {
+        let mut buf = [0; 7];
+        write_u64(&mut buf, 0);
+    }
+
+    // Deterministic sample of `n` values: edge cases plus an xorshift sequence
+    // so every byte lane takes many distinct values.
+    fn sample_values() -> Vec<u64> {
+        let mut vs = vec![
+            0,
+            1,
+            u64::MAX,
+            0x0102_0304_0506_0708, // all 8 bytes distinct: distinguishes byte order
+            0xFEDC_BA98_7654_3210,
+            0x00FF_00FF_00FF_00FF,
+            0xFF00_0000_0000_0000, // only the most-significant byte set
+            0x0000_0000_0000_00FF, // only the least-significant byte set
+        ];
+        let mut x: u64 = 0x9E37_79B9_7F4A_7C15;
+        for _ in 0..64 {
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            vs.push(x);
+        }
+        vs
+    }
+
+    // POSTCONDITION (value + endianness): for any `n` and any buffer of length
+    // >= 8, the first 8 bytes are the big-endian encoding of `n`, i.e. byte `i`
+    // is the `(7 - i)`-th byte counting from the least-significant end. Computed
+    // with explicit shifts so the test does not just restate `n.to_be_bytes()`;
+    // a little-endian (or otherwise byte-permuted) implementation fails here.
+    #[test]
+    fn prop_big_endian_byte_order() {
+        for &n in &sample_values() {
+            for len in 8..=16usize {
+                let mut buf = vec![0xAAu8; len];
+                write_u64(&mut buf, n);
+                for i in 0..8 {
+                    let expected = (n >> (8 * (7 - i as u32))) as u8;
+                    assert_eq!(
+                        buf[i], expected,
+                        "n={n:#018x}, len={len}, byte {i}"
+                    );
+                }
+            }
+        }
+    }
+
+    // POSTCONDITION (writes exactly 8 bytes): bytes at index >= 8 are left
+    // untouched. The buffer is pre-filled with a sentinel that never appears in
+    // the big-endian encoding region under test, so a write that spills past
+    // index 8 (or clears the whole buffer) is caught.
+    #[test]
+    fn prop_tail_unchanged() {
+        const SENTINEL: u8 = 0x5A;
+        for &n in &sample_values() {
+            for len in 9..=24usize {
+                let mut buf = vec![SENTINEL; len];
+                write_u64(&mut buf, n);
+                for i in 8..len {
+                    assert_eq!(
+                        buf[i], SENTINEL,
+                        "n={n:#018x}, len={len}, tail byte {i} modified"
+                    );
+                }
+            }
+        }
+    }
+
+    // FAILURE CONDITION (precondition violation): every buffer shorter than 8
+    // bytes causes a panic, regardless of `n`. Generalizes the single len==7
+    // case in `write_big_endian` to all sub-minimal lengths.
+    #[test]
+    fn prop_panics_when_buffer_too_small() {
+        for len in 0..8usize {
+            for &n in &[0u64, 1, u64::MAX, 0x0102_0304_0506_0708] {
+                let mut buf = vec![0u8; len];
+                let result =
+                    panic::catch_unwind(AssertUnwindSafe(|| write_u64(&mut buf, n)));
+                assert!(
+                    result.is_err(),
+                    "expected panic for buffer len {len} with n={n:#018x}"
+                );
+            }
+        }
+    }
+}

@@ -1,0 +1,78 @@
+-- Companion obligations file for the `big_endian_read_u64` extraction.
+-- Each property the Rust function should satisfy belongs here as a separate `theorem`.
+-- Proofs use `sorry` placeholders at this stage; they are filled in by the proof stage.
+
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+import big_endian_read_u64
+
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+set_option maxHeartbeats 1600000
+
+namespace Big_endian_read_u64Obligations
+
+open big_endian_read_u64
+
+/-! ## Specification oracle: big-endian decode of the first eight bytes.
+
+Independent `Nat`-level reference mirroring the Rust test helper
+`be_first_eight`: the most significant byte is `buf[0]`, the least
+significant is `buf[7]`, and only the first eight bytes participate.
+Stating the postcondition against this oracle (rather than restating the
+shift/OR code) makes it a genuine semantic specification. -/
+private def beFirstEight (b0 b1 b2 b3 b4 b5 b6 b7 : u8) : Nat :=
+  b0.toNat * 2 ^ 56
+    + b1.toNat * 2 ^ 48
+    + b2.toNat * 2 ^ 40
+    + b3.toNat * 2 ^ 32
+    + b4.toNat * 2 ^ 24
+    + b5.toNat * 2 ^ 16
+    + b6.toNat * 2 ^ 8
+    + b7.toNat
+
+/-- Postcondition (in-bounds, `buf.len() ≥ 8`): `read_u64` returns the
+    big-endian value built from exactly the first eight bytes, in order
+    (`buf[0]` most significant … `buf[7]` least significant).
+
+    Captures the property test `postcondition_big_endian_of_first_eight_bytes`.
+    Because the right-hand side mentions only `buf.val[0..7]`, this single
+    equation simultaneously pins down (i) which bytes are read (the first
+    eight), (ii) the byte order (big-endian, distinguishing it from
+    little-endian / byte-swapped variants), and (iii) that trailing bytes at
+    index ≥ 8 do not affect the result. The equational `= RustM.ok …` form
+    also discharges the boundary half of `panics_iff_buffer_shorter_than_eight`
+    ("length exactly 8 must not panic"), since length 8 satisfies `8 ≤ size`.
+    A buggy implementation slicing a different prefix or using little-endian
+    order would falsify this. -/
+theorem read_u64_postcondition
+    (buf : RustSlice u8) (h : 8 ≤ buf.val.size) :
+    read_u64 buf = RustM.ok (UInt64.ofNat
+      (beFirstEight
+        (buf.val[0]'(by omega)) (buf.val[1]'(by omega))
+        (buf.val[2]'(by omega)) (buf.val[3]'(by omega))
+        (buf.val[4]'(by omega)) (buf.val[5]'(by omega))
+        (buf.val[6]'(by omega)) (buf.val[7]'(by omega)))) := by
+  sorry
+
+/-- Failure condition (`buf.len() < 8`): `read_u64` panics for every buffer
+    shorter than eight bytes. Evaluation reads `buf[0]_?`, `buf[1]_?`, … in
+    order; for `buf.val.size = k < 8` the first out-of-range access
+    `buf[k]_?` fails with `arrayOutOfBounds`, exactly mirroring the original
+    `buf[..8]` slice panic.
+
+    Captures the panic half of the property test
+    `panics_iff_buffer_shorter_than_eight` (lengths 0 through 7). A buggy
+    implementation slicing a shorter prefix (e.g. `buf[..4]`) would survive
+    some short buffers and be caught here. -/
+theorem read_u64_panics_when_short
+    (buf : RustSlice u8) (h : buf.val.size < 8) :
+    read_u64 buf = RustM.fail .arrayOutOfBounds := by
+  sorry
+
+end Big_endian_read_u64Obligations

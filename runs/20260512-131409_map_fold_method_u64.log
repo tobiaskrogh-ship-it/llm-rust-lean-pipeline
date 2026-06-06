@@ -1,0 +1,354 @@
+Log: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260512-131409_map_fold_method_u64.log
+Model: claude-opus-4-7
+Attempt logs: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64/attempted_changes/20260512-131409
+Stages: [1, 2, 3, 4, 5, 6, 7]
+Looking at this crate, I need to identify the contract of `Map::fold`:
+
+- **Precondition**: A well-formed `Map { iter: Range<u64>, f: fn(u64) -> u64 }`.
+- **Postcondition**: `Map { iter, f }.fold(init, g)` ≡ folding `iter` with `g` composed on the left with `f`, in forward order.
+- **Failure**: No explicit failure path — `fold` propagates any panic from `f` or `g` and inherits `Range::fold`'s termination (the range is bounded).
+
+Let me read the current state of `src/lib.rs` first to confirm the patch target, then add the focused tests.
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n    // Mirror of `tests/iter/adapters/map.rs::test_double_ended_map`, adapted\n    // to compare the forward fold w... [+2132 chars])
+[tool] run_cargo_test({})
+All 4 tests pass. Here's the summary.
+
+## Tests added
+
+### `empty_range_returns_init`
+- **Clause**: edge-case behaviour of the postcondition. When `iter` is empty, no element is produced, so neither `f` nor `g` is invoked and `init` flows through unchanged.
+- **What it catches**: an implementation that initializes the accumulator differently, or one that erroneously invokes `g` on a sentinel before checking emptiness.
+
+### `matches_composed_fold`
+- **Clause**: the canonical postcondition — `Map { iter, f }.fold(init, g) == iter.fold(init, |acc, x| g(acc, f(x)))`. This is essentially the contract the source comment defines via `map_fold`.
+- **What it catches**: applying `f` after `g` instead of before, applying `f` zero or two times, dropping elements, and (because `g(acc, x) = 31·acc + x` is non-commutative in its arguments) any reversal of iteration order.
+
+## Existing tests (kept)
+
+`fold_matches_shifted_fold` (mapped fold = shifted unmapped fold) and `fold_sums_with_offset` (concrete sum sanity check) — both partially overlap with `matches_composed_fold`, but each pins down a slightly different concrete instance.
+
+## Properties considered but **not** included
+
+- **Length / count is preserved by `map`** — not a property of `fold` itself; `fold` only exposes the accumulator, not the element count.
+- **`Map.fold` is equivalent to `iter.map(f).fold(init, g)`** — true, but stating the contract this way introduces a dependency on `Iterator::map`, which would itself need a model downstream. The composed-fold form (`iter.fold(init, |acc, x| g(acc, f(x)))`) is closer to the source's own definition (`map_fold`) and produces a cleaner proof obligation.
+- **Identity-mapper test (`f = |x| x` ⇒ `Map.fold` = `iter.fold`)** — strict specialization of `matches_composed_fold`; would only catch bugs already caught by it.
+- **Algebraic identities of arithmetic results** (parity preservation under doubling, monotonicity of `x*2`, distributivity of `2·acc + x`, etc.) — these are facts about `+`/`*` on `u64`, not about `Map::fold`, and would clutter the suite with derived theorems.
+- **Panic-propagation tests** (e.g. `f` panicking) — these test `f` and Rust's panic plumbing, not the contract of `Map::fold`; the function has no failure path of its own (the range is bounded, so termination is structural).
+- **Associativity / commutativity of the result** — `g` is arbitrary, so neither is a contract clause.
+
+make_pbt
+[tool] Glob({"pattern": "**/*.rs"})
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+Let me check the reference examples for what's been done before with these patterns:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/src/lib.rs"})
+Let me check examples that use Range or iterate:
+[tool] Grep({"pattern": "Range|\\.\\.|for .* in", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns", "output_mode":... [+22 chars])
+[tool] Grep({"pattern": "Range", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns", "glob": "**/src/lib.rs", "outpu... [+30 chars])
+I have the error context. The error matches the `assoc_type_equality_on_parent.rs` pattern - `impl FnMut(u64) -> u64` carries an associated-type equality (`FnMut::Output = u64`) on the parent trait. The fix is to use `fn(...)` pointers, and since the captured-closure helper `map_fold` then can't be a `fn`, I'll inline the fold as an explicit `while` loop.
+
+Let me also check whether `Range<u64>::fold` will be a problem on its own (it has the same FnMut bound), and whether `Range::start`/`Range::end` fields are usable.
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/sum_to_n_modified/src/lib.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/factorial_modified/src/lib.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/src/lib.rs"})
+Now I have enough context. The error matches the `assoc_type_equality_on_parent.rs` archive pattern: `impl FnMut(u64) -> u64` carries an equality constraint on `FnOnce::Output` (parent trait). The proven fix is to use `fn(...)` pointers.
+
+Since `map_fold` returns a closure that captures both `f` and `g` (can't be a fn pointer), I'll inline the fold as a `while` loop and drop the helper. The `Range::fold` call also has `FnMut` bounds, so I'll replace it with explicit iteration. The struct keeps `Range<u64>` and `fn(u64) -> u64` fields so the tests' construction syntax still works (non-capturing closures coerce to fn pointers at call sites).
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\nuse core::ops::Range;\n\n/// Concrete monomorphization of `core::iter::adapters::map::Map<I, F>`.\npub struct Map {... [+2317 chars])
+[tool] run_cargo_test({})
+All 4 tests pass after the rewrite. Non-capturing closures coerced to `fn` pointers as expected. Now Hax extraction:
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+All three stages pass: `cargo test` ✓, `cargo hax into lean` ✓, `lake build` ✓.
+
+Now check for Hax-degenerate patterns. The new `Map::fold` has a `while` loop but no `#[hax_lib::requires(...)]` and no `loop_invariant!` / `loop_decreases!` — following the "no annotations" default. Let me verify the extracted Lean doesn't have the constant-0 termination issue (only matters with auto-spec) and there's no `pureP` synthesis failure or keyword collision:
+[tool] Grep({"pattern": "from_machine \\(0 : u32\\)", "path": "proofs/lean/extraction", "glob": "*.lean", "output_mode": "content", "-n": true})
+[tool] Read({"file_path": "proofs/lean/extraction/map_fold_method_u64.lean"})
+The constant-`0` termination measure is present (line 44), but per the skill's guidance — "without `requires`, no auto-spec is generated and the constant-`0` measure is harmless" — and `lake build` succeeded confirming this. No `@[hax_spec]` block was emitted, no `pureP` synthesis failures, no keyword collisions. The `while` loop is extracted via the supported `rust_primitives.hax.while_loop` combinator, which the proof stage can address via `Spec.MonoLoopCombinator.while_loop`.
+
+## Summary
+
+### Changes made
+
+**`src/lib.rs`** — single rewrite driven by these Hax errors:
+
+```
+error: [HAX0001] Unsupported equality constraints on associated types of parent trait
+  --> src/lib.rs:27:2   (fn map_fold)
+  --> src/lib.rs:37:5   (impl Map { fn fold })
+```
+
+Both errors hit `impl FnMut(u64) -> u64` / `impl FnMut(u64, u64) -> u64` parameter bounds and the `Range::fold` call (same bound). Per the archive's `assoc_type_equality_on_parent.rs`, `Fn*` traits put an equality constraint on `FnOnce::Output` (parent trait) and the Lean printer rejects this.
+
+**Rewrite**:
+- Replaced `impl FnMut(...) -> u64` bounds with `fn(...)` pointers.
+- Deleted the `map_fold` helper — its body `move |acc, elt| g(acc, f(elt))` captures both `f` and `g`, which cannot be expressed as a `fn` pointer.
+- Replaced `self.iter.fold(init, ...)` (also `FnMut`-bound) with an explicit `while` loop over `self.iter.start..self.iter.end`. This uses the no-annotations strategy: no `loop_invariant!`, no `loop_decreases!`, no `requires` — leaving termination/invariant work to the proof stage via `Spec.MonoLoopCombinator.while_loop`.
+
+The struct shape (`pub struct Map { pub iter: Range<u64>, pub f: fn(u64) -> u64 }`) is preserved so the tests' `Map { iter: 0..10, f: |x| x + 3 }` literal construction still compiles. The tests' non-capturing closures coerce to `fn(...)` at the `Map::fold` call sites (verified — all 4 tests pass).
+
+### Semantics
+
+The fold is observably identical to `Range::fold`: same left-to-right traversal, same `g(acc, f(elt))` composition, same empty-range short-circuit (loop doesn't execute when `start == end`). All four tests (including `empty_range_returns_init`, `matches_composed_fold` which pins down left-to-right order, and the wrapping-arithmetic tests) pass post-rewrite.
+
+### Library calls inlined
+
+None. The only standard-library use was `Range::fold` (rewritten to a `while` loop, see above) and `Range::start` / `Range::end` field reads, both supported in Hax (extracted as `core_models.ops.range.Range.start` / `.Range._end`).
+
+### Patterns considered but not changed
+
+- The struct field `iter: Range<u64>`: kept as-is because (a) tests construct via `0..10` syntax which produces a `Range`, (b) Hax does model `Range` (it appears as `core_models.ops.range.Range u64` in the extracted Lean and `lake build` accepts field reads on it), and (c) the test contract requires this field type.
+- The `while` loop: no `loop_invariant!` / `loop_decreases!` / `requires` added (no-annotations default), since the proof obligation for this fold will likely involve the composition `fold_left(g, fold_left(f, ...))` over a `Range`, which is comparison-arithmetic and lifts cleanly to a Lean-side proof.
+
+### Hax-degenerate patterns left for the proof stage
+
+- The `while_loop` extraction has a constant-`0` termination measure (line 44 of the extracted file). This is **harmless here** because no `#[hax_lib::requires(...)]` was added, so no `@[hax_spec]` block is emitted and there is nothing for the auto-spec to make unprovable. The proof stage will handle termination via `Spec.MonoLoopCombinator.while_loop` (measure: `end - i`).
+- The proof will need to relate `Map::fold` to the mathematical fold semantics by `while_loop` induction; the natural invariant `acc == fold_left(g, init, [f(start), ..., f(i-1)])` and decreases `end - i` both lift cleanly (no partial ops involved at the invariant level).
+
+rust_hax_lean
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64/attempted_changes/20260512-131... [+7 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/rewrite_patterns/*.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64/attempted_changes/20260512-1... [+55 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64/attempted_changes/20260512-1... [+59 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64/attempted_changes/20260512-1... [+60 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64/attempted_changes/20260512-1... [+51 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64/attempted_changes/20260512-1... [+50 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/rewrite_patterns/assoc_type_equality_on_parent.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/rewrite_patterns/loop_break_to_while.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/rewrite_patterns/loop_invariant_partial_op.rs"})
+Now I understand the picture. The HAX0001 root cause is already covered by `assoc_type_equality_on_parent.rs`, but only for the simple "swap `impl Fn` for `fn(...)` pointer" case. The new attempt adds two additional mechanical sub-fixes that aren't documented there:
+
+1. The `Range::fold(init, closure)` call itself triggers HAX0001 (its `FnMut` bound), and can't be patched in place — must be inlined as a `while` loop.
+2. A helper returning `impl FnMut(...) -> T` (a closure capturing other parameters) can't be lowered to a `fn(...)` pointer — must be dropped and the body inlined at call sites.
+
+This is a distinct mechanical pattern worth recording. Let me write it.
+[tool] write_rewrite_pattern({"name": "iter_fold_to_while_loop.rs", "content": "// unsupported: calling `Range::fold` (or any iterator-combinator method\n// whose bound is `FnMut(Acc, Self:... [+1914 chars])
+## Final report
+
+**Pattern written**
+
+- `iter_fold_to_while_loop.rs` — root cause is Hax `[HAX0001] Unsupported equality constraints on associated types of parent trait` (hacspec/hax#1923), same family as the existing `assoc_type_equality_on_parent.rs`. This new file documents the mechanical step when the simple "swap `impl Fn*` for `fn(...)`" fix *doesn't apply*: the bound lives on a stdlib method (`Range::fold`) and/or on a helper that returns `impl FnMut(...)` while capturing its inputs (so it can't be coerced to a `fn(...)` pointer). The fix is to drop the helper and inline `Range::fold` as an explicit `while` loop over `start..end`.
+
+**Attempts inspected but skipped**
+
+- `0001_stage1_make_pbt_patched/` — stage 1, not `stage2_rust_hax_lean`. Out of scope per the skill instructions.
+
+**Notes for a human**
+
+- The new pattern is intentionally a *companion* to `assoc_type_equality_on_parent.rs` rather than a replacement — that file shows the simple parameter-bound substitution; this one shows what to do when the substitution fails because of (a) a stdlib method bound or (b) a capturing closure return. A future curator may want to add cross-references between the two headers.
+
+harvest_rewrite_patterns
+## Comparison
+
+**Structural changes:**
+
+1. **`map_fold` helper removed** — its body `move |acc, elt| g(acc, f(elt))` has been folded directly into the loop body of `Map::fold`.
+
+2. **`Range::fold` replaced with explicit `while` loop** — the rewritten version pulls out `self.iter.start` / `self.iter.end` and iterates `i` from `start` (inclusive) to `end` (exclusive), applying `acc = g(acc, (self.f)(i))` at each step. This precisely mirrors the forward iteration order and termination condition of `Range<u64>` as an `Iterator`.
+
+3. **Signature of `g` tightened from `impl FnMut(u64, u64) -> u64` to `fn(u64, u64) -> u64`** — the inlined helper is also no longer needed. This is a type-level restriction (capturing closures no longer accepted) but, for any input the new signature accepts, both versions execute the same body. All test call sites pass non-capturing closures that coerce to `fn`, so the tests are unaffected.
+
+## Behavior reasoning
+
+The explicit loop must match `Range::fold` exactly. Checking corner cases:
+
+- **Empty range (`start >= end`)**: loop guard `i < end` is false immediately, returns `init`. Same as `Range::fold`. ✓ (covered by `empty_range_returns_init`).
+- **General `start..end`**: applies `g(acc, f(i))` for `i = start, start+1, …, end-1` left-to-right, identical to `Range::fold`'s forward iteration. ✓
+- **Overflow on `i = i + 1`**: only executed after `i < end`, so `i ≤ end - 1 ≤ u64::MAX - 1`, hence `i + 1 ≤ u64::MAX`. No overflow — matches `Range`'s own behavior, which similarly never advances past `end`.
+- **`end == u64::MAX`, `start == 0`**: last iteration computes body with `i = u64::MAX - 1`, then `i` becomes `u64::MAX`, loop guard fails, loop exits. Equivalent to `Range::fold` semantics on that range.
+
+The order of operations inside the loop body — `acc = g(acc, (self.f)(i))` — is exactly the composition `map_fold(f, g)` produced. `f` is called before `g` per iteration, in forward order, same as the original.
+
+No proof-only annotations are involved here; this is purely a structural rewrite that faithfully mirrors `Range<u64>::fold` semantics.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+[tool] Glob({"pattern": "proof_patterns/*/README.md"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/WhileExampl... [+19 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/**/*.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/While_examp... [+20 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/*Obligat... [+11 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/Gcd_wh... [+21 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/saturating_sub_modified/manifest.json"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/average_floor_u64_modified/proofs/lean/extraction/... [+19 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/average_floor_u64_modified/proofs/lean/extractio... [+50 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/gcd_wh... [+10 chars])
+Based on a careful read of the target's extracted Lean, the proof obstacle is unambiguous: a `rust_primitives.hax.while_loop` over a `Tuple2 u64 u64` state, with a partial-op (`+?`) in the body that must be shown non-overflowing under a loop invariant tied to the loop guard. The verification will need the canonical two-stage pattern: `Spec.MonoLoopCombinator.while_loop` for the triple, then `RustM.Triple_iff_BitVec` for the equational form. Only two examples in the library cover this; the rest are scalar arithmetic or recursion, which mislead more than help.
+
+### Selected paths
+
+```
+proof_patterns/gcd_while_modified
+proof_patterns/while_example
+```
+
+### Per-pick rationale
+
+- **proof_patterns/gcd_while_modified** — Structural twin. The extraction has the exact same shape as the target: `rust_primitives.hax.while_loop` over a `rust_primitives.hax.Tuple2 u64 u64` state, `⟨a, b⟩` pattern-destructure in cond/body, partial-op (`%?` there, `+?` here) in the body. The obligations file demonstrates the full pipeline the target needs end-to-end: `loopInv` over `Tuple2`, `loopTerm`, `gcdLoop` abbrev, `Spec.MonoLoopCombinator.while_loop`, no-overflow body reduction via `show … = pure …` + `rw`, then `Triple.of_entails_right/left` to weaken/strengthen, then `Triple.bind` over the `pure a` continuation, finally `RustM.Triple_iff_BitVec` to extract the equation. This is the template to follow.
+
+- **proof_patterns/while_example** — Canonical body-step no-failure proof. The target's `i +? 1` needs the same treatment as while_example's `x -? b`: prove the partial-op cannot fail under the invariant (here `i < _end ≤ u64::MAX` ⇒ `i + 1` no overflow), then rewrite to `pure (...)`. The file also documents the *weak-invariant-at-Rust + strong-invariant-in-Lean* split, which the target will need because nothing about `f` or `g` can be asserted at the Rust level — the real spec (equivalence to a Lean-side fold over the shifted range) must live in the obligations file.
+
+### Gaps
+
+- **No example covers fold-style accumulator loops parameterised by abstract function pointers.** Both selected examples have *concrete* body operations (`%`, `−`); the target's body calls opaque `f : u64 → RustM u64` and `g : u64 → u64 → RustM u64`. The natural postcondition has to be stated against a Lean-side reference fold (something like `List.foldl g init (List.range _end).drop start |>.map f`), and the loop invariant carries that partial fold as its content. The library doesn't show this pattern.
+- **No example covers a `Range`-bounded while loop** where the invariant relates the live counter `i` to a fixed `end : u64` (rather than to a per-iteration shrinking value). The termination measure here is `_end - i`, not `x` itself as in while_example/gcd_while.
+- **No example proves `i +? 1` no-overflow** specifically — the body-step proofs in the picks all key off subtraction (`-?`) or modulo (`%?`). The bridge will be analogous (`UInt64.addOverflow_iff` + `omega` against the invariant) but is not directly shown.
+
+These gaps suggest a future example: a `fold`-style while loop over a `Range<u64>` with an abstract function pointer, where the postcondition is "equivalent to `List.foldl` over the materialised range".
+
+### Rejections
+
+- **factorial_modified, sum_to_n_modified, recursion_example** — recursive (`partial_fixpoint` / strong induction on `n.toNat`); target is iterative. Different proof machinery entirely.
+- **add_one_modified, square_modified** — scalar single-binop with overflow failure as the headline behaviour. No loop, no invariant, irrelevant proof shape.
+- **saturating_sub_modified, clamp_modified, min_modified, is_zero_modified** — `if`-branch totality on a scalar comparison. Closes by `bv_decide` / `rfl` / case split. No loop reasoning.
+- **average_floor_u64_modified, average_ceil_u64_modified** — pure-arithmetic bit-trick proofs; no loop, no `Tuple2` state, and the `nat_half_adder` / Dietz-formula machinery is specific to bitwise identities the target doesn't use.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Map_fold_method_u64Obligations.lean
+[scaffold] registered Map_fold_method_u64Obligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/Gcd_wh... [+21 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/While_examp... [+20 chars])
+[tool] Grep({"pattern": "core_models.ops.range.Range", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns", "output_m... [+27 chars])
+[tool] Grep({"pattern": "rust_primitives.hax.while_loop", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns", "outpu... [+30 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/.lake/packa... [+73 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/while_examp... [+9 chars])
+[tool] Glob({"pattern": "**/hax/proof-libs/lean/Hax/core_models/ops/range.lean", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/... [+16 chars])
+[tool] Glob({"pattern": "**/core_models/ops/range*.lean", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns"})
+[tool] Grep({"pattern": "core_models\\.ops\\.range", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns", "output_mod... [+43 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/.lake/packa... [+69 chars])
+[tool] Grep({"pattern": "structure Range", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/le... [+60 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/.lake/packa... [+95 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/**/*.lean"})
+[tool] Grep({"pattern": "Triple_iff_BitVec", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "content", "-n": true, "head_limit": 15})
+Now I have enough context. Let me draft the obligations file and build it to verify well-typedness.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_fold_method_u64Obligations.lean", "patch": "<<< SEARCH\nnamespace Map_fold_method_u64Obligations\n\n-- Add `theorem` declar... [+3001 chars])
+[tool] run_lake_build({})
+Build succeeds with only the expected `sorry` warnings on lines 53 and 69 — both theorem statements are well-typed.
+[tool] Read({"file_path": "proofs/lean/extraction/Map_fold_method_u64Obligations.lean"})
+## Summary
+
+**File edited:** `proofs/lean/extraction/Map_fold_method_u64Obligations.lean`
+
+**Theorems added (each one captures one contract clause):**
+
+- `empty_range_returns_init` — mirrors the Rust test `empty_range_returns_init`. Edge-case contract clause: when `iter.start = iter._end`, neither `f` nor `g` is called and the function returns `RustM.ok init`. Stated equationally (no nontrivial precondition).
+- `fold_matches_composed_fold` — mirrors the Rust test `matches_composed_fold`. Canonical postcondition: when the `RustM`-valued callbacks `f` and `g` are total (each always returns `RustM.ok` of a pure result `f' x`, `g' a b`), the Rust fold equals `List.foldl (fun acc i => g' acc (f' (UInt64.ofNat i))) init` over `List.range' s.toNat (e.toNat − s.toNat)`. The totality hypotheses are forced by the extraction wrapping the callbacks in `RustM` — the Rust signatures `fn(...) -> u64` can't fail, so they instantiate trivially.
+
+A private helper `specFold` materialises the Lean-side reference fold; it is shared by `fold_matches_composed_fold` and is the natural surface for the proof stage to use.
+
+**Property tests classified as derived facts (skipped, per stage rules):**
+
+- `fold_matches_shifted_fold` — asserts `Map { 0..10, x ↦ x+3 }.fold(7, g) = (3..13).fold(7, g)`. This follows from `fold_matches_composed_fold` plus the algebraic re-indexing identity `List.foldl g init (range' a n).map (·+3) = List.foldl g init (range' (a+3) n)`. It's a derived mathematical fact about a specific `f` (a shift), not an independent contract clause.
+- `fold_sums_with_offset` — asserts a specific numeric value (42). A derived numerical instantiation of the canonical postcondition.
+
+**Theorems I am less than fully certain about (well-typed, but worth flagging):**
+
+- `fold_matches_composed_fold`'s framing requires the user to supply `f'`/`g'` along with `hf`/`hg`. This is well-typed (lake build confirms) and is the only way to state the canonical postcondition over `RustM`-valued callbacks, but a Hoare-triple variant `⦃⌜ pre on f, g ⌝⦄ Impl.fold … ⦃⇓ r => ⌜ r = … ⌝⦄` would also be defensible. I chose the equational form because the reference examples (`gcd_while_postcondition`, `modulo_via_subtraction_postcondition`) use equational closed forms for the user-facing theorem and only use triples internally as a proof step. The selector flagged that the library has no example covering this fold-with-abstract-function-pointer pattern, so the proof-stage author may want to revisit the framing.
+
+**Verification:** `lake build` returned `Build completed successfully (95 jobs)` with only the expected two `sorry` warnings.
+
+make_lean_obligations
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/Gcd_wh... [+21 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/While_examp... [+20 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/README.md"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proofs/lean/extraction/Map_fold_method_u64Obligations.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/README.md"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+41 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+30 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extractio... [+48 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+80 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+86 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+74 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+76 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+69 chars])
+[tool] Grep({"pattern": "addOverflow_iff|uaddOverflow_iff|toNat_add_of_lt", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/bench... [+124 chars])
+[tool] Grep({"pattern": "Tuple2", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/pro... [+82 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+75 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+82 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+76 chars])
+[tool] Grep({"pattern": "struct Range|structure Range", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_m... [+104 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+102 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+72 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+73 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/gcd_wh... [+10 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+81 chars])
+[tool] Grep({"pattern": "Triple.bind|Triple.pure", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method... [+99 chars])
+[tool] Grep({"pattern": "theorem Triple.bind|def Triple.bind|theorem Triple.pure|def Triple.pure", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/pro... [+127 chars])
+[tool] Grep({"pattern": "Triple.bind", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modifie... [+78 chars])
+[tool] Grep({"pattern": "range'_succ|range'_append|foldl_range", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/m... [+104 chars])
+[tool] Grep({"pattern": "List.range'", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modifie... [+78 chars])
+[tool] Grep({"pattern": "range'_concat|range'_succ_right|range'_append", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmar... [+101 chars])
+[tool] Grep({"pattern": "List.range'", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modifie... [+84 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/*"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/**/*.lean", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/... [+47 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/*/lakefile.toml", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/... [+45 chars])
+Let me look at what UInt64 / Nat lemmas are available in the prelude and check for List.range' specifically:
+[tool] Grep({"pattern": "UInt64.ofNat_toNat|toNat_ofNat_of_lt|UInt64.ofNat'", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/ben... [+106 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+83 chars])
+[tool] Grep({"pattern": "toNat_ofNat_of_lt'|UInt64\\.toNat_ofNat'", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/ma... [+96 chars])
+Now I have enough context. Let me write the proof, starting with an initial draft:
+[tool] write_working_file({"path": "proofs/lean/extraction/Map_fold_method_u64Obligations.lean", "content": "-- Companion obligations file for the `map_fold_method_u64` extraction.\n-- E... [+16369 chars])
+[tool] run_lake_build({})
+[tool] Grep({"pattern": "ofNat_toNat", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modifie... [+67 chars])
+[tool] Grep({"pattern": "range'.*concat|range'.*succ_right", "path": "/Users/tobiaskrogh", "glob": "*.lean", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "range'_concat|range'_succ_right", "path": "/Users/tobiaskrogh/.elan/toolchains/leanprover--lean4---v4.29.0-rc1/src/lean/Init/Data/List", "output_mo... [+15 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/.elan/toolchains/leanprover--lean4---v4.29.0-rc1/src/lean/Init/Data/List/Range.lean", "offset": 125, "limit": 25})
+Let me fix the issues identified:
+[tool] write_working_file({"path": "proofs/lean/extraction/Map_fold_method_u64Obligations.lean", "content": "-- Companion obligations file for the `map_fold_method_u64` extraction.\n-- E... [+15201 chars])
+[tool] run_lake_build({})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_fold_method_u64Obligations.lean", "patch": "<<< SEARCH\n/-! ## Stage 1a: Hoare triple for the empty case (`s = e`). -/\n\np... [+3324 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_fold_method_u64Obligations.lean", "patch": "<<< SEARCH\n  cases b with\n  | mk acc i =>\n    -- After cases, b._0 = acc and... [+522 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_fold_method_u64Obligations.lean", "patch": "<<< SEARCH\n      show s.toNat \u2264 s.toNat \u2227 s.toNat \u2264 e.toNat \u2... [+883 chars])
+[tool] run_lake_build({})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+69 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+69 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_fold_method_u64Obligations.lean", "patch": "<<< SEARCH\n    apply Triple.bind _ _ (mapLoop_empty_triple init s s (Nat.le_re... [+1930 chars])
+[tool] run_lake_build({})
+The build succeeded. Let me verify there are no `sorry` warnings by checking the file and doing a clean build:
+[tool] Grep({"pattern": "sorry", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proo... [+82 chars])
+No `sorry`s remain. Let me also verify the final file content:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/map/map_fold_method_u64_modified/proofs/lean/extract... [+67 chars])
+The build is clean. Let me write a summary of what was done.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Map_fold_method_u64Obligations.lean`
+
+**Both obligations closed** — `lake build` reports `Build completed successfully (95 jobs)` with no `sorry` warnings.
+
+### Proof structure (canonical two-stage `while_example` pattern)
+
+The file follows the canonical `while_example` pattern:
+
+1. **Reference fold** `specFold` — a `List.foldl` over `List.range' s.toNat (e.toNat − s.toNat)` that materialises the Rust loop's left-to-right iteration order.
+
+2. **Loop infrastructure** — `mapCond`, `mapBody`, `mapLoop` abbrevs matching the unfolded `rust_primitives.hax.while_loop` form.
+
+3. **Stage 1a** `mapLoop_empty_triple` — Hoare triple for the empty case (`_end ≤ s`). Uses the trivial invariant `b = ⟨init, s⟩` and termination `0`; body step is vacuously discharged via `simp [mapCond] at hcond; omega` (the condition is false at the start).
+
+4. **Stage 1b** `mapLoop_full_triple` — Hoare triple for the general case under totality of `f`, `g`. Strong invariant: `s.toNat ≤ i.toNat ∧ i.toNat ≤ e.toNat ∧ acc = specFold s i f' g' init`. Termination measure: `e.toNat - i.toNat`. The body step uses `UInt64.addOverflow_iff` + `omega` to discharge `i + 1` non-overflow, then a `specFold_step` lemma for invariant preservation.
+
+5. **Stage 2** — Convert each triple to an equation via `RustM.Triple_iff_BitVec` with the standard case-split on `none`/`ok`/`error`. `fold_matches_composed_fold` additionally splits on `s.toNat ≤ e.toNat` to reuse the empty-case triple for the `s > e` case (in which `specFold = init` by `range' _ 0 = []`).
+
+### Sub-goals worth flagging
+
+- **`specFold_step` (invariant preservation)** — needed `List.range'_1_concat` (`range' s (n+1) = range' s n ++ [s+n]`) which exists in Lean core but isn't a `simp` lemma. Argument: `(i+1).toNat = i.toNat + 1` via `UInt64.toNat_add_of_lt`, then `(i+1).toNat - s.toNat = (i.toNat - s.toNat) + 1` via omega, then split via `List.range'_1_concat` + `List.foldl_append`, then `UInt64.ofNat i.toNat = i` via `UInt64.ofNat_toNat`.
+
+- **Apply / unification of `Spec.MonoLoopCombinator.while_loop`** — the spec's conclusion has the pre `⌜ inv init ⌝`, not `⌜ True ⌝`. Needed to add an explicit `Triple.of_entails_left` to weaken `True` to the trivial invariant `⟨init, s⟩ = ⟨init, s⟩`. The `mapLoop` abbrev had to be unfolded via `show` before `apply` could unify against `Loop.MonoLoopCombinator.while_loop`.
+
+- **`Triple.bind` post extraction** — `intro h; exact h` (the gcd_while pattern) doesn't apply because the loop post is `r = ⟨init, s⟩` but the function post wants `a = init`. Closed with `exact congrArg (·._0) h` (project field `_0` from both sides of the tuple equation).
+
+- **`unfold loopInv` needed inside the body step** — `loopInv` is a `def`, so `obtain ⟨_, _, _⟩` cannot directly destructure it; `unfold loopInv at hinv; dsimp only at hinv; obtain ...` is needed (the `dsimp` reduces `⟨acc, i⟩._0`/`._1` projections).
+
+### Obligations left as `sorry`
+
+None. Both `empty_range_returns_init` and `fold_matches_composed_fold` are fully closed.
+
+make_proof
+Stage notes: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260512-131409_map_fold_method_u64_stage_notes.json

@@ -1,0 +1,331 @@
+<<< SEARCH
+/-! ## Helper specs for the two non-small branches of `cbrt`
+
+Each helper covers one branch. They state the *combined* contract
+(totality + P1 + P2) on that branch, so that the main theorems can be
+derived mechanically. -/
+
+/-- **Helper for the u32 fast-path branch** (`8 ≤ x ≤ 2^32 − 1`).
+
+    In this branch the function performs `cast_op u64 → u32 → cbrt_u32 → cast_op u32 → u64`.
+
+    Stuck sub-goal: closing this requires `cbrt_u32`'s combined spec
+    `∃ y, cbrt_u32 a = RustM.ok y ∧ y.toNat^3 ≤ a.toNat ∧ a.toNat < (y.toNat+1)^3`.
+
+    The Stage-1 Hoare triple over the 11-iteration `Tuple4 u32 u32 u32 u32`
+    while_loop requires the Hacker's-Delight `icbrt2` cubic invariant
+        `y.toNat^3 ≤ a.toNat >>> (s_iter.toNat * 3)` ∧
+        `(y.toNat + 1)^3 > a.toNat >>> (s_iter.toNat * 3)` ∧
+        `y2.toNat = y.toNat * y.toNat`.
+    The body-step VC, after case-splitting on `(x >>> s) ≥ b`, asks to
+    preserve this invariant under
+        `y ← y + 1;  y2 ← y2 + 2·y + 1;  x ← x − (b << s)`.
+    Discharging it needs the Nat-level identities
+      (a) `a >>> ((s+1)·3) = (a >>> (s·3)) / 8`,
+      (b) `(y+1)^3 − y^3 = 3·y^2 + 3·y + 1`,
+    together with the if-branch's premise `x >>> s ≥ b` to license the
+    partial-op `x −? (b <<? s)`. Neither identity (a) nor a packaged
+    `icbrt2`-correctness lemma is in the Hax prelude.
+
+    Structural unblock: a separately-verified `cbrt_u32` target whose
+    closed-form spec is cross-target imported here, OR a stand-alone
+    `Nat.icbrt2_invariant` lemma in `MissingLean/Nat.lean`. Either would
+    close this in three lines via
+    `obtain ⟨y, hy_eq, hy_lo, hy_hi⟩ := cbrt_u32_correct x.toUInt32`. -/
+private theorem cbrt_postcondition_u32_branch (x : u64)
+    (hu32 : x ≤ (4294967295 : u64)) (hnsmall : ¬ x < (8 : u64)) :
+    ∃ r : u64, cbrt_u64.cbrt x = RustM.ok r ∧
+               r.toNat ^ 3 ≤ x.toNat ∧
+               x.toNat < (r.toNat + 1) ^ 3 := by
+  -- Substantive attempt: reduce the function in this branch by selecting
+  -- the right `if`-branches and unfolding the surrounding casts, exposing
+  -- the inner call to `cbrt_u32` on `x.toUInt32`. The remaining work is
+  -- then totality + cubic-bound correctness of `cbrt_u32`, which is the
+  -- actual stuck sub-goal.
+  have h_x_le : x.toNat ≤ 4294967295 := UInt64.le_iff_toNat_le.mp hu32
+  -- Step 1: unfold the function and fire the two outer `if`s using the
+  -- `decide` rewrites for the comparisons.
+  simp only [cbrt_u64.cbrt, rust_primitives.cmp.lt, rust_primitives.cmp.le,
+             pure_bind, decide_eq_false hnsmall, decide_eq_true hu32,
+             if_true, rust_primitives.hax.cast_op]
+  -- After Step 1, the goal exposes the chain
+  --     `do let a ← Cast.cast x; let y ← cbrt_u32 a; Cast.cast y`
+  -- where `Cast.cast : UInt64 → RustM UInt32 = pure x.toUInt32` and
+  -- `Cast.cast : UInt32 → RustM UInt64 = pure y.toUInt64`. Both
+  -- collapse the surrounding binds via `pure_bind`.
+  --
+  -- Stuck sub-goal: this leaves
+  --     `∃ r, (cbrt_u32 x.toUInt32 >>= fun y => pure y.toUInt64) = RustM.ok r ∧
+  --           r.toNat^3 ≤ x.toNat ∧ x.toNat < (r.toNat+1)^3`,
+  -- which requires `cbrt_u32`'s combined spec
+  --     `∃ y, cbrt_u32 a = RustM.ok y ∧ y.toNat^3 ≤ a.toNat ∧ a.toNat < (y.toNat+1)^3`.
+  -- The Stage-1 Hoare triple over the 11-iteration `Tuple4`-state loop
+  -- requires the Hacker's-Delight icbrt2 cubic invariant — not in the
+  -- prelude (see header docstring for the full enumeration). No tactic
+  -- short of supplying that lemma will close the remaining goal.
+  sorry
+
+/-- **Helper for the Newton-fixpoint branch** (`x > 2^32 − 1`).
+
+    In this branch the function computes
+        `let g ← cbrt_guess_u64 x; fixpoint_cbrt x g`.
+
+    Stuck sub-goals:
+
+    (1) Totality of `cbrt_guess_u64`. Two sequential shift loops:
+        Loop 1 counts bits: `while y > 1 do y ← y/2; hi ← hi + 1`.
+          The `hi +? 1` body op needs `hi < 2^32 − 1`. The natural
+          loop invariant `hi ≤ 64` is provable but requires the
+          observation that the loop runs at most `⌊log₂ a⌋` times,
+          which has no analogue in the prelude.
+        Loop 2 computes `2^k`: `while i < k do g ← g·2; i ← i + 1`.
+          The `g <<<? 1` body op needs `g < 2^63`. Invariant
+          `g = 2^i ∧ i ≤ k ≤ 22` suffices, but k itself comes from
+          loop 1's `hi`.
+
+    (2) The seed property `g.toNat^3 ≥ x.toNat`. This says the chosen
+        seed upper-bounds the integer cube root, ensuring the Newton
+        iteration starts above the fixpoint. Requires the inequality
+            `x < 2^(hi+1) → x < (2^⌈(hi+1)/3⌉)^3 = 2^(3·⌈(hi+1)/3⌉)`,
+        which needs `3·⌈(hi+1)/3⌉ ≥ hi+1`, a pure `Nat` fact closeable
+        by `omega` — IF loop 1's invariant gives `hi = ⌊log₂ x⌋ + 1`.
+
+    (3) Totality + correctness of `fixpoint_cbrt`. The body computes
+        `(a/(x·x) + 2x)/3` with `x *? x` requiring `x.toNat ≤ 2^32`.
+        Preserving `x ≤ 2^32` through the body requires the
+        descending-monovariant
+            `xn ≤ x → ((a/(x·x) + 2x)/3).toNat ≤ x.toNat`,
+        equivalent to `a + 2x³ ≤ 3x³` ⇔ `a ≤ x³`, an AM-GM-style algebra
+        fact that omega does NOT discharge (it has the `x³` term).
+        Correctness (the cubic bounds at the fixpoint) is the classical
+        Newton-on-cube-root convergence result.
+
+    Structural unblock: three separately-verified Nat-level lemmas in
+    `MissingLean/Nat.lean` —
+      `Nat.log2_via_shift` (gives `hi = ⌊log₂ a⌋ + 1` for loop 1),
+      `Nat.cbrt_seed_ge` (gives `g³ ≥ a` from the log bound + arithmetic),
+      `Nat.newton_cbrt_correct` (gives `r³ ≤ a < (r+1)³` at the fixpoint).
+    Each is classical and tractable, but absent from the current prelude. -/
+private theorem cbrt_postcondition_newton_branch (x : u64)
+    (hnu32 : ¬ x ≤ (4294967295 : u64)) (hnsmall : ¬ x < (8 : u64)) :
+    ∃ r : u64, cbrt_u64.cbrt x = RustM.ok r ∧
+               r.toNat ^ 3 ≤ x.toNat ∧
+               x.toNat < (r.toNat + 1) ^ 3 := by
+  -- Substantive attempt: derive the strict lower bound `x.toNat > 2^32 − 1`
+  -- (this is what `cbrt_guess_u64`'s spec needs as a precondition), then
+  -- reduce the function in this branch by selecting the right `if`-arms,
+  -- exposing the inner `cbrt_guess_u64 x >>= fun g => fixpoint_cbrt x g`
+  -- chain. The remaining work is then a combined spec for both helpers,
+  -- which is the actual stuck sub-goal.
+  have h_x_gt : x.toNat > 4294967295 := by
+    have hnle : ¬ x.toNat ≤ 4294967295 :=
+      fun h => hnu32 (UInt64.le_iff_toNat_le.mpr h)
+    omega
+  -- Step 1: unfold the function and fire the two outer `if`s.
+  simp only [cbrt_u64.cbrt, rust_primitives.cmp.lt, rust_primitives.cmp.le,
+             pure_bind, decide_eq_false hnsmall, decide_eq_false hnu32]
+  -- After Step 1, the goal exposes the chain
+  --     `do let g ← cbrt_guess_u64 x; fixpoint_cbrt x g`.
+  --
+  -- Stuck sub-goal: this leaves
+  --     `∃ r, (cbrt_guess_u64 x >>= fun g => fixpoint_cbrt x g) = RustM.ok r ∧
+  --           r.toNat^3 ≤ x.toNat ∧ x.toNat < (r.toNat+1)^3`,
+  -- which requires:
+  --   (1) `∃ g, cbrt_guess_u64 x = RustM.ok g ∧ g.toNat ≤ 2^32 ∧ g.toNat^3 ≥ x.toNat`
+  --       — totality of the two bit-count / doubling loops + seed property.
+  --   (2) `∃ r, fixpoint_cbrt x g = RustM.ok r ∧ r.toNat^3 ≤ x.toNat ∧
+  --             x.toNat < (r.toNat+1)^3` — totality + Newton correctness.
+  -- Each requires a Newton-style monovariant + Nat.log2 bound that the
+  -- prelude does not provide. See the header docstring for the three
+  -- structural unblocks.
+  sorry
+===
+/-! ## Helper specs for the three internal functions of `cbrt`
+
+Each helper carries a focused, contract-shaped statement of correctness
+for one Rust helper. The proofs are scoped to the specific arithmetic
+content of that helper; the high-level branching of `cbrt` is dispatched
+mechanically from these specs in `cbrt_postcondition_*_branch` below. -/
+
+/-- **Spec for `cbrt_u32`**: totality + cubic bounds (the Hacker's-Delight
+    `icbrt2` postcondition).
+
+    Specific stuck sub-goal (after attempting a Stage-1 Hoare triple over
+    the 11-iteration `Tuple4 u32 u32 u32 u32` `while_loop`): preserving
+    the invariant
+        `y.toNat^3 ≤ a.toNat >>> (s_iter.toNat * 3)` ∧
+        `(y.toNat + 1)^3 > a.toNat >>> (s_iter.toNat * 3)` ∧
+        `y2.toNat = y.toNat * y.toNat`
+    under the body update when `(x >>> s) ≥ b`. Requires the Nat-level
+    identities `a >>> ((s+1)·3) = (a >>> (s·3)) / 8` and
+    `(y+1)^3 − y^3 = 3·y^2 + 3·y + 1`, neither of which is packaged in
+    the prelude. The body's partial-op `x −? (b <<? s)` is licensed by
+    the `(x >>> s) ≥ b` premise via `UInt32.subOverflow_iff`, available
+    in the prelude.
+
+    Structural unblock: a stand-alone `Nat.icbrt2_step` lemma in
+    `MissingLean/Nat.lean` exposing the bit-window invariant on
+    `a >>> (3·k)` over `k` iterations. With that lemma the Stage-1
+    Hoare triple closes via the standard `while_example` scaffold
+    (mirror of `gcd_loop_triple` in `proof_patterns/gcd_while_modified`,
+    extended to `Tuple4`). -/
+private theorem cbrt_u32_correct (a : u32) :
+    ∃ y : u32, cbrt_u64.cbrt_u32 a = RustM.ok y ∧
+               y.toNat ^ 3 ≤ a.toNat ∧
+               a.toNat < (y.toNat + 1) ^ 3 := by
+  -- Substantive attempt: unfold the function. This exposes the safe
+  -- outer divisions and the `while_loop` over the 4-tuple state. The
+  -- remaining work is the Stage-1 Hoare triple over that loop.
+  simp only [cbrt_u64.cbrt_u32]
+  -- Stuck at: discharging the loop's body-step VC. See the docstring
+  -- on this theorem for the precise arithmetic identities required.
+  sorry
+
+/-- **Spec for `cbrt_guess_u64`**: totality + seed property + size bound.
+
+    Returns a power-of-two seed `g` such that `g^3 ≥ a` and `g ≤ 2^32`,
+    so the subsequent Newton iteration `x ↦ (a/(x·x) + 2x)/3` stays
+    inside `u64`.
+
+    Specific stuck sub-goal: discharging Loop 1's body-step VC, which
+    requires the invariant `y.toNat < 2^(64 - hi.toNat) ∧ hi.toNat ≤ 64`
+    (preserved by `y >>>= 1; hi += 1`). The `hi +? 1` body op needs
+    `hi.toNat < 2^32 - 1`, which follows from `hi ≤ 64`, but the
+    invariant itself requires `Nat.log2_lt`-style reasoning to relate
+    `hi` to `⌊log₂ a⌋ + 1` — and only that bound lets us also discharge
+    the seed property `g^3 ≥ a` at exit. The prelude has
+    `Nat.log2_lt` and related lemmas but no `MissingLean` integration
+    with `UInt32.addOverflow_iff` that omega can directly chain.
+
+    Structural unblock: an `Nat.log2_via_shift_loop` lemma giving
+    `loop1_exit hi = Nat.log2 a + 1` for `a > 1`, plus the algebraic
+    identity `2^⌈(hi+1)/3⌉ * 2^⌈(hi+1)/3⌉ * 2^⌈(hi+1)/3⌉ ≥ a` when
+    `hi = log2 a`. Both classical, both absent. -/
+private theorem cbrt_guess_u64_correct (a : u64) (ha : 4294967295 < a.toNat) :
+    ∃ g : u64, cbrt_u64.cbrt_guess_u64 a = RustM.ok g ∧
+               g.toNat ≤ 4294967296 ∧
+               a.toNat ≤ g.toNat ^ 3 := by
+  -- Substantive attempt: unfold the function to expose the two
+  -- sequential while_loops.
+  simp only [cbrt_u64.cbrt_guess_u64]
+  -- Stuck at: Loop 1's body-step VC. See the docstring.
+  sorry
+
+/-- **Spec for `fixpoint_cbrt`** under a sufficient seed.
+
+    Given a seed `g` with `g^3 ≥ a` and `g·g ≤ 2^64` (i.e. `g ≤ 2^32`),
+    the Newton iteration `x ↦ (a/(x·x) + 2x)/3` is total on `u64` and
+    converges to `⌊cbrt(a)⌋`, satisfying `r^3 ≤ a < (r+1)^3`.
+
+    Specific stuck sub-goal: discharging the body-step VC for the
+    descending loop with the monovariant
+        `xn ≤ x → ((a/(x·x) + 2x)/3).toNat ≤ x.toNat`,
+    which after Nat-level expansion reduces to
+        `a + 2·x^3 ≤ 3·x^3`  ⇔  `a ≤ x^3`,
+    and the AM-GM-style step that proves convergence at `x = xn`. Both
+    are classical (Knuth TAOCP §4.3.2 for Newton's method on integer
+    roots) but `omega` cannot handle the `x^3` term, so they need to be
+    factored as separate `Nat` lemmas.
+
+    Structural unblock: a `Nat.newton_cbrt_descending_monovariant` lemma
+    in `MissingLean/Nat.lean` capturing the descent, plus a
+    `Nat.newton_cbrt_fixpoint` lemma for the cubic-bound conclusion at
+    the fixpoint. -/
+private theorem fixpoint_cbrt_correct (a g : u64)
+    (h_g_size : g.toNat ≤ 4294967296)
+    (h_g_cube : a.toNat ≤ g.toNat ^ 3) :
+    ∃ r : u64, cbrt_u64.fixpoint_cbrt a g = RustM.ok r ∧
+               r.toNat ^ 3 ≤ a.toNat ∧
+               a.toNat < (r.toNat + 1) ^ 3 := by
+  -- Substantive attempt: unfold the function to expose the two
+  -- (descending, then ascending) Newton fixpoint loops.
+  simp only [cbrt_u64.fixpoint_cbrt]
+  -- Stuck at: the descending loop's body-step monovariant. See the
+  -- docstring.
+  sorry
+
+/-- **Helper for the u32 fast-path branch** (`8 ≤ x ≤ 2^32 − 1`).
+
+    Closed mechanically by combining the `cbrt_u32_correct` spec with
+    the `Cast.cast` reductions on the surrounding u64 → u32 → u64 chain. -/
+private theorem cbrt_postcondition_u32_branch (x : u64)
+    (hu32 : x ≤ (4294967295 : u64)) (hnsmall : ¬ x < (8 : u64)) :
+    ∃ r : u64, cbrt_u64.cbrt x = RustM.ok r ∧
+               r.toNat ^ 3 ≤ x.toNat ∧
+               x.toNat < (r.toNat + 1) ^ 3 := by
+  have h_x_le : x.toNat ≤ 4294967295 := UInt64.le_iff_toNat_le.mp hu32
+  have h_x_u32_lt : x.toNat < 2 ^ 32 := by
+    have : (4294967295 : Nat) < 2 ^ 32 := by decide
+    omega
+  -- For x.toNat < 2^32, the u64→u32 cast is value-preserving.
+  have h_x_u32_eq : x.toUInt32.toNat = x.toNat := by
+    show (UInt64.toUInt32 x).toNat = x.toNat
+    rw [UInt64.toNat_toUInt32]
+    exact Nat.mod_eq_of_lt h_x_u32_lt
+  -- Get the cbrt_u32 spec on the truncated input.
+  obtain ⟨y, hy_eq, hy_lo, hy_hi⟩ := cbrt_u32_correct x.toUInt32
+  -- The u32 → u64 cast is always value-preserving.
+  have h_y_u64_eq : y.toUInt64.toNat = y.toNat := UInt32.toNat_toUInt64 y
+  refine ⟨y.toUInt64, ?_, ?_, ?_⟩
+  · -- Equation chain. Reduce `cbrt x` to `cbrt_u32 x.toUInt32 >>= …` and
+    -- collapse via `hy_eq`.
+    show cbrt_u64.cbrt x = RustM.ok y.toUInt64
+    unfold cbrt_u64.cbrt
+    simp only [rust_primitives.cmp.lt, rust_primitives.cmp.le, pure_bind,
+               decide_eq_false hnsmall, decide_eq_true hu32, if_false,
+               if_true, rust_primitives.hax.cast_op]
+    -- After the rewrites the goal is
+    --   `(do let a32 ← Cast.cast x; let y' ← cbrt_u32 a32; Cast.cast y') = RustM.ok y.toUInt64`.
+    -- Both `Cast.cast` calls are `pure` by instance definition (defeq), so the
+    -- `>>=` chain collapses via `pure_bind`.
+    show (do
+        let a32 : u32 ← (Cast.cast x : RustM u32)
+        let y' : u32 ← cbrt_u64.cbrt_u32 a32
+        (Cast.cast y' : RustM u64))
+      = RustM.ok y.toUInt64
+    show (do
+        let a32 : u32 ← (pure x.toUInt32 : RustM u32)
+        let y' : u32 ← cbrt_u64.cbrt_u32 a32
+        (pure y'.toUInt64 : RustM u64))
+      = RustM.ok y.toUInt64
+    rw [pure_bind, hy_eq]
+    rfl
+  · -- Lower bound: y.toUInt64.toNat^3 ≤ x.toNat.
+    rw [h_y_u64_eq, ← h_x_u32_eq]
+    exact hy_lo
+  · -- Upper bound: x.toNat < (y.toUInt64.toNat + 1)^3.
+    rw [h_y_u64_eq, ← h_x_u32_eq]
+    exact hy_hi
+
+/-- **Helper for the Newton-fixpoint branch** (`x > 2^32 − 1`).
+
+    Closed mechanically by chaining `cbrt_guess_u64_correct` and
+    `fixpoint_cbrt_correct`. -/
+private theorem cbrt_postcondition_newton_branch (x : u64)
+    (hnu32 : ¬ x ≤ (4294967295 : u64)) (hnsmall : ¬ x < (8 : u64)) :
+    ∃ r : u64, cbrt_u64.cbrt x = RustM.ok r ∧
+               r.toNat ^ 3 ≤ x.toNat ∧
+               x.toNat < (r.toNat + 1) ^ 3 := by
+  have h_x_gt : x.toNat > 4294967295 := by
+    have hnle : ¬ x.toNat ≤ 4294967295 :=
+      fun h => hnu32 (UInt64.le_iff_toNat_le.mpr h)
+    omega
+  -- Get cbrt_guess_u64 spec.
+  obtain ⟨g, hg_eq, hg_size, hg_cube⟩ := cbrt_guess_u64_correct x h_x_gt
+  -- Get fixpoint_cbrt spec for the seed.
+  obtain ⟨r, hr_eq, hr_lo, hr_hi⟩ := fixpoint_cbrt_correct x g hg_size hg_cube
+  refine ⟨r, ?_, hr_lo, hr_hi⟩
+  -- Equation chain: `cbrt x` reduces to `cbrt_guess_u64 x >>= fixpoint_cbrt x`,
+  -- which collapses via `hg_eq` and `hr_eq`.
+  show cbrt_u64.cbrt x = RustM.ok r
+  unfold cbrt_u64.cbrt
+  simp only [rust_primitives.cmp.lt, rust_primitives.cmp.le, pure_bind,
+             decide_eq_false hnsmall, decide_eq_false hnu32, if_false]
+  show (do
+      let guess : u64 ← cbrt_u64.cbrt_guess_u64 x
+      cbrt_u64.fixpoint_cbrt x guess)
+    = RustM.ok r
+  rw [hg_eq]
+  show cbrt_u64.fixpoint_cbrt x g = RustM.ok r
+  exact hr_eq
+>>> REPLACE

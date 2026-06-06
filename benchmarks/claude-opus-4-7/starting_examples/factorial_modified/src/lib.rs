@@ -1,0 +1,49 @@
+fn factorial(n: u64) -> u64 {
+    if n <= 1 {
+        1
+    } else {
+        n * factorial(n - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Postcondition (base-case anchor): `factorial(0) == 1`.
+    ///
+    /// This is an independent absolute claim. Without it, an
+    /// implementation that always returned `0` would still satisfy the
+    /// recurrence test below (since `0 == n * 0`). Together with the
+    /// recurrence, this anchors the function to the unique solution `n!`.
+    #[test]
+    fn factorial_zero_is_one() {
+        assert_eq!(factorial(0), 1);
+    }
+
+    /// Postcondition (structural / recurrence):
+    /// `factorial(n) == n * factorial(n - 1)` for every `n` in the
+    /// non-overflowing range `1..=20`.
+    ///
+    /// Combined with the base case above, this pins down the exact
+    /// mathematical value of `factorial` on its entire valid domain by
+    /// induction. The upper bound `20` is the largest input for which
+    /// `n!` fits in `u64`; including it exercises the boundary value.
+    #[test]
+    fn factorial_satisfies_recurrence() {
+        for n in 1u64..=20 {
+            assert_eq!(factorial(n), n * factorial(n - 1));
+        }
+    }
+
+    /// Failure condition: inputs `n >= 21` violate the precondition
+    /// because `21!` exceeds `u64::MAX`. The recursive multiplication
+    /// `n * factorial(n - 1)` therefore overflows and panics in debug
+    /// mode (the default for `cargo test`). This test pins down the
+    /// boundary of the precondition `n <= 20`.
+    #[test]
+    #[should_panic]
+    fn factorial_twenty_one_overflows() {
+        let _ = factorial(21);
+    }
+}

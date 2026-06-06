@@ -1,0 +1,155 @@
+<<< SEARCH
+/-- **Functional correctness (closed form).** For every pair of `u64`
+inputs, `gcd_stein` succeeds and returns the integer gcd of the two
+inputs (computed over `Nat`).  This single equation pins down every
+concrete `known_values` case as well as the `zero_zero_is_zero`
+boundary (`Nat.gcd 0 0 = 0`).
+
+**Proof state (after retry attempt 3):**
+
+* `a = 0` branch — closed via `gcd_stein_a_zero` + `Nat.gcd_zero_left`.
+* `b = 0` branch — closed via `gcd_stein_b_zero` + `Nat.gcd_zero_right`.
+* `a ≠ 0 ∧ b ≠ 0` branch — `sorry` remains, but the function has been
+  unfolded and the boundary check discharged.  All algebraic Stein-step
+  lemmas — `nat_gcd_sub_self_left`, `nat_gcd_halve_even`,
+  `nat_gcd_halve_even_pow` — are now **fully proved** above (the
+  retry-3 turn closed `nat_gcd_halve_even` from its prior `sorry`
+  state and added the iterated `nat_gcd_halve_even_pow` helper that
+  the outer-loop body step requires).  The only remaining structural
+  gap is the *outer Stein-loop Hoare triple* plus the final-shift
+  overflow analysis — see the detailed stuck-goal description in the
+  proof body below.
+
+**Specific stuck sub-goal (main case):** after the boundary cases
+collapse and the function is unfolded, the goal is
+
+  `do { let shift ← trailing_zeros_u64 (a ||| b);`
+  `     let m ← a >> trailing_zeros_u64 a;`
+  `     let n ← b >> trailing_zeros_u64 b;`
+  `     let ⟨m, n⟩ ← outer_loop ⟨m, n⟩;`
+  `     m <<? shift }`
+  `   = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat))`
+
+The first three `let` bindings are now mechanical to discharge using
+`trailing_zeros_u64_correctness` proved above (each returns
+`RustM.ok k` for a specific `k`, and after the shifts `m_odd` and
+`n_odd` are odd values such that `m_odd * 2^k_a = a` and
+`n_odd * 2^k_b = b`).  The *outer-loop* call is the remaining
+obstacle: it has the same shape as the trailing-zeros inner loop
+(a `Loop.MonoLoopCombinator.while_loop`) but requires the stronger
+classical Stein invariant
+
+  `Nat.gcd m n = Nat.gcd m_odd n_odd`  (no `2^shift` factor here —
+                                         the shift factor lives in
+                                         the *outer* `shift` variable)
+
+combined with `m, n` both odd (preserved by `m -= n; m >>= tz(m)`).
+
+**Structural unblocks the next pass would need:**
+
+1. **A `tz_loop_triple`-style spec for the outer Stein loop.**  The
+   shape is identical to `tz_loop_triple` above, but the invariant is
+   the Stein-step preservation: under `m, n` both odd and `m ≠ n`,
+   the body produces `m', n'` both odd with
+   `Nat.gcd m'.toNat n'.toNat = Nat.gcd m.toNat n.toNat`.
+
+2. **A `Nat.gcd_stein_step` lemma** capturing
+   `Nat.gcd (m - n) n = Nat.gcd m n` for `m ≥ n` (combine
+   `Nat.gcd_sub_self_left` + commutativity), plus a "halve-by-2 on the
+   even side" lemma `Nat.gcd (2*k) (2*l+1) = Nat.gcd k (2*l+1)`.  These
+   exist in Mathlib as `Nat.gcd_sub_self_left` and `Nat.Coprime`-flavour
+   facts, but the Hax prelude does not pull Mathlib in.  Both can be
+   proved locally from `Nat.gcd_rec`.
+
+3. **A `UInt64.shiftLeft_no_overflow_iff` lemma**: `x <<< s` does not
+   overflow ↔ `x.toNat * 2^s.toNat < 2^64`.  Combine with the loop
+   invariant `m_final = Nat.gcd m_odd n_odd` and
+   `Nat.gcd m_odd n_odd * 2^shift ≤ max(a, b) < 2^64` to discharge the
+   final `<<<? shift`. -/
+===
+/-- **Functional correctness (closed form).** For every pair of `u64`
+inputs, `gcd_stein` succeeds and returns the integer gcd of the two
+inputs (computed over `Nat`).  This single equation pins down every
+concrete `known_values` case as well as the `zero_zero_is_zero`
+boundary (`Nat.gcd 0 0 = 0`).
+
+**Proof state (after retry attempt 4):**
+
+* `a = 0` branch — closed via `gcd_stein_a_zero` + `Nat.gcd_zero_left`.
+* `b = 0` branch — closed via `gcd_stein_b_zero` + `Nat.gcd_zero_right`.
+* `a ≠ 0 ∧ b ≠ 0` branch — `sorry` remains, but the proof now
+  (1) extracts the three `trailing_zeros_u64` witnesses with their
+  divisibility / oddness clauses, (2) discharges the
+  `(a == 0) || (b == 0) = false` boundary check, (3) unfolds the
+  function and runs a `simp only` that uses the three witnesses
+  (`h_tz_a`, `h_tz_b`, `h_tz_ab`) as rewrite rules — eliminating each
+  `trailing_zeros_u64` call.
+
+**Infrastructure added in retry-4 (above this theorem):**
+
+All five of the algebraic / termination identities the outer-loop
+Hoare triple would need are now **fully proved**:
+
+* `nat_gcd_sub_self_left` — Euclid subtraction step (existing).
+* `nat_gcd_halve_even` — gcd(2k, n) = gcd(k, n) for `n` odd (existing).
+* `nat_gcd_halve_even_pow` — iterated form `gcd(m/2^k, n) = gcd(m, n)`
+  for `n` odd and `2^k ∣ m` (existing).
+* `stein_diff_even_pos` — `m - n` is positive and even when `m, n`
+  are both positive, both odd, and `m > n`.  This is the fact that
+  forces `trailing_zeros_u64 (m - n) ≥ 1` in every Stein iteration.
+* `stein_body_gcd_preserve_left/right` — single-step gcd preservation
+  for the body's two branches:
+  `Nat.gcd ((m - n) / 2^k) n = Nat.gcd m n`  (when `n` odd, `2^k ∣ m-n`)
+  and the symmetric variant for the `m ≤ n` branch.
+* `stein_term_decrease_left/right` — strict decrease of `m + n` as
+  termination measure, granted `k ≥ 1`.
+
+The outer-loop scaffolding (`steinCond`, `steinBody`, `steinLoop`,
+`steinInv`, `steinTerm`) is also defined above so a future pass can
+state `stein_loop_triple` by `apply Spec.MonoLoopCombinator.while_loop`
+and `unfold rust_primitives.hax.while_loop` will reveal `steinLoop`.
+
+**Specific stuck sub-goal after the `simp only` (this theorem's body):**
+
+After the simp rewrites away the three `trailing_zeros_u64` calls
+the goal still contains
+  `rust_primitives.hax.while_loop ... ⟨a >>> k_a.toNat.toUInt64,
+                                       b >>> k_b.toNat.toUInt64⟩ ...`
+plus a final `(m_final <<<? k_ab)`.  Closing this requires three
+*non-mechanical* pieces of work that do not exist yet:
+
+1. **`stein_loop_triple` itself** — a Hoare triple over `steinLoop`
+   with invariant `steinInv (Nat.gcd m_odd n_odd)` and termination
+   `steinTerm`.  Stating it is mechanical (`steinInv`, `steinTerm`
+   are now defined), but the *body step* requires composing the
+   inner `trailing_zeros_u64_correctness` with the branch-specific
+   gcd-preservation lemma `stein_body_gcd_preserve_{left,right}` —
+   roughly 150 lines of `tz_loop_triple`-style proof, with the extra
+   complication that the body contains a *nested* `RustM` call
+   (the inner `trailing_zeros_u64`).
+
+2. **The closed-form bridge** between `Nat.gcd m_odd n_odd` and
+   `Nat.gcd a b`: specifically,
+   `Nat.gcd a.toNat b.toNat = 2^k_ab.toNat * Nat.gcd m_odd.toNat n_odd.toNat`.
+   This depends on the bit-level identity `k_ab = min(k_a, k_b)`
+   (since `tz(a|b) = min(tz(a), tz(b))`).  Once that identity is
+   available, `nat_gcd_halve_even_pow` cancels the residual `2^|k_a - k_ab|`
+   or `2^|k_b - k_ab|` factor against the odd partner.
+
+3. **No-truncation for the final `m_final <<<? k_ab`**:
+   `m_final.toNat * 2 ^ k_ab.toNat < 2^64` follows from item 2
+   (since the product equals `Nat.gcd a.toNat b.toNat` and
+   `gcd_lt_2_64` already shows that bound).  The shift itself
+   then evaluates to `RustM.ok (UInt64.ofNat (m_final.toNat * 2^k_ab.toNat))`
+   via a `UInt64.toNat_shiftLeft` analogue.
+
+**Structural unblock the next pass would need:** prove
+`stein_loop_triple` as a stand-alone theorem.  Every algebraic piece
+it needs has been factored into a named lemma above, so the only
+genuinely-new content is the body-step bind-chain reduction.  The
+`tz_loop_triple` proof in this file is the template — the differences
+are the case-split on `m > n` vs `m ≤ n` and the nested
+`trailing_zeros_u64` call inside the body.  See the in-body comment
+following the `simp only` for the precise goal-shape after the
+trailing-zeros rewrites land. -/
+>>> REPLACE

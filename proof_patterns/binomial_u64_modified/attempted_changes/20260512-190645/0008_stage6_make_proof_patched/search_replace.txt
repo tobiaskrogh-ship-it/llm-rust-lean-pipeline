@@ -1,0 +1,242 @@
+<<< SEARCH
+/-- Main postcondition: in the overflow-free range `n ≤ 67`, the function
+    computes the standard binomial coefficient `Nat.choose`.  Captures the
+    sweep tests `pascal_oracle_up_to_n67` and `agrees_with_source`, and
+    subsumes the specific instances in `test_binomial_u64`.
+
+    The proof case-splits on the outer guards of `binomial_u64.binomial`:
+    the `k > n` branch is closed by `binomial_k_gt_n` + the natChoose
+    out-of-triangle zero clause, and the `k = 0` branch is closed by
+    `binomial_k_zero`. The remaining `0 < k ≤ n` branch is the
+    `while d ≤ k { r := multiply_and_divide r n d; n := n - 1; d := d + 1 }`
+    loop, and is left as `sorry`.
+
+    Stuck sub-goal (the loop case): after applying
+    `Spec.MonoLoopCombinator.while_loop` to the loop in
+    `binomial_u64.binomial`, the body-step obligation requires showing
+    that one iteration preserves the multiplicative invariant
+    `r.toNat * (d - 1)! = (n₀)(n₀ - 1) ⋯ (n₀ - d + 2)` (where `n₀` is the
+    initial value of `n` after any symmetry swap). Inside the body that
+    obligation reduces to a Hoare triple for
+    `multiply_and_divide r n d`, which in turn requires
+    `gcd_u64 r d = RustM.ok (UInt64.ofNat (Nat.gcd r.toNat d.toNat))`
+    and the exact-divisibility fact `(d / gcd_u64 r d) ∣ n` at each step.
+
+    Structural unblock: a separately-verified
+      `gcd_u64_postcondition : ∀ x y : u64,
+         binomial_u64.gcd_u64 x y =
+           RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat))`
+    proved as its own pipeline target (the Rust source already exposes
+    `gcd_u64` and `trailing_zeros_u64` as top-level functions, so this
+    is a single additional target rather than a Mathlib import). With
+    that lemma in hand, `multiply_and_divide` reduces to
+    `pure (r / gcd * (a / (b / gcd)))` under the precondition
+    `b ∣ r * a`, and the body-step obligation follows from
+    `Nat.div_mul_div_comm` + `Nat.gcd_dvd_left/right` (both already in
+    core Lean), without needing any Mathlib import. -/
+theorem binomial_postcondition (n k : u64) (hn : n.toNat ≤ 67) :
+    binomial_u64.binomial n k
+      = RustM.ok (UInt64.ofNat (natChoose n.toNat k.toNat)) := by
+  -- Case 1: `k > n`.  The function returns 0; `natChoose n k = 0`.
+  by_cases h_k_gt_n : n.toNat < k.toNat
+  · rw [binomial_k_gt_n n k h_k_gt_n]
+    apply congrArg RustM.ok
+    rw [natChoose_eq_zero_of_lt n.toNat k.toNat h_k_gt_n]
+    rfl
+  -- Case 2: `k ≤ n` and `k = 0`.  Use `binomial_k_zero`; `natChoose _ 0 = 1`.
+  have h_kn : k.toNat ≤ n.toNat := Nat.not_lt.mp h_k_gt_n
+  by_cases h_k_eq : k = 0
+  · subst h_k_eq
+    rw [binomial_k_zero n]
+    -- `(0 : u64).toNat` reduces to `0` after a `show`; `natChoose_zero_right`
+    -- then collapses the natChoose term to `1`.
+    show RustM.ok 1 = RustM.ok (UInt64.ofNat (natChoose n.toNat 0))
+    rw [natChoose_zero_right n.toNat]
+    rfl
+  -- Case 3: `0 < k ≤ n`.  Loop case; see docstring for the obstacle.
+  sorry
+===
+/-- The loop case of `binomial_postcondition`: when `0 < k` and
+    `2 * k ≤ n` (so the function takes the non-recursive branch with the
+    inner `while d ≤ k` loop), the result is `UInt64.ofNat (natChoose n k)`.
+
+    `binomial_postcondition` reduces every other case to this one — case
+    `k > n` is closed by `binomial_k_gt_n`, case `k = 0` by
+    `binomial_k_zero`, case `k = n` by `binomial_k_eq_n` +
+    `natChoose_symmetry`, and case `n - k < k < n` by `binomial_symmetry`
+    applied to swap arguments to `(n, n - k)` (which then satisfies
+    `2 * (n - k) ≤ n`) plus `natChoose_symmetry`.
+
+    Stage 1 of the proof (the Hoare triple) is scaffolded below: we
+    `unfold binomial_u64.binomial`, reduce the `k > n` and `k > n - k`
+    guards to false via `sub_pure` + `decide_eq_false`, and arrive at a
+    triple about the underlying `Loop.MonoLoopCombinator.while_loop`.
+    Stage 2 (the triple-to-equation conversion via
+    `RustM.Triple_iff_BitVec`) is fully written out and reused verbatim
+    from `binomial_k_zero`.
+
+    Stuck sub-goal: after the simp reduces the early-return guards, the
+    remaining triple is about the loop with initial state `⟨1, n, 1⟩`
+    and body `fun ⟨d, n', r⟩ => do
+      let r ← multiply_and_divide r n' d
+      let n' ← n' -? 1
+      let d ← d +? 1
+      pure ⟨d, n', r⟩`. Applying `Spec.MonoLoopCombinator.while_loop`
+    with the natural invariant
+      `loopInv ⟨d, n', r⟩ ≡ 1 ≤ d.toNat ∧ d.toNat ≤ k.toNat + 1
+                         ∧ n'.toNat = n.toNat - (d.toNat - 1)
+                         ∧ r.toNat = natChoose n.toNat (d.toNat - 1)`
+    and termination measure `k.toNat + 1 - d.toNat` reduces the goal to
+    a body-step obligation. The body-step obligation requires:
+      (a) `multiply_and_divide r n' d = RustM.ok r_new` with
+          `r_new.toNat = natChoose n.toNat d.toNat`. This unfolds to a
+          Hoare triple for `multiply_and_divide`, which in turn requires
+          `gcd_u64 r d = RustM.ok (UInt64.ofNat (Nat.gcd r.toNat d.toNat))`.
+      (b) Exact-divisibility: `(d / Nat.gcd r d) ∣ n'` so the
+          `a / (b / g)` step inside `multiply_and_divide` produces no
+          remainder. This holds because by the invariant
+          `r.toNat * d.toNat / Nat.gcd ... = natChoose n.toNat (d.toNat - 1) * (n.toNat - (d.toNat - 1))`
+          and the Nat-level identity
+          `natChoose n.toNat d.toNat * d.toNat = natChoose n.toNat (d.toNat - 1) * (n.toNat - (d.toNat - 1))`.
+      (c) New `r.toNat = natChoose n.toNat d.toNat`, which follows from
+          (a) + (b) once `multiply_and_divide` is verified.
+
+    Structural unblock: a separately-verified
+      `gcd_u64_postcondition : ∀ x y : u64,
+         binomial_u64.gcd_u64 x y =
+           RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat))`
+    Stein's binary GCD correctness, proved as its own pipeline target
+    (the Rust source already exposes `gcd_u64` and `trailing_zeros_u64`
+    as top-level functions, so this is a single additional target). With
+    that lemma in hand, the body-step obligation reduces to the Nat-level
+    multiplicative-recurrence identity above, which is a routine
+    inductive argument from `Nat.div_mul_div_comm`, `Nat.gcd_dvd_left/right`,
+    and the unfolded definition of `natChoose` — no Mathlib import
+    required. The work splits cleanly into: (i) `gcd_u64` Stein-algorithm
+    correctness (own target), (ii) `multiply_and_divide` correctness
+    (derived from gcd), (iii) the binomial loop invariant (derived from
+    multiply_and_divide). -/
+private theorem binomial_loop_case (n k : u64)
+    (hn : n.toNat ≤ 67) (h_k_pos : 0 < k.toNat) (h_2k_le_n : 2 * k.toNat ≤ n.toNat) :
+    binomial_u64.binomial n k = RustM.ok (UInt64.ofNat (natChoose n.toNat k.toNat)) := by
+  have h_kn : k.toNat ≤ n.toNat := by omega
+  have h_sub_eq : (n - k).toNat = n.toNat - k.toNat := UInt64.toNat_sub_of_le' h_kn
+  have h_k_le_nk : k.toNat ≤ (n - k).toNat := by rw [h_sub_eq]; omega
+  -- Stage 1: Hoare triple over `binomial_u64.binomial n k`.
+  have h_triple :
+      ⦃⌜ True ⌝⦄
+        binomial_u64.binomial n k
+      ⦃⇓ r => ⌜ r = UInt64.ofNat (natChoose n.toNat k.toNat) ⌝⦄ := by
+    unfold binomial_u64.binomial
+    have h_kn_gt_false : decide (k > n) = false := by
+      apply decide_eq_false
+      intro h
+      exact absurd (UInt64.lt_iff_toNat_lt.mp h) (Nat.not_lt.mpr h_kn)
+    have h_sub_pure : (n -? k : RustM u64) = pure (n - k) := sub_pure h_kn
+    have h_k_gt_nk_false : decide (k > (n - k)) = false := by
+      apply decide_eq_false
+      intro h
+      exact absurd (UInt64.lt_iff_toNat_lt.mp h) (Nat.not_lt.mpr h_k_le_nk)
+    simp only [show (k >? n) = (pure (decide (k > n)) : RustM Bool) from rfl,
+               show (k >? (n - k)) = (pure (decide (k > (n - k))) : RustM Bool) from rfl,
+               h_kn_gt_false, h_sub_pure, h_k_gt_nk_false, pure_bind,
+               Bool.false_eq_true, ↓reduceIte]
+    -- After these reductions, the goal is a Hoare triple about
+    -- `do let ⟨d, n', r'⟩ ← Loop.MonoLoopCombinator.while_loop … ⟨1, n, 1⟩ …; pure r'`.
+    -- This is where the multiplicative loop invariant + multiply_and_divide
+    -- correctness + gcd_u64 correctness chain begins; see the docstring
+    -- on this theorem for the precise stuck sub-goal and structural unblock.
+    sorry
+  -- Stage 2: convert the triple to an equation. Same template as
+  -- `binomial_k_zero` / `gcd_while_postcondition`.
+  rw [RustM.Triple_iff_BitVec] at h_triple
+  simp only [decide_true, Bool.not_true, Bool.false_or,
+             Bool.and_eq_true, decide_eq_true_eq] at h_triple
+  obtain ⟨hok, hval⟩ := h_triple
+  cases hf : binomial_u64.binomial n k with
+  | none => rw [hf] at hok; simp [RustM.toBVRustM] at hok
+  | some result =>
+    cases result with
+    | ok v =>
+      rw [hf] at hval; simp [RustM.toBVRustM] at hval
+      exact congrArg RustM.ok hval
+    | error e =>
+      rw [hf] at hok; cases e <;> simp [RustM.toBVRustM] at hok
+
+/-- Main postcondition: in the overflow-free range `n ≤ 67`, the function
+    computes the standard binomial coefficient `natChoose`.  Captures the
+    sweep tests `pascal_oracle_up_to_n67` and `agrees_with_source`, and
+    subsumes the specific instances in `test_binomial_u64`.
+
+    The proof case-splits on the outer guards of `binomial_u64.binomial`:
+    * `k > n` → closed by `binomial_k_gt_n` + `natChoose_eq_zero_of_lt`.
+    * `k = 0` → closed by `binomial_k_zero` + `natChoose_zero_right`.
+    * `k = n` (with `n > 0`) → closed by `binomial_k_eq_n` +
+      `natChoose_symmetry` (collapsing `natChoose n n` to
+      `natChoose n 0 = 1`).
+    * `n - k < k < n` (the symmetric loop branch) → use
+      `binomial_symmetry` to swap arguments to `(n, n - k)` which then
+      satisfies `2 * (n - k) ≤ n`, apply `binomial_loop_case` to the
+      swapped arguments, then rewrite the resulting
+      `natChoose n (n - k)` to `natChoose n k` via `natChoose_symmetry`.
+    * `0 < k ≤ n - k` (the direct loop branch) → use `binomial_loop_case`
+      directly.
+
+    All structural / case-analysis work is done here; the remaining
+    unproven content is the loop case itself (`binomial_loop_case`),
+    whose docstring lays out the body-step obligation and the
+    `gcd_u64`-correctness structural unblock. -/
+theorem binomial_postcondition (n k : u64) (hn : n.toNat ≤ 67) :
+    binomial_u64.binomial n k
+      = RustM.ok (UInt64.ofNat (natChoose n.toNat k.toNat)) := by
+  -- Case 1: `k > n`.
+  by_cases h_k_gt_n : n.toNat < k.toNat
+  · rw [binomial_k_gt_n n k h_k_gt_n]
+    apply congrArg RustM.ok
+    rw [natChoose_eq_zero_of_lt n.toNat k.toNat h_k_gt_n]
+    rfl
+  have h_kn : k.toNat ≤ n.toNat := Nat.not_lt.mp h_k_gt_n
+  -- Case 2: `k = 0`.
+  by_cases h_k_eq : k = 0
+  · subst h_k_eq
+    rw [binomial_k_zero n]
+    show RustM.ok 1 = RustM.ok (UInt64.ofNat (natChoose n.toNat 0))
+    rw [natChoose_zero_right n.toNat]
+    rfl
+  have h_k_pos : 0 < k.toNat := by
+    rcases Nat.eq_zero_or_pos k.toNat with h | h
+    · exfalso; apply h_k_eq; apply UInt64.toNat_inj.mp; rw [h]; rfl
+    · exact h
+  have h_sub_eq : (n - k).toNat = n.toNat - k.toNat := UInt64.toNat_sub_of_le' h_kn
+  -- Case 3: `k = n`. Use `binomial_k_eq_n` + `natChoose_symmetry`.
+  by_cases h_k_eq_n_nat : k.toNat = n.toNat
+  · have h_k_eq_n_u64 : k = n := UInt64.toNat_inj.mp h_k_eq_n_nat
+    rw [h_k_eq_n_u64, binomial_k_eq_n n]
+    show RustM.ok 1 = RustM.ok (UInt64.ofNat (natChoose n.toNat n.toNat))
+    have h_nc_nn : natChoose n.toNat n.toNat = 1 := by
+      rw [natChoose_symmetry n.toNat n.toNat (Nat.le_refl _), Nat.sub_self]
+      exact natChoose_zero_right n.toNat
+    rw [h_nc_nn]
+    rfl
+  have h_k_lt_n : k.toNat < n.toNat := Nat.lt_of_le_of_ne h_kn h_k_eq_n_nat
+  -- Case 4: `0 < k < n`. Split on whether `k > n - k`.
+  by_cases h_swap : (n - k).toNat < k.toNat
+  · -- 4a: `k > n - k`. Use symmetry to swap, then loop_case on (n, n - k).
+    have h_swap_nat : n.toNat - k.toNat < k.toNat := by
+      rw [h_sub_eq] at h_swap; exact h_swap
+    have h_nk_pos : 0 < (n - k).toNat := by rw [h_sub_eq]; omega
+    have h_2nk_le_n : 2 * (n - k).toNat ≤ n.toNat := by
+      rw [h_sub_eq]; omega
+    rw [binomial_symmetry n k h_kn]
+    rw [binomial_loop_case n (n - k) hn h_nk_pos h_2nk_le_n]
+    apply congrArg RustM.ok
+    apply congrArg UInt64.ofNat
+    rw [h_sub_eq]
+    exact (natChoose_symmetry n.toNat k.toNat h_kn).symm
+  · -- 4b: `k ≤ n - k`. Direct loop case.
+    push_neg at h_swap
+    have h_swap_nat : k.toNat ≤ n.toNat - k.toNat := by
+      rw [h_sub_eq] at h_swap; exact h_swap
+    have h_2k_le_n : 2 * k.toNat ≤ n.toNat := by omega
+    exact binomial_loop_case n k hn h_k_pos h_2k_le_n
+>>> REPLACE

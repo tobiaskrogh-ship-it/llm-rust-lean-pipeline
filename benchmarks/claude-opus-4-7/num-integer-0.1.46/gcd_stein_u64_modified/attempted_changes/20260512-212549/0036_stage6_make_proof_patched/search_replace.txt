@@ -1,0 +1,332 @@
+<<< SEARCH
+private theorem tz_loop_triple (x : u64) (h_x_pos : 0 < x.toNat) :
+    ⦃⌜ tzInv x ⟨(0 : u32), x⟩ ⌝⦄
+      tzLoop x
+    ⦃⇓ r => ⌜ tzInv x r ∧ ¬ tzCond r = true ⌝⦄ := by
+  apply Std.Do.Spec.MonoLoopCombinator.while_loop
+    ⟨(0 : u32), x⟩ Lean.Loop.mk tzCond tzBody (tzInv x) tzTerm
+  intro s hcond hinv
+  cases s with
+  | mk count y =>
+        -- Normalize tuple projections in the hypotheses.
+        change y.toNat > 0 ∧ y.toNat * 2 ^ count.toNat = x.toNat at hinv
+        change tzCond ⟨count, y⟩ = true at hcond
+        obtain ⟨hy_pos, hprod_eq⟩ := hinv
+        -- Derive count.toNat < 64 from the invariant.
+        have hcount_lt : count.toNat < 64 := by
+          -- y ≥ 1 ⟹ 2^count ≤ y * 2^count = x < 2^64
+          have h2c_le_x : 2 ^ count.toNat ≤ x.toNat := by
+            have h_one_le_y : 1 ≤ y.toNat := hy_pos
+            have h_step : 1 * 2 ^ count.toNat ≤ y.toNat * 2 ^ count.toNat :=
+              Nat.mul_le_mul_right _ h_one_le_y
+            rw [Nat.one_mul] at h_step
+            rw [hprod_eq] at h_step
+            exact h_step
+          have h_x_lt : x.toNat < 2 ^ 64 := x.toNat_lt
+          have h_pow_lt : 2 ^ count.toNat < 2 ^ 64 :=
+            Nat.lt_of_le_of_lt h2c_le_x h_x_lt
+          exact (Nat.pow_lt_pow_iff_right (by decide : 1 < 2)).mp h_pow_lt
+        -- Unpack the loop guard: (y &&& 1).toNat = 0.
+        have hcond_eq : (y &&& (1 : u64)).toNat = (0 : u64).toNat := by
+          have h := hcond
+          unfold tzCond at h
+          exact of_decide_eq_true h
+        have h_one_uint64_toNat : (1 : u64).toNat = 1 := rfl
+        have h_zero_uint64_toNat : (0 : u64).toNat = 0 := rfl
+        -- y is even.
+        have h_y_mod_2 : y.toNat % 2 = 0 := by
+          have h := hcond_eq
+          rw [UInt64.toNat_and, h_one_uint64_toNat, h_zero_uint64_toNat,
+              Nat.and_one_is_mod] at h
+          exact h
+        -- y ≥ 2 (from y > 0 and y is even).
+        have h_y_ge_2 : 2 ≤ y.toNat := by omega
+        -- The shift y >>>? 1 succeeds because 0 ≤ 1 < 64 over i32.
+        have h_y_shr_eq :
+            (y >>>? (1 : i32) : RustM u64) =
+              pure (y >>> ((1 : i32).toNatClampNeg.toUInt64)) := by
+          show (rust_primitives.ops.bit.Shr.shr y (1 : i32) : RustM u64) = _
+          show (if (0 : Int32) ≤ (1 : i32) && (1 : i32) < 64
+                then pure (y >>> ((1 : i32).toNatClampNeg.toUInt64))
+                else (.fail .integerOverflow : RustM u64)) = _
+          rw [show ((0 : Int32) ≤ (1 : i32) && (1 : i32) < 64) = true from rfl]
+          rfl
+        have h_shift_amount : ((1 : i32).toNatClampNeg.toUInt64 : u64) = (1 : u64) := rfl
+        -- The result of the shift.
+        have h_shr_toNat :
+            (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat = y.toNat / 2 := by
+          rw [h_shift_amount, UInt64.toNat_shiftRight,
+              h_one_uint64_toNat, Nat.shiftRight_eq_div_pow]
+        have h_y'_pos_raw :
+            0 < (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat := by
+          rw [h_shr_toNat]; omega
+        have h_y'_lt_raw :
+            (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat < y.toNat := by
+          rw [h_shr_toNat]; omega
+        -- count + 1 doesn't overflow.
+        have h_count_add_eq :
+            (count +? (1 : u32) : RustM u32) = pure (count + 1) := by
+          show (rust_primitives.ops.arith.Add.add count (1 : u32) : RustM u32) = _
+          show (if BitVec.uaddOverflow count.toBitVec (1 : u32).toBitVec
+                then (.fail .integerOverflow : RustM u32)
+                else pure (count + 1)) = _
+          have h_no_ovf : BitVec.uaddOverflow count.toBitVec (1 : u32).toBitVec = false := by
+            cases h_eq : BitVec.uaddOverflow count.toBitVec (1 : u32).toBitVec
+            · rfl
+            · exfalso
+              have h_ovf : UInt32.addOverflow count (1 : u32) = true := h_eq
+              rw [UInt32.addOverflow_iff] at h_ovf
+              have h1 : (1 : u32).toNat = 1 := rfl
+              rw [h1] at h_ovf
+              omega
+          rw [h_no_ovf]; rfl
+        have h_count_succ_nat : (count + 1).toNat = count.toNat + 1 := by
+          rw [UInt32.toNat_add_of_lt]
+          · rfl
+          · have h1 : (1 : u32).toNat = 1 := rfl
+            rw [h1]; omega
+        -- Now compose the body.
+        dsimp only [tzBody]
+        rw [h_y_shr_eq, pure_bind]
+        rw [h_count_add_eq, pure_bind]
+        -- Goal: triple form for `pure ⟨count + 1, y >>> (1 : i32).toNatClampNeg.toUInt64⟩`.
+        -- The framework reduces this to the postcondition applied to that pure value.
+        refine ⟨?_, ?_, ?_⟩
+        · -- termination measure strictly decreases
+          show (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat < y.toNat
+          exact h_y'_lt_raw
+        · -- invariant: y' positive
+          show 0 < (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat
+          exact h_y'_pos_raw
+        · -- invariant: y' * 2^(count + 1) = x
+          show (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat *
+                2 ^ (count + 1).toNat = x.toNat
+          rw [h_shr_toNat, h_count_succ_nat, Nat.pow_succ]
+          -- Goal: (y.toNat / 2) * (2^count.toNat * 2) = x.toNat
+          -- We have y even, so y/2 * 2 = y. Combine with hprod_eq.
+          have h_half_times_two : (y.toNat / 2) * 2 = y.toNat := by
+            have h_div_mod := Nat.div_add_mod y.toNat 2
+            omega
+          have h_assoc : (y.toNat / 2) * (2 ^ count.toNat * 2)
+                          = ((y.toNat / 2) * 2) * 2 ^ count.toNat := by
+            rw [Nat.mul_comm (2 ^ count.toNat) 2, ← Nat.mul_assoc]
+          rw [h_assoc, h_half_times_two]
+          exact hprod_eq
+    -- Stage 2: Weaken to ⦃True⦄ _ ⦃⇓ _ => True⦄ and extract existence.
+    have h_init_inv : tzInv x ⟨(0 : u32), x⟩ := by
+      refine ⟨h_x_pos, ?_⟩
+      show x.toNat * 2 ^ (0 : u32).toNat = x.toNat
+      simp
+    have h_triple_true : ⦃⌜True⌝⦄ tzLoop x ⦃⇓ _ => ⌜True⌝⦄ := by
+      have h_weak : ⦃⌜ tzInv x ⟨(0 : u32), x⟩ ⌝⦄ tzLoop x ⦃⇓ _ => ⌜True⌝⦄ := by
+        apply Std.Do.Triple.of_entails_right _ _ _ _ h_loop
+        apply Std.Do.PostCond.entails.of_left_entails
+        intro r _
+        trivial
+      apply Std.Do.Triple.of_entails_left _ _ _ _ h_weak
+      intro _
+      exact h_init_inv
+    rw [RustM.Triple_iff_BitVec] at h_triple_true
+    simp only [decide_true, Bool.not_true, Bool.false_or,
+               Bool.and_true] at h_triple_true
+    -- Case-split on the loop result.
+    have h_loop_ok : ∃ r : Tuple2 u32 u64, tzLoop x = RustM.ok r := by
+      cases hf : tzLoop x with
+      | none => rw [hf] at h_triple_true; simp [RustM.toBVRustM] at h_triple_true
+      | some result =>
+        cases result with
+        | ok v => exact ⟨v, rfl⟩
+        | error e =>
+          rw [hf] at h_triple_true
+          cases e <;> simp [RustM.toBVRustM] at h_triple_true
+    obtain ⟨r, hr⟩ := h_loop_ok
+    refine ⟨r._0, ?_⟩
+    -- Final step: unfold trailing_zeros_u64 and use hr.
+    show gcd_stein_u64.trailing_zeros_u64 x = RustM.ok r._0
+    unfold gcd_stein_u64.trailing_zeros_u64
+    simp only [rust_primitives.cmp.eq, pure_bind]
+    have h_x_ne_beq : (x == (0 : u64)) = false := by
+      cases h : (x == (0 : u64)) with
+      | true => exact absurd (beq_iff_eq.mp h) hx
+      | false => rfl
+    rw [h_x_ne_beq]
+    simp only [Bool.false_eq_true, ↓reduceIte]
+    unfold rust_primitives.hax.while_loop
+    show (tzLoop x >>= fun s => match s with | ⟨c, _⟩ => pure c) = RustM.ok r._0
+    rw [hr]
+    cases r with
+    | mk c y => rfl
+===
+private theorem tz_loop_triple (x : u64) (h_x_pos : 0 < x.toNat) :
+    ⦃⌜ tzInv x ⟨(0 : u32), x⟩ ⌝⦄
+      tzLoop x
+    ⦃⇓ r => ⌜ tzInv x r ∧ ¬ tzCond r = true ⌝⦄ := by
+  apply Std.Do.Spec.MonoLoopCombinator.while_loop
+    ⟨(0 : u32), x⟩ Lean.Loop.mk tzCond tzBody (tzInv x) tzTerm
+  intro s hcond hinv
+  cases s with
+  | mk count y =>
+    -- Normalize tuple projections in the hypotheses.
+    change y.toNat > 0 ∧ y.toNat * 2 ^ count.toNat = x.toNat at hinv
+    change tzCond ⟨count, y⟩ = true at hcond
+    obtain ⟨hy_pos, hprod_eq⟩ := hinv
+    -- Derive count.toNat < 64 from the invariant.
+    have hcount_lt : count.toNat < 64 := by
+      have h2c_le_x : 2 ^ count.toNat ≤ x.toNat := by
+        have h_one_le_y : 1 ≤ y.toNat := hy_pos
+        have h_step : 1 * 2 ^ count.toNat ≤ y.toNat * 2 ^ count.toNat :=
+          Nat.mul_le_mul_right _ h_one_le_y
+        rw [Nat.one_mul] at h_step
+        rw [hprod_eq] at h_step
+        exact h_step
+      have h_x_lt : x.toNat < 2 ^ 64 := x.toNat_lt
+      have h_pow_lt : 2 ^ count.toNat < 2 ^ 64 :=
+        Nat.lt_of_le_of_lt h2c_le_x h_x_lt
+      exact (Nat.pow_lt_pow_iff_right (by decide : 1 < 2)).mp h_pow_lt
+    -- Unpack the loop guard: (y &&& 1).toNat = 0.
+    have hcond_eq : (y &&& (1 : u64)).toNat = (0 : u64).toNat := by
+      have h := hcond
+      unfold tzCond at h
+      exact of_decide_eq_true h
+    have h_one_uint64_toNat : (1 : u64).toNat = 1 := rfl
+    have h_zero_uint64_toNat : (0 : u64).toNat = 0 := rfl
+    have h_y_mod_2 : y.toNat % 2 = 0 := by
+      have h := hcond_eq
+      rw [UInt64.toNat_and, h_one_uint64_toNat, h_zero_uint64_toNat,
+          Nat.and_one_is_mod] at h
+      exact h
+    have h_y_ge_2 : 2 ≤ y.toNat := by omega
+    have h_y_shr_eq :
+        (y >>>? (1 : i32) : RustM u64) =
+          pure (y >>> ((1 : i32).toNatClampNeg.toUInt64)) := by
+      show (rust_primitives.ops.bit.Shr.shr y (1 : i32) : RustM u64) = _
+      show (if (0 : Int32) ≤ (1 : i32) && (1 : i32) < 64
+            then pure (y >>> ((1 : i32).toNatClampNeg.toUInt64))
+            else (.fail .integerOverflow : RustM u64)) = _
+      rw [show ((0 : Int32) ≤ (1 : i32) && (1 : i32) < 64) = true from rfl]
+      rfl
+    have h_shift_amount : ((1 : i32).toNatClampNeg.toUInt64 : u64) = (1 : u64) := rfl
+    have h_shr_toNat :
+        (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat = y.toNat / 2 := by
+      rw [h_shift_amount, UInt64.toNat_shiftRight,
+          h_one_uint64_toNat, Nat.shiftRight_eq_div_pow]
+    have h_y'_pos_raw :
+        0 < (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat := by
+      rw [h_shr_toNat]; omega
+    have h_y'_lt_raw :
+        (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat < y.toNat := by
+      rw [h_shr_toNat]; omega
+    have h_count_add_eq :
+        (count +? (1 : u32) : RustM u32) = pure (count + 1) := by
+      show (rust_primitives.ops.arith.Add.add count (1 : u32) : RustM u32) = _
+      show (if BitVec.uaddOverflow count.toBitVec (1 : u32).toBitVec
+            then (.fail .integerOverflow : RustM u32)
+            else pure (count + 1)) = _
+      have h_no_ovf : BitVec.uaddOverflow count.toBitVec (1 : u32).toBitVec = false := by
+        cases h_eq : BitVec.uaddOverflow count.toBitVec (1 : u32).toBitVec
+        · rfl
+        · exfalso
+          have h_ovf : UInt32.addOverflow count (1 : u32) = true := h_eq
+          rw [UInt32.addOverflow_iff] at h_ovf
+          have h1 : (1 : u32).toNat = 1 := rfl
+          rw [h1] at h_ovf
+          omega
+      rw [h_no_ovf]; rfl
+    have h_count_succ_nat : (count + 1).toNat = count.toNat + 1 := by
+      rw [UInt32.toNat_add_of_lt]
+      · rfl
+      · have h1 : (1 : u32).toNat = 1 := rfl
+        rw [h1]; omega
+    dsimp only [tzBody]
+    rw [h_y_shr_eq, pure_bind]
+    rw [h_count_add_eq, pure_bind]
+    refine ⟨?_, ?_, ?_⟩
+    · show (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat < y.toNat
+      exact h_y'_lt_raw
+    · show 0 < (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat
+      exact h_y'_pos_raw
+    · show (y >>> ((1 : i32).toNatClampNeg.toUInt64)).toNat *
+            2 ^ (count + 1).toNat = x.toNat
+      rw [h_shr_toNat, h_count_succ_nat, Nat.pow_succ]
+      have h_half_times_two : (y.toNat / 2) * 2 = y.toNat := by
+        have h_div_mod := Nat.div_add_mod y.toNat 2
+        omega
+      have h_assoc : (y.toNat / 2) * (2 ^ count.toNat * 2)
+                      = ((y.toNat / 2) * 2) * 2 ^ count.toNat := by
+        rw [Nat.mul_comm (2 ^ count.toNat) 2, ← Nat.mul_assoc]
+      rw [h_assoc, h_half_times_two]
+      exact hprod_eq
+
+/-- **Loop result existence (no failure).** Given x > 0, the inner
+trailing-zeros loop returns `RustM.ok ⟨count_final, y_final⟩` for some
+final state satisfying the invariant and ¬tzCond. -/
+private theorem tz_loop_ok (x : u64) (h_x_pos : 0 < x.toNat) :
+    ∃ r : Tuple2 u32 u64, tzLoop x = RustM.ok r ∧
+      tzInv x r ∧ ¬ tzCond r = true := by
+  have h_loop := tz_loop_triple x h_x_pos
+  have h_init_inv : tzInv x ⟨(0 : u32), x⟩ := by
+    refine ⟨h_x_pos, ?_⟩
+    show x.toNat * 2 ^ (0 : u32).toNat = x.toNat
+    simp
+  -- Weaken precondition to True.
+  have h_loop' : ⦃⌜True⌝⦄ tzLoop x
+      ⦃⇓ r => ⌜ tzInv x r ∧ ¬ tzCond r = true ⌝⦄ := by
+    apply Std.Do.Triple.of_entails_left _ _ _ _ h_loop
+    intro _; exact h_init_inv
+  rw [RustM.Triple_iff_BitVec] at h_loop'
+  simp only [decide_true, Bool.not_true, Bool.false_or,
+             Bool.and_eq_true, decide_eq_true_eq] at h_loop'
+  obtain ⟨hok, hpost⟩ := h_loop'
+  cases hf : tzLoop x with
+  | none =>
+    rw [hf] at hok; simp [RustM.toBVRustM] at hok
+  | some result =>
+    cases result with
+    | ok v =>
+      rw [hf] at hpost
+      simp [RustM.toBVRustM] at hpost
+      exact ⟨v, rfl, hpost⟩
+    | error e =>
+      rw [hf] at hok
+      cases e <;> simp [RustM.toBVRustM] at hok
+
+/-- **Reduce `trailing_zeros_u64 x` to `tzLoop x` extraction.**  Given
+the loop returns `RustM.ok r`, the wrapping `if x = 0 then ...` produces
+`RustM.ok r._0`. -/
+private theorem trailing_zeros_unfold_ne_zero (x : u64) (hx : x ≠ 0)
+    (r : Tuple2 u32 u64) (hr : tzLoop x = RustM.ok r) :
+    gcd_stein_u64.trailing_zeros_u64 x = RustM.ok r._0 := by
+  unfold gcd_stein_u64.trailing_zeros_u64
+  simp only [rust_primitives.cmp.eq, pure_bind]
+  have h_x_ne_beq : (x == (0 : u64)) = false := by
+    cases h : (x == (0 : u64)) with
+    | true => exact absurd (beq_iff_eq.mp h) hx
+    | false => rfl
+  rw [h_x_ne_beq]
+  simp only [Bool.false_eq_true, ↓reduceIte]
+  unfold rust_primitives.hax.while_loop
+  show (tzLoop x >>= fun s => match s with | ⟨c, _⟩ => pure c) = RustM.ok r._0
+  rw [hr]
+  cases r with
+  | mk c y => rfl
+
+/-- **Trailing-zero counter — totality.** For every `u64`, `trailing_zeros_u64`
+returns *some* value in `RustM` (it never panics or diverges).
+
+* When `x = 0` the function short-circuits to `pure 64` (no loop).
+* When `x ≠ 0`, derived from `tz_loop_triple` via existence projection. -/
+private theorem trailing_zeros_u64_total (x : u64) :
+    ∃ k : u32, gcd_stein_u64.trailing_zeros_u64 x = RustM.ok k := by
+  by_cases hx : x = 0
+  · subst hx
+    refine ⟨64, ?_⟩
+    simp only [gcd_stein_u64.trailing_zeros_u64, rust_primitives.cmp.eq,
+               pure_bind, beq_self_eq_true, ↓reduceIte]
+    rfl
+  · have h_x_pos : 0 < x.toNat := by
+      rcases Nat.eq_zero_or_pos x.toNat with h | h
+      · exfalso; apply hx; apply UInt64.toNat_inj.mp; rw [h]; rfl
+      · exact h
+    obtain ⟨r, hr, _, _⟩ := tz_loop_ok x h_x_pos
+    exact ⟨r._0, trailing_zeros_unfold_ne_zero x hx r hr⟩
+>>> REPLACE

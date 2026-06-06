@@ -1,0 +1,105 @@
+<<< SEARCH
+    use super::*;
+
+    // Transferred from the `repeat_packed` assertions of
+    // `tests/alloc.rs::layout_errors` (`Layout::new::<[u8; 2]>()` => size 2,
+    // align 1).
+    #[test]
+    fn layout_errors() {
+        let layout = Layout { size: 2, align: 1 };
+        let size = layout.size();
+        let size_max = isize::MAX as usize;
+        let align_max = size_max / size;
+
+        assert!(repeat_packed(layout, align_max).is_ok());
+        assert!(repeat_packed(layout, align_max + 1).is_err());
+    }
+
+    #[test]
+    fn packs_without_padding() {
+        let layout = Layout { size: 6, align: 4 };
+        assert_eq!(
+            repeat_packed(layout, 3).unwrap(),
+            Layout { size: 18, align: 4 }
+        );
+    }
+}
+===
+    use super::*;
+
+    // Representative input grids. The pipeline turns each assertion into a
+    // proof obligation, so the suite is kept deliberately small: one test per
+    // independent contract clause, each driven over edge + bulk values.
+
+    const SIZES: &[usize] = &[0, 1, 2, 6, 17, 1024, 65536];
+    const ALIGNS: &[usize] = &[1, 2, 4, 8, 4096];
+    const NS: &[usize] = &[0, 1, 2, 3, 100, 50_000];
+
+    // Postcondition (success case): when `repeat_packed` returns `Ok`, the
+    // result is *packed* (size is exactly `size * n`, no inter-instance
+    // padding) and the original alignment is carried through unchanged.
+    // These are two independent claims: a buggy impl could pad the size while
+    // keeping align, or keep size while resetting align.
+    #[test]
+    fn ok_is_packed_and_preserves_align() {
+        for &size in SIZES {
+            for &align in ALIGNS {
+                for &n in NS {
+                    let layout = Layout { size, align };
+                    // These grids never overflow `usize` and stay far below
+                    // the isize size limit, so the call must succeed.
+                    let out = repeat_packed(layout, n)
+                        .expect("in-bounds inputs must succeed");
+                    assert_eq!(out.size(), size * n, "packed size");
+                    assert_eq!(out.align(), align, "alignment preserved");
+                }
+            }
+        }
+    }
+
+    // Precondition / failure boundary: `from_size_alignment` accepts a record
+    // exactly up to `max_size_for_align(align) == (isize::MAX + 1) - align`
+    // and rejects anything larger. This pins down both directions of the
+    // threshold (no spurious error at/under the limit; `Err` just past it),
+    // generalising the original `layout_errors` case over many aligns/sizes.
+    #[test]
+    fn isize_size_limit_boundary() {
+        for &align in ALIGNS {
+            let max = (isize::MAX as usize + 1) - align;
+            for &size in &[1usize, 2, 3, 7] {
+                let layout = Layout { size, align };
+                let n_ok = max / size; // n_ok * size <= max
+                let n_bad = n_ok + 1; // n_ok*size + size  > max, no usize overflow
+                assert!(
+                    repeat_packed(layout, n_ok).is_ok(),
+                    "product <= limit must be Ok (size={size}, align={align})"
+                );
+                assert!(
+                    repeat_packed(layout, n_bad).is_err(),
+                    "product > limit must be Err (size={size}, align={align})"
+                );
+            }
+        }
+    }
+
+    // Failure condition: when `size * n` overflows `usize`, the checked
+    // multiplication is `None` and `repeat_packed` returns `Err` (it must not
+    // wrap around and report a bogus small layout).
+    #[test]
+    fn mul_overflow_is_err() {
+        for &size in &[usize::MAX, usize::MAX / 2 + 1, usize::MAX - 1] {
+            for &n in &[2usize, 3, 1000, usize::MAX] {
+                // size > usize::MAX/2 and n >= 2  =>  size * n overflows.
+                let layout = Layout { size, align: 1 };
+                assert!(
+                    repeat_packed(layout, n).is_err(),
+                    "overflowing size*n must be Err (size={size}, n={n})"
+                );
+            }
+        }
+        // An explicit overflowing pair: 2^40 * 2^40 = 2^80 > usize::MAX.
+        let layout = Layout { size: 1usize << 40, align: 8 };
+        assert!(repeat_packed(layout, 1usize << 40).is_err());
+    }
+}
+>>> REPLACE

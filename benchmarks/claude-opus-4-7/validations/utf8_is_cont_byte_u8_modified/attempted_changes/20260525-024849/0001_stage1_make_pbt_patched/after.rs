@@ -1,0 +1,53 @@
+//! Extracted from `core::str::validations::utf8_is_cont_byte`.
+//!
+//! Checks whether the byte is a UTF-8 continuation byte (i.e., starts with the
+//! bits `10`).
+
+#[inline]
+pub const fn utf8_is_cont_byte(byte: u8) -> bool {
+    (byte as i8) < -64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf8_is_cont_byte;
+
+    /// Postcondition, positive direction: every byte whose top two bits are
+    /// `10` — equivalently, every byte in `[0x80, 0xBF]` — is classified as a
+    /// continuation byte. Catches any implementation that under-accepts
+    /// (e.g. an off-by-one on either endpoint, or one that always returns
+    /// `false`).
+    #[test]
+    fn returns_true_on_every_byte_in_continuation_range() {
+        for b in 0x80u8..=0xBF {
+            assert!(
+                utf8_is_cont_byte(b),
+                "byte = {:#x} has top bits 10 and should be classified as a continuation byte",
+                b
+            );
+        }
+    }
+
+    /// Postcondition, negative direction: every byte whose top two bits are
+    /// not `10` — equivalently, every byte in `[0x00, 0x7F] ∪ [0xC0, 0xFF]`
+    /// (ASCII, leading bytes, and invalid bytes) — is rejected. Catches any
+    /// implementation that over-accepts (e.g. one that returns `true` for all
+    /// bytes with the high bit set, or that always returns `true`).
+    #[test]
+    fn returns_false_on_every_byte_outside_continuation_range() {
+        for b in 0u8..=0x7F {
+            assert!(
+                !utf8_is_cont_byte(b),
+                "byte = {:#x} is ASCII and should not be classified as a continuation byte",
+                b
+            );
+        }
+        for b in 0xC0u8..=0xFF {
+            assert!(
+                !utf8_is_cont_byte(b),
+                "byte = {:#x} is a leading/invalid byte and should not be classified as a continuation byte",
+                b
+            );
+        }
+    }
+}

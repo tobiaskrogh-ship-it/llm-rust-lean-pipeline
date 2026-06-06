@@ -1,0 +1,124 @@
+<<< SEARCH
+  rw [dif_pos h_size_arr]
+  simp only [pure_bind]
+  congr 1
+
+/-- Totality: `intersperse` always succeeds (returns `RustM.ok`).
+===
+  rw [dif_pos h_size_arr]
+  simp only [pure_bind]
+  congr 1
+
+/-! ## Strong-induction helper for the non-empty obligations
+
+The three remaining obligations (length-nonempty, even-indices, odd-indices)
+all reduce to a single invariant on the recursion of `intersperse_at`. We
+state that invariant here as `intersperse_at_full_invariant`.
+
+The invariant says: starting from `(i, acc)` with `acc` already a valid
+"partial output up to index `i.toNat`", if `intersperse_at` succeeds and
+returns `v`, then `v` is a valid "full output up to `numbers.val.size`".
+
+**Structural unblock for the surviving `sorry`:** the proof is a strong
+induction on `numbers.val.size - i.toNat` using the three step lemmas above
+(`intersperse_at_oob`, `intersperse_at_step_zero`, `intersperse_at_step_pos`).
+The induction step needs an auxiliary "step-success extraction" lemma:
+
+```
+private theorem intersperse_at_step_extract
+    (numbers : RustSlice i64) (delimiter : i64) (i : usize)
+    (acc v : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi : i.toNat < numbers.val.size)
+    (hres : intersperse_at numbers delimiter i acc = RustM.ok v) :
+  (i.toNat = 0 ∧ ∃ h_no : acc.val.size + 1 < 2 ^ 64,
+     intersperse_at numbers delimiter (i + 1)
+       (acc_push_one acc (numbers.val[0]'hi) h_no) = RustM.ok v) ∨
+  (0 < i.toNat ∧ ∃ (h_no : acc.val.size + 2 < 2 ^ 64) (h_i1 : i.toNat + 1 < 2^64),
+     intersperse_at numbers delimiter (i + 1)
+       (acc_push_two acc delimiter (numbers.val[i.toNat]'hi) h_no) = RustM.ok v)
+```
+
+This extraction lemma converts `hres : ok v` into the preconditions of
+`intersperse_at_step_zero` / `intersperse_at_step_pos`, then applies them to
+get a smaller recursive `intersperse_at = ok v` for the inductive step.
+
+Proving the extraction lemma requires unfolding the function body the same
+way the step lemmas do, but in REVERSE: from `ok v` deduce that the inner
+`extend_from_slice` and `i +? 1` calls succeeded (i.e., the dif-positive
+branches were taken). This is the analogue of `i64_sub_extract` in
+`proof_patterns/000_has_close_elements_modified` (which extracts
+`¬ subOverflow` from `ok y`).
+
+Once that extraction lemma is available, the strong-induction proof of
+`intersperse_at_full_invariant` is mechanical: case-split on `i.toNat ≥ n`
+(use `oob`) vs `i.toNat < n` (use `step_extract` then IH on `m - 1`). -/
+
+private theorem intersperse_at_full_invariant
+    (numbers : RustSlice i64) (delimiter : i64) :
+    ∀ (m : Nat) (i : usize) (acc v : alloc.vec.Vec i64 alloc.alloc.Global),
+      numbers.val.size - i.toNat ≤ m →
+      i.toNat ≤ numbers.val.size →
+      acc.val.size = (if i.toNat = 0 then 0 else 2 * i.toNat - 1) →
+      (∀ k, k < i.toNat → ∀ (h2k : 2 * k < acc.val.size)
+              (hk : k < numbers.val.size),
+            acc.val[2 * k]'h2k = numbers.val[k]'hk) →
+      (∀ k, k + 1 < i.toNat → ∀ (h2k1 : 2 * k + 1 < acc.val.size),
+            acc.val[2 * k + 1]'h2k1 = delimiter) →
+      clever_005_intersperse.intersperse_at numbers delimiter i acc = RustM.ok v →
+      v.val.size = (if numbers.val.size = 0 then 0 else 2 * numbers.val.size - 1) ∧
+      (∀ k, k < numbers.val.size → ∀ (h2k : 2 * k < v.val.size)
+              (hk : k < numbers.val.size),
+            v.val[2 * k]'h2k = numbers.val[k]'hk) ∧
+      (∀ k, k + 1 < numbers.val.size → ∀ (h2k1 : 2 * k + 1 < v.val.size),
+            v.val[2 * k + 1]'h2k1 = delimiter) := by
+  intro m
+  induction m with
+  | zero =>
+    -- Base case: m = 0 ⇒ i.toNat ≥ n. Function is OOB, so v = acc, and
+    -- the input invariant transfers directly to v.
+    intro i acc v hm hin h_acc_size h_acc_even h_acc_odd hres
+    have h_i_ge_n : i.toNat ≥ numbers.val.size := by omega
+    have h_i_eq_n : i.toNat = numbers.val.size := by omega
+    rw [intersperse_at_oob numbers delimiter i acc h_i_ge_n] at hres
+    injection hres with h1
+    injection h1 with h_v_eq
+    subst h_v_eq
+    refine ⟨?_, ?_, ?_⟩
+    · -- Size: acc.val.size = (if i = 0 then 0 else 2*i - 1) and i = n.
+      rw [h_acc_size, h_i_eq_n]
+    · -- Even: acc satisfies even-content up to i = n.
+      intro k hk h2k hk_n
+      rw [h_i_eq_n] at h_acc_even
+      exact h_acc_even k hk h2k hk_n
+    · -- Odd: acc satisfies odd-content up to i = n.
+      intro k hk h2k1
+      rw [h_i_eq_n] at h_acc_odd
+      exact h_acc_odd k hk h2k1
+  | succ m ih =>
+    intro i acc v hm hin h_acc_size h_acc_even h_acc_odd hres
+    -- Step case: either i.toNat ≥ n (use base reasoning) or i.toNat < n
+    -- (use step-extract lemma + IH).
+    by_cases h_i_ge : i.toNat ≥ numbers.val.size
+    · -- OOB branch: same as base case.
+      have h_i_eq_n : i.toNat = numbers.val.size := by omega
+      rw [intersperse_at_oob numbers delimiter i acc h_i_ge] at hres
+      injection hres with h1
+      injection h1 with h_v_eq
+      subst h_v_eq
+      refine ⟨?_, ?_, ?_⟩
+      · rw [h_acc_size, h_i_eq_n]
+      · intro k hk h2k hk_n
+        rw [h_i_eq_n] at h_acc_even
+        exact h_acc_even k hk h2k hk_n
+      · intro k hk h2k1
+        rw [h_i_eq_n] at h_acc_odd
+        exact h_acc_odd k hk h2k1
+    · -- In-bounds branch: needs the step-extract lemma (documented above)
+      -- to convert `hres : ok v` into the no-overflow preconditions of
+      -- `intersperse_at_step_zero` / `intersperse_at_step_pos`, then apply
+      -- the IH on the resulting smaller measure.
+      -- This is the structural sorry: the extract lemma is the missing piece.
+      sorry
+
+/-- Totality: `intersperse` always succeeds (returns `RustM.ok`).
+>>> REPLACE

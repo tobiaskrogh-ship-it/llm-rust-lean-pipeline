@@ -1,0 +1,58 @@
+//! Extracted from `core::str::validations::utf8_first_byte`.
+//!
+//! Returns the initial codepoint accumulator for the first byte.
+//! The first byte is special, only want bottom 5 bits for width 2, 4 bits
+//! for width 3, and 3 bits for width 4.
+
+#[inline]
+pub const fn utf8_first_byte(byte: u8, width: u32) -> u32 {
+    (byte & (0x7F >> width)) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::utf8_first_byte;
+    use proptest::prelude::*;
+
+    #[test]
+    fn ascii_width_passes_byte_low_bits() {
+        // For width 2, mask is 0x1F. 0xC2 -> 0x02
+        assert_eq!(utf8_first_byte(0xC2, 2), 0x02);
+        // For width 3, mask is 0x0F. 0xE0 -> 0x00
+        assert_eq!(utf8_first_byte(0xE0, 3), 0x00);
+        assert_eq!(utf8_first_byte(0xEF, 3), 0x0F);
+        // For width 4, mask is 0x07. 0xF0 -> 0x00, 0xF4 -> 0x04
+        assert_eq!(utf8_first_byte(0xF0, 4), 0x00);
+        assert_eq!(utf8_first_byte(0xF4, 4), 0x04);
+    }
+
+    #[test]
+    fn width_zero_keeps_low_7_bits() {
+        // mask 0x7F
+        assert_eq!(utf8_first_byte(0x7F, 0), 0x7F);
+        assert_eq!(utf8_first_byte(0xFF, 0), 0x7F);
+    }
+
+    proptest! {
+        /// Postcondition: for every valid `width` (0..=7), the result is the
+        /// byte ANDed with the codepoint-payload mask `0x7F >> width`. This is
+        /// the full functional contract of `utf8_first_byte` — a buggy
+        /// implementation that uses a different mask, forgets the AND, or
+        /// returns the raw byte is caught here.
+        #[test]
+        fn matches_payload_mask(byte: u8, width in 0u32..=7) {
+            let expected = (byte as u32) & ((0x7Fu32) >> width);
+            prop_assert_eq!(utf8_first_byte(byte, width), expected);
+        }
+    }
+
+    /// Precondition: `width` must be strictly less than 8. The implementation
+    /// computes `0x7F_u8 >> width`, and shifting a `u8` by 8 or more positions
+    /// is a shift overflow that panics in debug builds. Pinning this down so
+    /// downstream proofs know `width < 8` is required for the call to be valid.
+    #[test]
+    #[should_panic]
+    fn panics_when_width_reaches_byte_width() {
+        let _ = utf8_first_byte(0x00, 8);
+    }
+}

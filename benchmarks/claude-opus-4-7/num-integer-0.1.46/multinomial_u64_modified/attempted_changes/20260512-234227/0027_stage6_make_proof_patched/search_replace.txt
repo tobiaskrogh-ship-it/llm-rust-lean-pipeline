@@ -1,0 +1,262 @@
+<<< SEARCH
+/-- Postcondition (functional correctness on small inputs). -/
+theorem multinomial_value
+    (k : RustSlice u64)
+    (h : (k.val.toList.map UInt64.toNat).foldr (· + ·) 0 ≤ 20) :
+    multinomial_u64.multinomial k =
+      RustM.ok (UInt64.ofNat (multinomialNat (k.val.toList.map UInt64.toNat))) := by
+  /- Stuck sub-goal: full functional correctness requires three nested
+     `while_loop` invariants (the outer multinomial loop tracking
+     `r = ∏ binomial(prefix-sum, kᵢ)`; the inner `binomial` loop
+     tracking `r = ∏_{j=0}^{d-1} (n - j)`; the innermost `gcd` loop
+     tracking the gcd-equation invariant of `gcd_while_modified`) plus
+     three cross-function postcondition compositions
+     (`multinomial`'s body needs `binomial`'s postcondition;
+     `binomial`'s body needs `multiply_and_divide`'s; that needs
+     `gcd`'s). Each invariant on its own is a 50-line lemma along the
+     lines of `gcd_loop_triple`.
+     Structural unblock (in dependency order, each is a separately-
+     verifiable Stage-1+Stage-2 lemma):
+       (1) `gcd_postcondition : ∀ a b, multinomial_u64.gcd a b =
+            RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat))`
+           — copy-paste of `gcd_while_modified`, since the Rust source
+           is line-for-line identical.
+       (2) `multiply_and_divide_postcondition` consuming (1) to lift
+           `gcd`'s output, plus an overflow-bound hypothesis derived
+           from the `multinomial_value` precondition `sum ≤ 20`.
+       (3) `binomial_postcondition` consuming (2) on every body
+           iteration, with an invariant
+           `r * d! = ∏_{j=0}^{d-1} (n - j) * (steps - j)`.
+       (4) An outer-loop invariant for `multinomial` consuming (3),
+           plus the overflow-bound `∏ binomial(…) < 2^64`.
+     Each step is mechanical given the predecessor; the obstacle is
+     library volume, not technique. -/
+  sorry
+===
+/-! ## Helper lemmas for `multinomial_value` (functional correctness)
+
+The proof of `multinomial_value` requires four cascaded stages, in
+dependency order:
+
+  (1) `gcd_postcondition` — the Euclidean GCD computes `Nat.gcd`
+  (2) `multiply_and_divide_postcondition` — `r * a / b` correctness given
+      no-overflow bounds, using (1) to lift `gcd`'s output.
+  (3) `binomial_postcondition` — `binomial n k` returns the correct
+      binomial coefficient given no-overflow bounds, using (2).
+  (4) The outer-loop invariant for `multinomial`, using (3).
+
+We close (1) here — it is a direct adaptation of `gcd_while_modified`'s
+proof, since the Rust source is line-for-line identical. The other three
+remain `sorry` with statements stated precisely enough that the next pass
+can pick them up. -/
+
+/-- Loop abbreviations for `multinomial_u64.gcd`. Same shape as
+    `gcd_while_modified`. -/
+private abbrev gcdCond : rust_primitives.hax.Tuple2 u64 u64 → Bool :=
+  fun b => UInt64.toNat b._1 != UInt64.toNat 0
+
+private abbrev gcdBody :
+    rust_primitives.hax.Tuple2 u64 u64 → RustM (rust_primitives.hax.Tuple2 u64 u64) :=
+  fun x =>
+    match x with
+    | ⟨a, b⟩ =>
+      (do
+        let t : u64 := b
+        let b : u64 ← (a %? b)
+        let a : u64 := t
+        pure (rust_primitives.hax.Tuple2.mk a b) :
+        RustM (rust_primitives.hax.Tuple2 u64 u64))
+
+private abbrev gcdLoop (a b : u64) : RustM (rust_primitives.hax.Tuple2 u64 u64) :=
+  Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk gcdCond ⟨a, b⟩ gcdBody
+
+private def gcd_loopInv (a₀ b₀ : u64) (s : rust_primitives.hax.Tuple2 u64 u64) : Prop :=
+  Nat.gcd s._0.toNat s._1.toNat = Nat.gcd a₀.toNat b₀.toNat
+
+private def gcd_loopTerm (s : rust_primitives.hax.Tuple2 u64 u64) : Nat := s._1.toNat
+
+private theorem gcd_lt_2_64 (a b : u64) : Nat.gcd a.toNat b.toNat < 2 ^ 64 := by
+  by_cases hb : b.toNat = 0
+  · rw [hb, Nat.gcd_zero_right]
+    exact a.toNat_lt
+  · have h_le : Nat.gcd a.toNat b.toNat ≤ b.toNat :=
+      Nat.gcd_le_right a.toNat (Nat.pos_of_ne_zero hb)
+    exact Nat.lt_of_le_of_lt h_le b.toNat_lt
+
+private theorem gcd_toNat_ofNat (a b : u64) :
+    (UInt64.ofNat (Nat.gcd a.toNat b.toNat)).toNat = Nat.gcd a.toNat b.toNat :=
+  UInt64.toNat_ofNat_of_lt' (gcd_lt_2_64 a b)
+
+private theorem gcd_loop_triple (a₀ b₀ : u64) :
+    ⦃⌜ gcd_loopInv a₀ b₀ ⟨a₀, b₀⟩ ⌝⦄
+      gcdLoop a₀ b₀
+    ⦃⇓ r => ⌜ gcd_loopInv a₀ b₀ r ∧ ¬ gcdCond r = true ⌝⦄ := by
+  apply Std.Do.Spec.MonoLoopCombinator.while_loop ⟨a₀, b₀⟩ Lean.Loop.mk
+    gcdCond gcdBody (gcd_loopInv a₀ b₀) gcd_loopTerm
+  intro s hcond hinv
+  cases s with
+  | mk a b =>
+    have hb_ne : b ≠ 0 := by
+      intro hb_eq
+      rw [hb_eq] at hcond
+      simp at hcond
+    have hb_pos : 0 < b.toNat := by
+      rcases Nat.eq_zero_or_pos b.toNat with hh | hh
+      · exfalso; apply hb_ne; apply UInt64.toNat_inj.mp; rw [hh]; rfl
+      · exact hh
+    have h_term_lt : (a % b).toNat < b.toNat := by
+      rw [UInt64.toNat_mod]; exact Nat.mod_lt _ hb_pos
+    have h_inv' : Nat.gcd b.toNat (a % b).toNat = Nat.gcd a₀.toNat b₀.toNat := by
+      rw [UInt64.toNat_mod, Nat.gcd_comm b.toNat, ← Nat.gcd_rec, Nat.gcd_comm]
+      exact hinv
+    have h_rem : (a %? b : RustM u64) = pure (a % b) := by
+      show (rust_primitives.ops.arith.Rem.rem a b : RustM u64) = pure (a % b)
+      show (if b = 0 then (RustM.fail .divisionByZero : RustM u64) else pure (a % b))
+            = pure (a % b)
+      rw [if_neg hb_ne]
+    dsimp only [gcdBody]
+    rw [h_rem]
+    simp only [pure_bind]
+    exact ⟨h_term_lt, h_inv'⟩
+
+private theorem gcd_triple (a₀ b₀ : u64) :
+    ⦃⌜ True ⌝⦄
+      multinomial_u64.gcd a₀ b₀
+    ⦃⇓ r => ⌜ r = UInt64.ofNat (Nat.gcd a₀.toNat b₀.toNat) ⌝⦄ := by
+  have h_loop := gcd_loop_triple a₀ b₀
+  have h_loop' :
+      ⦃⌜ gcd_loopInv a₀ b₀ ⟨a₀, b₀⟩ ⌝⦄
+        gcdLoop a₀ b₀
+      ⦃⇓ r => ⌜ r._0 = UInt64.ofNat (Nat.gcd a₀.toNat b₀.toNat) ⌝⦄ := by
+    apply Triple.of_entails_right _ _ _ _ h_loop
+    apply PostCond.entails.of_left_entails
+    intro r ⟨hinv, hncond⟩
+    have hb_zero_nat : r._1.toNat = 0 := by
+      rcases Nat.eq_zero_or_pos r._1.toNat with hh | hh
+      · exact hh
+      · exfalso
+        apply hncond
+        show (UInt64.toNat r._1 != UInt64.toNat 0) = true
+        exact bne_iff_ne.mpr (Nat.pos_iff_ne_zero.mp hh)
+    unfold gcd_loopInv at hinv
+    rw [hb_zero_nat, Nat.gcd_zero_right] at hinv
+    apply UInt64.toNat_inj.mp
+    rw [hinv]
+    exact (gcd_toNat_ofNat a₀ b₀).symm
+  have h_loop'' :
+      ⦃⌜ True ⌝⦄
+        gcdLoop a₀ b₀
+      ⦃⇓ r => ⌜ r._0 = UInt64.ofNat (Nat.gcd a₀.toNat b₀.toNat) ⌝⦄ := by
+    apply Triple.of_entails_left _ _ _ _ h_loop'
+    intro _
+    show Nat.gcd a₀.toNat b₀.toNat = Nat.gcd a₀.toNat b₀.toNat
+    rfl
+  unfold multinomial_u64.gcd
+  unfold rust_primitives.hax.while_loop
+  show ⦃⌜True⌝⦄
+      (gcdLoop a₀ b₀ >>= fun s => match s with | ⟨a, _⟩ => pure a)
+      ⦃⇓ r => ⌜r = UInt64.ofNat (Nat.gcd a₀.toNat b₀.toNat)⌝⦄
+  apply Triple.bind _ _ h_loop''
+  intro s
+  cases s with
+  | mk a b =>
+    refine Triple.pure a ?_
+    intro hr
+    exact hr
+
+/-- `multinomial_u64.gcd` computes the GCD. Direct adaptation of
+    `gcd_while_modified`. -/
+private theorem gcd_postcondition (a b : u64) :
+    multinomial_u64.gcd a b = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat)) := by
+  have h := gcd_triple a b
+  rw [RustM.Triple_iff_BitVec] at h
+  simp only [decide_true, Bool.not_true, Bool.false_or,
+             Bool.and_eq_true, decide_eq_true_eq] at h
+  obtain ⟨hok, hval⟩ := h
+  cases hf : multinomial_u64.gcd a b with
+  | none =>
+    rw [hf] at hok
+    simp [RustM.toBVRustM] at hok
+  | some result =>
+    cases result with
+    | ok v =>
+      rw [hf] at hval
+      simp [RustM.toBVRustM] at hval
+      exact congrArg RustM.ok hval
+    | error e =>
+      rw [hf] at hok
+      cases e <;> simp [RustM.toBVRustM] at hok
+
+/-- `multiply_and_divide r a b` returns `r * a / b` correctly given no
+    overflow, assuming `b ≠ 0` and `gcd r b` divides `r`.
+    Statement scaffolding for the next pass — left as `sorry`. -/
+private theorem multiply_and_divide_postcondition (r a b : u64)
+    (hb_pos : b.toNat > 0) (hdiv : (Nat.gcd r.toNat b.toNat) ∣ r.toNat)
+    (hno_overflow : (r.toNat / Nat.gcd r.toNat b.toNat) *
+                    (a.toNat / (b.toNat / Nat.gcd r.toNat b.toNat)) < 2 ^ 64) :
+    multinomial_u64.multiply_and_divide r a b =
+      RustM.ok (UInt64.ofNat ((r.toNat / Nat.gcd r.toNat b.toNat) *
+                              (a.toNat / (b.toNat / Nat.gcd r.toNat b.toNat)))) := by
+  /- Stuck sub-goal: after using `gcd_postcondition r b` to reduce `gcd`
+     to a `pure` value, the remaining do-block is
+        `(r /? g) >>= fun rg => (b /? g) >>= fun bg => (a /? bg) >>= fun ab => rg *? ab`
+     and we need to show each division is well-defined (g > 0 since gcd of
+     nonzero values is nonzero, bg > 0 since b = bg*g and b > 0) and the
+     final multiplication does not overflow (from `hno_overflow`).
+     Structural unblock: a Nat-level lemma `Nat.gcd_pos_of_pos_right` plus
+     a `u64_div_no_panic` helper (`UInt64.toNat (a /? b) = a.toNat / b.toNat`
+     when `b ≠ 0`). Both exist in `Hax/MissingLean/Init/Data/UInt/Lemmas.lean`
+     and `Hax/MissingLean/Init/Data/Nat/Div/Basic.lean`; left as `sorry`
+     pending a more careful proof sketch. -/
+  sorry
+
+/-- `binomial n k` returns the correct binomial coefficient given no
+    overflow at any intermediate product. Statement scaffolding —
+    left as `sorry`. -/
+private theorem binomial_postcondition (n k : u64)
+    (hk_le : k.toNat ≤ n.toNat)
+    (hno_overflow : Nat.choose n.toNat k.toNat < 2 ^ 64) :
+    multinomial_u64.binomial n k =
+      RustM.ok (UInt64.ofNat (Nat.choose n.toNat k.toNat)) := by
+  /- Stuck sub-goal: requires a loop invariant on the inner while loop
+     of `binomial`. With `(d, n_var, r, steps)` as the loop state and
+     `k_pick` being the smaller of `k` and `n - k`, the invariant is:
+        r * (k_pick - steps)! * d! = n! / (n - k_pick + steps)!
+     and an additional bound that `r * (n_var) / d` (the next
+     `multiply_and_divide` invocation) doesn't overflow when
+     `Nat.choose n.toNat k.toNat < 2^64`.
+     Closing this requires a non-trivial induction argument plus the
+     correctness of `multiply_and_divide_postcondition` above (which is
+     itself a separate `sorry`). -/
+  sorry
+
+/-- Postcondition (functional correctness on small inputs). -/
+theorem multinomial_value
+    (k : RustSlice u64)
+    (h : (k.val.toList.map UInt64.toNat).foldr (· + ·) 0 ≤ 20) :
+    multinomial_u64.multinomial k =
+      RustM.ok (UInt64.ofNat (multinomialNat (k.val.toList.map UInt64.toNat))) := by
+  /- Stuck sub-goal: the outer-loop invariant for `multinomial` is
+        `r = ∏_{j<idx} binomial(prefix-sum_j, k_j)` together with
+        `p = prefix-sum_idx`. Each iteration the body computes
+        `binomial p i` for the current i = k[idx], multiplies into r,
+        increments idx and decrements remaining. To discharge the body
+        step we need `binomial_postcondition` (above, currently `sorry`).
+     Even with `binomial_postcondition` in hand, we'd then need an
+     overflow bound `∏ binomial(prefix-sum_j, k_j) < 2^64` derived from
+     `h : sum ≤ 20`; this is provable since each binomial(p, k) ≤ p!
+     and p ≤ 20 throughout, but the *bookkeeping* is non-trivial.
+     The `gcd_postcondition` helper IS proved above (direct adaptation
+     of gcd_while_modified). The intermediate helpers
+     `multiply_and_divide_postcondition` and `binomial_postcondition`
+     are stated above with `sorry`. With those three lemmas closed,
+     this theorem becomes a Stage-1/Stage-2 proof along the lines of
+     `multinomial_singleton_triple` + `Triple_iff_BitVec` conversion.
+     Structural unblock: complete `multiply_and_divide_postcondition`
+     and `binomial_postcondition` above. These two lemmas are
+     independent of any new external infrastructure — they reduce to
+     plain Nat/u64 arithmetic plus the Hoare-triple Stage-1/Stage-2
+     pattern already demonstrated in `gcd_triple`/`gcd_postcondition`.
+     `gcd_postcondition` IS available for use here. -/
+  sorry
+>>> REPLACE

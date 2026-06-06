@@ -1,0 +1,108 @@
+<<< SEARCH
+    #[test]
+    fn sequence_of_codepoints_reverse() {
+        let s = "Aé€😀".as_bytes();
+        let mut it = s.iter();
+        unsafe {
+            assert_eq!(next_code_point_reverse(&mut it), Some(0x1F600));
+            assert_eq!(next_code_point_reverse(&mut it), Some(0x20AC));
+            assert_eq!(next_code_point_reverse(&mut it), Some(0xE9));
+            assert_eq!(next_code_point_reverse(&mut it), Some(0x41));
+            assert_eq!(next_code_point_reverse(&mut it), None);
+        }
+    }
+}
+===
+    #[test]
+    fn sequence_of_codepoints_reverse() {
+        let s = "Aé€😀".as_bytes();
+        let mut it = s.iter();
+        unsafe {
+            assert_eq!(next_code_point_reverse(&mut it), Some(0x1F600));
+            assert_eq!(next_code_point_reverse(&mut it), Some(0x20AC));
+            assert_eq!(next_code_point_reverse(&mut it), Some(0xE9));
+            assert_eq!(next_code_point_reverse(&mut it), Some(0x41));
+            assert_eq!(next_code_point_reverse(&mut it), None);
+        }
+    }
+
+    // ----- Property-based tests -----
+
+    /// Postcondition (single code point): for *every* valid Unicode scalar
+    /// value `cp`, encoding `cp` to UTF-8 and then calling
+    /// `next_code_point_reverse` on the resulting bytes recovers `Some(cp)`
+    /// and fully drains the iterator. This pins down the decoding contract
+    /// across all four encoding widths (1, 2, 3, and 4 bytes) and at every
+    /// boundary (0x00, 0x7F, 0x80, 0x7FF, 0x800, 0xFFFF, 0x10000, 0x10FFFF,
+    /// surrogate-adjacent values, ...).
+    #[test]
+    fn prop_single_codepoint_roundtrip() {
+        let mut buf = [0u8; 4];
+        for cp in 0u32..=0x10FFFF {
+            let Some(c) = char::from_u32(cp) else { continue };
+            let s = c.encode_utf8(&mut buf);
+            let bytes = s.as_bytes();
+            let mut it = bytes.iter();
+            let decoded = unsafe { next_code_point_reverse(&mut it) };
+            assert_eq!(decoded, Some(cp), "round-trip failed for U+{:04X}", cp);
+            // Consumption postcondition: the iterator is drained exactly.
+            assert!(
+                it.as_slice().is_empty(),
+                "iterator not drained for U+{:04X}",
+                cp
+            );
+        }
+    }
+
+    /// Postcondition (sequence + consumption): for any valid UTF-8 string,
+    /// repeatedly calling `next_code_point_reverse` yields the same sequence
+    /// of `u32` values as `s.chars().rev()`. This is the multi-codepoint
+    /// extension of the single-codepoint round-trip and is what catches
+    /// bugs in *how many* bytes the function consumes: an off-by-one in the
+    /// consumption count would land the next call on a continuation byte
+    /// and produce a wrong code point (or trigger the `unwrap_unchecked`
+    /// branch). The set of strings exercises ASCII, mixed widths, and
+    /// every encoding-width boundary in a single byte slice.
+    #[test]
+    fn prop_string_matches_chars_rev() {
+        let strings: &[&str] = &[
+            "",
+            "A",
+            "hello, world",
+            "café",
+            "Aé€😀",
+            "🦀🦀🦀",
+            "Hello, 世界!",
+            "abc\u{0080}\u{07FF}\u{0800}\u{FFFF}\u{10000}\u{10FFFF}",
+        ];
+        for s in strings {
+            let mut it = s.as_bytes().iter();
+            let mut expected = s.chars().rev();
+            loop {
+                let got = unsafe { next_code_point_reverse(&mut it) };
+                let want = expected.next().map(|c| c as u32);
+                assert_eq!(got, want, "mismatch on string {:?}", s);
+                if got.is_none() {
+                    break;
+                }
+            }
+            // After drainage, the iterator stays empty.
+            assert!(it.as_slice().is_empty(), "leftover bytes on {:?}", s);
+        }
+    }
+
+    /// Failure clause: the only way `next_code_point_reverse` returns
+    /// `None` is when the iterator is empty, and once it is empty it
+    /// stays `None` on every subsequent call (no panics, no spurious
+    /// `Some`). A buggy implementation that, say, returned `Some(0)` on
+    /// the second call would be caught here.
+    #[test]
+    fn prop_empty_iterator_stays_none() {
+        let s: &[u8] = b"";
+        let mut it = s.iter();
+        for _ in 0..8 {
+            assert_eq!(unsafe { next_code_point_reverse(&mut it) }, None);
+            assert!(it.as_slice().is_empty());
+        }
+    }
+}

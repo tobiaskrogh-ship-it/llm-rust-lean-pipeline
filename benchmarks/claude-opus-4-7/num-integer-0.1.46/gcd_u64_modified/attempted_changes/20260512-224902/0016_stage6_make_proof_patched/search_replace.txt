@@ -1,0 +1,142 @@
+<<< SEARCH
+/-- **Central characterization** — `gcd_u64.gcd` computes `Nat.gcd`
+    exactly, cast back to `u64`.
+
+    LEFT AS `sorry`. The Rust source implements Stein's binary GCD
+    algorithm via **six nested `rust_primitives.hax.while_loop`** calls:
+
+      L1 — `(m, n, shift)` strip common 2-factors until `(m | n) & 1 ≠ 0`
+      L2 — strip remaining 2-factors from `m`
+      L3 — strip remaining 2-factors from `n`
+      L4 — outer loop: while `m ≠ n`, replace larger by `(larger - smaller)`
+            then re-strip 2s; terminates with `m = n`
+      L5 — strip 2-factors from `m` after `m -= n` (inside L4)
+      L6 — strip 2-factors from `n` after `n -= m` (inside L4)
+
+    Closing requires a six-fold composite loop invariant attached via
+    `Std.Do.Spec.MonoLoopCombinator.while_loop` from
+    `Hax/MissingLean/Std/Do/Triple/SpecLemmas.lean:40`. The invariants
+    needed (loop-by-loop):
+
+      L1: `Nat.gcd m.toNat n.toNat * 2^shift.toNat = Nat.gcd x.toNat y.toNat`
+          ∧ `m.toNat > 0` ∧ `n.toNat > 0` ∧ `shift.toNat < 64`
+          ∧ `m.toNat * 2^shift.toNat ≤ x.toNat` (for L7 no-overflow)
+          Termination measure: `m.toNat + n.toNat`.
+      L2: same gcd invariant with `n_final` fixed; `m.toNat > 0`.
+          Termination: `m.toNat`.
+      L3: same gcd invariant with `m_final` fixed; `n.toNat > 0`.
+          Termination: `n.toNat`.
+      L4: same gcd invariant; `m & 1 = 1` ∧ `n & 1 = 1` (both odd) ∧
+          `m.toNat * 2^shift.toNat ≤ x.toNat` ∧
+          `n.toNat * 2^shift.toNat ≤ y.toNat ∨ symmetric`.
+          Termination: `m.toNat + n.toNat`.
+      L5/L6: like L2/L3, run after the subtraction.
+
+      L7 — the closing `m <<<? shift` — needs `shift.toNat < 64` and
+          `m.toNat * 2^shift.toNat < 2^64`, both maintained by L1–L4.
+
+    Per-iteration discharges needed at the body steps:
+      * L1 termination (Nat-level): `m & 1 = 0 ∧ n & 1 = 0 ∧ m > 0` ⇒
+          `(m >>> 1).toNat + (n >>> 1).toNat < m.toNat + n.toNat`.
+      * L1 no-overflow on `shift +? 1`: `shift.toNat < 63` ⇒ no UInt32
+          add-overflow (use `UInt32.addOverflow_iff` + `omega`).
+      * L1 gcd preservation: `m, n both even` ⇒
+          `Nat.gcd m n * 2 = Nat.gcd (m/2) (n/2) * 2 * 2` — needs the
+          Nat-level lemma `Nat.gcd_div_two_of_even_even`, which is NOT
+          in the prelude (`Grep`'d `proofs/lean/extraction/.lake/packages/`
+          — no match for `Nat.gcd.*even`). Would need to derive from
+          `Nat.gcd_mul_right`: `Nat.gcd (2*a) (2*b) = 2 * Nat.gcd a b`.
+      * L4 gcd preservation: `m, n odd ∧ m > n` ⇒
+          `Nat.gcd m n = Nat.gcd (m - n) n` (and post-strip via the
+          even-halving lemma). Standard `Nat.gcd_sub_self_right` would
+          suffice but is also absent from the prelude.
+      * L4 termination via `m | n`: needs the Nat-level fact
+          `(m - n) | n < m | n` when `m, n` both odd and `m > n`.
+          This is not a Mathlib-standard lemma; would need to be
+          developed locally.
+
+    **Structural unblock** — three classes of external work would close
+    this lemma in one pass each:
+      1. Adding `Nat.gcd_mul_right`, `Nat.gcd_sub_self_right` (or
+         their u64-lifted forms) to a `Hax/MissingLean/Nat/Gcd.lean`
+         file would furnish the gcd-preservation steps. These are
+         standard Mathlib lemmas that the Hax prelude does not yet
+         expose.
+      2. Adding a `Lemmas/StrictDecrease/BitwiseOr.lean` proving
+         `m, n odd ∧ m > n ⇒ (m - n).bit_or n < m.bit_or n` would close
+         the L4 termination.
+      3. A worked example in `proof_patterns/` exercising **nested**
+         `rust_primitives.hax.while_loop` (the closest current example,
+         `proof_patterns/gcd_while_modified`, has a single flat loop;
+         the selector flagged "no example exercises nested while_loop"
+         as a library gap). The composition pattern via `Triple.bind`
+         at each nesting level is non-trivial to discover from scratch.
+
+    Once any one of these external pieces lands, the matching
+    sub-component above falls into place; once all three land, the
+    full characterization is mechanical. -/
+===
+/-- **Central characterization** — `gcd_u64.gcd` computes `Nat.gcd`
+    exactly, cast back to `u64`.
+
+    Partial proof leaves a single `sorry`. Work done in the proof body:
+      * The two boundary cases (`x = 0`, `y = 0`) are closed via
+        `gcd_zero_left`/`gcd_zero_right` and `Nat.gcd_zero_left`/`right`.
+      * In the non-boundary case, `gcd_u64.gcd` is `unfold`ed and the
+        early-return guard `(x == 0 || y == 0)` is reduced to `false`
+        using `hx`, `hy`, leaving the else-branch (four sequential
+        `rust_primitives.hax.while_loop` calls + final `m <<<? shift`)
+        exposed.
+
+    Nat-level helpers developed above (all closed, no `sorry`):
+      * `nat_gcd_sub_left` — `gcd a b = gcd (a-b) b` when `b ≤ a`.
+      * `nat_gcd_two_mul_two_mul` — `gcd (2a) (2b) = 2 * gcd a b`.
+      * `nat_gcd_two_mul_left_odd_right` and the convenience variants
+        `nat_gcd_div_two_left_odd_right`, `nat_gcd_div_two_both_even`,
+        `nat_gcd_div_two_right_odd_left` — all four "strip-a-2" gcd
+        preservations.
+    These cover **every gcd-preservation step** any body discharge
+    needs (L1, L2, L3, L4 sub-step, L5, L6).
+
+    Stuck sub-goal: the equation
+    ```
+      ( do let shift := 0
+           let ⟨m,n,shift⟩ ← while_loop L1 …    -- strip common 2s
+           let m ← while_loop L2 …              -- strip 2s from m
+           let n ← while_loop L3 …              -- strip 2s from n
+           let ⟨m,n⟩ ← while_loop L4 …          -- outer, nests L5/L6
+           m <<<? shift )
+      = RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat))
+    ```
+    on six **nested** `rust_primitives.hax.while_loop` calls. Each
+    loop's partial-fixpoint definition does not reduce past one
+    iteration; the standard discharge (cf. the `while_example` README)
+    is two-stage: build a Hoare triple via `Spec.MonoLoopCombinator.while_loop`
+    with a strong invariant + termination measure, then convert to the
+    equation via `RustM.Triple_iff_BitVec` and a `RustM`-case-split.
+    Applying that pattern here means writing six body-step lemmas
+    (one per loop) and composing them with five `Triple.bind` links —
+    roughly 250-350 lines of tactic code that no current
+    `proof_patterns/` example demonstrates (the closest is
+    `proof_patterns/gcd_while_modified`, which has a single flat
+    loop).
+
+    **Structural unblock** (what would close this lemma in one pass):
+      1. A worked example in `proof_patterns/` exercising **nested**
+         `rust_primitives.hax.while_loop` — currently flagged by the
+         selector as a library gap. The composition pattern at each
+         nesting level (especially L4 → L5/L6 inside the body) is
+         non-trivial to discover from scratch and ought to be
+         documented once and reused.
+      2. A separately-verified bitwise-OR strict-decrease helper:
+         `m, n odd ∧ m > n → ((m - n) >>> k) ||| n < m ||| n`
+         (for the smallest `k ≥ 1` that makes the LHS odd). This is
+         the natural termination measure for L4 — the current
+         workaround would use `m.toNat + n.toNat` instead, but the
+         Rust source carries `loop_decreases!(m | n)`, so the
+         extracted shape requires matching the `m | n` measure.
+      3. Once (1) and (2) land, the gcd-preservation steps in every
+         body discharge are mechanically supplied by the
+         `nat_gcd_*` helpers above; the proof reduces to algebra over
+         `UInt64.toNat`-bridge lemmas (all in the prelude). -/
+>>> REPLACE

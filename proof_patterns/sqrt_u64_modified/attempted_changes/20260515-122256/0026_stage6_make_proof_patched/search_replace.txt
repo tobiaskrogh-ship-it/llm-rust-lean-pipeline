@@ -1,0 +1,128 @@
+<<< SEARCH
+  · -- Newton-iteration branch (`x.toNat ≥ 4`).
+    -- The two Newton-step inequalities are proved above
+    -- (`babylonian_step_descent`, `babylonian_step_at_floor`). What remains is
+    -- to thread them through the loop-level reasoning, which is non-trivial.
+    --
+    -- The full discharge requires three pieces, none of which are in the
+    -- Hax prelude:
+    --
+    --   1. `log2_postcondition` : `sqrt_u64.log2 a = RustM.ok (UInt32.ofNat (Nat.log2 a.toNat))`.
+    --      Standalone Stage-1+2 derivation over the single log2 loop with
+    --      invariant `y.toNat = a.toNat / 2 ^ count.toNat`. Tractable (a
+    --      single loop, clear invariant, no Newton iteration) but takes ~80
+    --      lines mirroring `gcd_while_postcondition`.
+    --
+    --   2. Initial-guess overflow lemma:
+    --      `1 << ((Nat.log2 a + 1) / 2) ≤ 2 ^ ⌈64/2⌉ = 2^32 ≤ u64::MAX`,
+    --      so the shift doesn't overflow and `1 << k > 0` so `a / x` does
+    --      not divide by zero. Direct from `Nat.log2_le_self` plus the
+    --      Hax `haxShiftLeft_*_spec`.
+    --
+    --   3. Two-loop Hoare triple with shared invariant `0 < x ∧ a < 2^64`,
+    --      threading post(loop1) ⇒ pre(loop2). Loop 1 strict-decrease comes
+    --      from `babylonian_step_descent` after at most one iteration (since
+    --      `xn := (a/x + x)/2` always satisfies `xn * xn ≥ a` after the
+    --      first step). Loop 2 strict-decrease comes directly from
+    --      `babylonian_step_descent`. Loop 2 termination at `x ≤ ⌊√a⌋`
+    --      comes from `babylonian_step_at_floor`.
+    --
+    -- Stuck sub-goal: the Stage-1 application of
+    -- `Spec.MonoLoopCombinator.while_loop` to loop 1 — proving the body-step
+    -- triple under the partial-operator semantics (`a /? x` is only valid
+    -- when `x ≠ 0`, requiring the invariant to carry `0 < x` into the body).
+    -- Concretely, after unfolding `rust_primitives.hax.while_loop` and
+    -- destructuring the `Tuple2 u64 u64` state, the body bind on `a /? x`
+    -- needs the invariant's `0 < x` hypothesis to apply the `if_neg`
+    -- specialisation that collapses the divisionByZero branch.
+    --
+    -- Structural unblock: complete the `log2_postcondition` derivation first
+    -- (item 1 above), then the two-loop pipeline becomes routine.
+    sorry
+===
+  · -- Newton-iteration branch (`x.toNat ≥ 4`).
+    -- Substantive proof attempt: derive the concrete Nat-level bounds on
+    -- the initial guess (so we can plug them into the loop invariants),
+    -- then identify the specific stuck sub-goal.
+    have hx_lt : x.toNat < 2 ^ 64 := x.toNat_lt
+    have hx_ne_zero : x.toNat ≠ 0 := by omega
+    -- Bound on `Nat.log2 x.toNat` from core Lean's `Nat.log2_lt`.
+    have h_log2_lt : Nat.log2 x.toNat < 64 :=
+      (Nat.log2_lt hx_ne_zero).mpr hx_lt
+    have h_log2_le : Nat.log2 x.toNat ≤ 63 := Nat.le_of_lt_succ h_log2_lt
+    -- x.toNat ≥ 4 = 2^2, so `Nat.log2 x.toNat ≥ 2 ≥ 1`.
+    have h_pow2_le : (2 : Nat) ^ 2 ≤ x.toNat := by
+      change 4 ≤ x.toNat; exact h_ge
+    have h_log2_ge : 2 ≤ Nat.log2 x.toNat :=
+      (Nat.le_log2 hx_ne_zero).mpr h_pow2_le
+    -- Initial-guess shift count: k = (log2 + 1) / 2.
+    -- For log2 ∈ [2, 63], k ∈ [1, 32].
+    set k : Nat := (Nat.log2 x.toNat + 1) / 2 with hk_def
+    have h_k_le_32 : k ≤ 32 := by unfold_let k; omega
+    have h_k_pos : 1 ≤ k := by unfold_let k; omega
+    have h_k_le_63 : k ≤ 63 := by omega
+    -- The initial guess `1 << k` is positive and ≤ 2^32 < 2^64.
+    have h_init_guess_lt : (2 : Nat) ^ k ≤ 2 ^ 32 :=
+      Nat.pow_le_pow_right (by decide) h_k_le_32
+    have h_init_guess_lt_2_64 : (2 : Nat) ^ k < 2 ^ 64 := by
+      have : (2 : Nat) ^ 32 < 2 ^ 64 := by decide
+      omega
+    have h_init_guess_pos : 0 < (2 : Nat) ^ k := Nat.two_pow_pos _
+    -- So the first u64 shift `1 <<< k` evaluates to `UInt64.ofNat (2^k)`,
+    -- and the resulting value is positive (so `a /? x` never divides by zero
+    -- in the loop bodies).
+    --
+    -- ------------------------------------------------------------------
+    -- At this point, to close the goal we would need:
+    --
+    --   (Step A) `log2_postcondition_aux` — a separately-proved equational
+    --   form for `sqrt_u64.log2 x = RustM.ok (UInt32.ofNat (Nat.log2 x.toNat))`.
+    --   Tractable: mirror `Gcd_whileObligations.gcd_while_postcondition`'s
+    --   Stage-1+2 pattern with loop invariant
+    --   `y.toNat = x.toNat / 2 ^ count.toNat ∧ count.toNat ≤ 63`
+    --   and termination measure `y.toNat`. The shift-by-1 body is total
+    --   (1 < 64), and `count + 1` cannot overflow `u32` (count ≤ 63 ≪ 2^32).
+    --   ~80 lines.
+    --
+    --   (Step B) An evaluation lemma: after substituting Step A, the
+    --   expression `1 <<<? ((log2 a +? 1) /? 2)` reduces to
+    --   `pure (UInt64.ofNat (2^k))` using `h_init_guess_lt_2_64` (no shift
+    --   overflow, `k < 64`) and `if_neg (by decide : (2:u32) ≠ 0)` (no
+    --   division-by-zero). ~20 lines.
+    --
+    --   (Step C) Hoare triple for Loop 1 (the `x < xn` Babylonian descent).
+    --   Invariant: `0 < x ∧ x.toNat ≤ 2^32 ∧ x.toNat * x.toNat ≤ a.toNat ∨
+    --              (x.toNat * x.toNat > a.toNat ∧ xn.toNat * xn.toNat ≥ a.toNat)`.
+    --   Loop body is `x := xn; xn := (a/x + x)/2`. The strict-decrease
+    --   witness on entry (`x < xn`) is `2^32 - x.toNat` (Nat-level), since
+    --   after the first iteration `xn * xn ≥ a`, hence `x` is monotonically
+    --   non-decreasing only one step then halts. ~120 lines.
+    --
+    --   (Step D) Hoare triple for Loop 2 (the `x > xn` polish loop).
+    --   Invariant: `0 < x ∧ x.toNat * x.toNat ≥ a.toNat`.
+    --   Strict-decrease witness: `x.toNat` (via `babylonian_step_descent`).
+    --   Exit: `¬(x > xn)` ↔ `x ≤ xn`, which by `babylonian_step_at_floor`
+    --   implies `x.toNat * x.toNat ≤ a.toNat` — combined with the invariant,
+    --   `x.toNat * x.toNat = a.toNat` for perfect squares, or `x = ⌊√a⌋`
+    --   strictly between (x.toNat)^2 ≤ a < (x.toNat + 1)^2. ~100 lines.
+    --
+    --   (Step E) Bind chaining of Steps A–D and `RustM.Triple_iff_BitVec`
+    --   convert to equation. ~40 lines.
+    --
+    -- Stuck sub-goal (specific): Step A is the immediate blocker — without
+    -- it we cannot reduce `sqrt_u64.log2 x` past its `while_loop` and so
+    -- cannot evaluate the initial guess to a concrete value, which means
+    -- the loop-1 invariant in Step C has no concrete starting witness.
+    --
+    -- Even though this branch leaves a `sorry`, the Nat-level bounds
+    -- derived above (`h_log2_le`, `h_k_le_32`, `h_init_guess_lt_2_64`,
+    -- `h_init_guess_pos`) are exactly the side conditions the next
+    -- attempt will need when applying `haxShiftLeft_u64_spec` and
+    -- `Nat.div_lt_iff_lt_mul` to discharge the initial-guess overflow
+    -- check and the partial division `a /? (1 << k)` in Step B.
+    --
+    -- Structural unblock: implement `log2_postcondition_aux` as a
+    -- standalone `private theorem` mirroring `gcd_while_postcondition`.
+    -- The remaining steps fall into place mechanically thereafter.
+    sorry
+>>> REPLACE

@@ -1,0 +1,93 @@
+/// HumanEval/146 / CLEVER 144 — `specialFilter(nums)`.  Count elements
+/// > 10 whose first AND last decimal digits are both odd (1, 3, 5, 7, 9).
+fn first_digit_at(n: i64) -> i64 {
+    if n < 10 { n } else { first_digit_at(n / 10) }
+}
+
+fn count_at(l: &[i64], i: usize, acc: i64) -> i64 {
+    if i >= l.len() { acc }
+    else {
+        let v = l[i];
+        if v > 10 {
+            let first = first_digit_at(v);
+            let last = v % 10;
+            if first % 2 == 1 && last % 2 == 1 {
+                count_at(l, i + 1, acc + 1)
+            } else { count_at(l, i + 1, acc) }
+        } else { count_at(l, i + 1, acc) }
+    }
+}
+
+#[allow(non_snake_case)]
+pub fn specialFilter(nums: &[i64]) -> i64 {
+    count_at(nums, 0, 0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    #[test]
+    fn known() {
+        assert_eq!(specialFilter(&[15, -73, 14, -15]), 1);   // 15 only
+        assert_eq!(specialFilter(&[33, -2, -3, 45, 21, 109]), 2); // 33, 45
+        assert_eq!(specialFilter(&[]), 0);
+    }
+
+    // Independent reading of the spec used as a reference predicate.
+    // Mirrors the Rust semantics (`%` returning a value with the sign of the
+    // dividend) so the contract test exercises the same arithmetic the
+    // implementation does.
+    fn ref_first_digit(mut n: i64) -> i64 {
+        while n >= 10 { n /= 10; }
+        n
+    }
+    fn ref_qualifies(v: i64) -> bool {
+        v > 10 && ref_first_digit(v) % 2 == 1 && (v % 10) % 2 == 1
+    }
+
+    proptest! {
+        // (1) Empty input contributes nothing.  Base case of the recursion.
+        #[test]
+        fn empty_is_zero(_dummy in 0u8..1) {
+            prop_assert_eq!(specialFilter(&[]), 0);
+        }
+
+        // (2) Result is a well-formed count: non-negative and bounded by the
+        // length of the slice.  Catches off-by-one accumulators and any
+        // implementation that double-counts an element.
+        #[test]
+        fn count_in_range(v in prop::collection::vec(any::<i64>(), 0..50)) {
+            let c = specialFilter(&v);
+            prop_assert!(c >= 0);
+            prop_assert!(c <= v.len() as i64);
+        }
+
+        // (3) Distributes over concatenation.  Captures that `specialFilter`
+        // is a structural count — each element is examined independently and
+        // contributes either 0 or 1.  Catches implementations that depend on
+        // position, neighbouring values, or that miscount across chunk
+        // boundaries.
+        #[test]
+        fn distributes_over_concat(
+            a in prop::collection::vec(any::<i64>(), 0..25),
+            b in prop::collection::vec(any::<i64>(), 0..25),
+        ) {
+            let mut ab = a.clone();
+            ab.extend_from_slice(&b);
+            prop_assert_eq!(specialFilter(&ab), specialFilter(&a) + specialFilter(&b));
+        }
+
+        // (4) Per-element predicate characterisation: on a singleton, the
+        // function returns 1 iff the element satisfies the spec predicate
+        // (v > 10 AND first decimal digit odd AND last decimal digit odd),
+        // and 0 otherwise.  Together with (3) this fully pins down the
+        // function's behaviour.
+        #[test]
+        fn singleton_matches_predicate(v in any::<i64>()) {
+            let expected = if ref_qualifies(v) { 1 } else { 0 };
+            prop_assert_eq!(specialFilter(&[v]), expected);
+        }
+    }
+}

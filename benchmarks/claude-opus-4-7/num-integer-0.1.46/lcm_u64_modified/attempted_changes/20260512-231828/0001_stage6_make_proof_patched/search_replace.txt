@@ -1,0 +1,165 @@
+<<< SEARCH
+/-- Helper: `gcd_u64 x 0 = pure x` — symmetric early-return when the second
+    argument is zero. -/
+private theorem gcd_u64_zero_right (x : u64) :
+    lcm_u64.gcd_u64 x 0 = pure x := by
+  unfold lcm_u64.gcd_u64
+  simp only [rust_primitives.cmp.eq, rust_primitives.hax.logical_op.or,
+             pure_bind, beq_self_eq_true, Bool.or_true, ↓reduceIte]
+  show (pure (x ||| (0 : u64)) : RustM u64) = pure x
+  congr 1
+  apply UInt64.toNat_inj.mp
+  simp
+===
+/-- Helper: `gcd_u64 x 0 = pure x` — symmetric early-return when the second
+    argument is zero. -/
+private theorem gcd_u64_zero_right (x : u64) :
+    lcm_u64.gcd_u64 x 0 = pure x := by
+  unfold lcm_u64.gcd_u64
+  simp only [rust_primitives.cmp.eq, rust_primitives.hax.logical_op.or,
+             pure_bind, beq_self_eq_true, Bool.or_true, ↓reduceIte]
+  show (pure (x ||| (0 : u64)) : RustM u64) = pure x
+  congr 1
+  apply UInt64.toNat_inj.mp
+  simp
+
+/-! ## Numeric-side infrastructure for the gcd-derived properties.
+
+    These helpers are the *closed* lemmas that the surviving `sorry` on
+    `gcd_u64_postcondition` is bracketed by. Every `lcm_*` obligation
+    below is closed conditional on `gcd_u64_postcondition`; if a future
+    pass replaces that `sorry` with a real Stein-correctness proof, the
+    five user-facing theorems are immediately green. -/
+
+/-- The mathematical gcd of two `u64` inputs (as `Nat`) fits in `u64`.
+    Same shape as `gcd_while_modified.gcd_lt_2_64`. -/
+private theorem gcd_lt_2_64 (a b : u64) : Nat.gcd a.toNat b.toNat < 2 ^ 64 := by
+  by_cases hb : b.toNat = 0
+  · rw [hb, Nat.gcd_zero_right]
+    exact a.toNat_lt
+  · have h_le : Nat.gcd a.toNat b.toNat ≤ b.toNat :=
+      Nat.gcd_le_right a.toNat (Nat.pos_of_ne_zero hb)
+    exact Nat.lt_of_le_of_lt h_le b.toNat_lt
+
+/-- The cast `UInt64.ofNat ∘ Nat.gcd` is a left inverse to `.toNat`,
+    given the bound above. Mirrors `gcd_while_modified.gcd_toNat_ofNat`. -/
+private theorem gcd_toNat_ofNat (a b : u64) :
+    (UInt64.ofNat (Nat.gcd a.toNat b.toNat)).toNat = Nat.gcd a.toNat b.toNat :=
+  UInt64.toNat_ofNat_of_lt' (gcd_lt_2_64 a b)
+
+/-- `Nat.gcd m n = 0 ↔ m = 0 ∧ n = 0`. Derived from `Nat.gcd_eq_zero_iff`
+    when available, otherwise by case-split. We use the case-split form to
+    avoid depending on a specific lemma name. -/
+private theorem gcd_toNat_eq_zero_iff (a b : u64) :
+    Nat.gcd a.toNat b.toNat = 0 ↔ a.toNat = 0 ∧ b.toNat = 0 := by
+  constructor
+  · intro h
+    refine ⟨?_, ?_⟩
+    · have := Nat.gcd_dvd_left a.toNat b.toNat
+      rw [h] at this
+      exact Nat.eq_zero_of_zero_dvd this
+    · have := Nat.gcd_dvd_right a.toNat b.toNat
+      rw [h] at this
+      exact Nat.eq_zero_of_zero_dvd this
+  · rintro ⟨ha, hb⟩
+    rw [ha, hb, Nat.gcd_zero_left]
+
+/-- **Postcondition for Stein's-algorithm `gcd_u64`** — the extracted
+    function returns the mathematical gcd, lifted to `u64`.
+
+    *Status*: left as `sorry`. The Rust implementation is Stein's binary
+    gcd plus a hand-rolled `trailing_zeros_u64`. The canonical two-stage
+    `while_example/README.md` proof pattern (`Spec.MonoLoopCombinator.while_loop`
+    → strong invariant → `Triple_iff_BitVec`) applies in principle, but
+    two ingredients are not exercised by any example in the proof-pattern
+    library, so they would have to be invented from prelude internals:
+
+    1. **Nested `while_loop`s.** The body of `gcd_u64`'s outer loop invokes
+       `trailing_zeros_u64`, which is itself a `while_loop`. Proving the
+       outer Hoare triple needs the post of the inner `trailing_zeros_u64`
+       loop as a `bind`-step hypothesis. `gcd_while_modified` only handles
+       a single top-level loop with a primitive `a %? b` in the body.
+    2. **Stein invariant.** The strong invariant is
+       `2 ^ shift * Nat.gcd m.toNat n.toNat = Nat.gcd a₀.toNat b₀.toNat`
+       with both `m` and `n` odd at the loop head. Preservation of this
+       invariant under the body `(M - N) >> tz(M - N)` requires two facts:
+       (a) "odd minus odd is even" so `tz ≥ 1`, and (b)
+       `Nat.gcd (M - N) N = Nat.gcd M N` when `N ≤ M`. Neither is in the
+       Hax prelude (`Grep` confirms no `Nat.gcd_sub` lemma at
+       `proofs/lean/extraction/.lake/packages/Hax/`), so the proof would
+       need to develop them locally from scratch — significantly more
+       work than fits in one obligations-stage pass.
+
+    *Structural unblock*: a separately-verified Stein gcd target — e.g.
+    a dedicated `proof_patterns/stein_gcd_u64` archetype that extends
+    `proof_patterns/gcd_while_modified` with (i) nested `while_loop`
+    chaining via `Triple.bind` and (ii) the Stein invariant above —
+    would close this `sorry` in one cross-target import. All five
+    user-facing obligations in this file would then be discharged
+    automatically. -/
+private theorem gcd_u64_postcondition (a b : u64) :
+    lcm_u64.gcd_u64 a b
+      = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat)) := by
+  -- Substantive attempt: discharge the cases where `gcd_u64` does not
+  -- actually enter Stein's loop. The remaining case is the genuine
+  -- Stein-correctness gap documented above.
+  by_cases ha : a = 0
+  · subst ha
+    rw [gcd_u64_zero_left]
+    show (pure b : RustM u64) = RustM.ok (UInt64.ofNat (Nat.gcd 0 b.toNat))
+    show RustM.ok b = RustM.ok (UInt64.ofNat (Nat.gcd 0 b.toNat))
+    congr 1
+    apply UInt64.toNat_inj.mp
+    rw [Nat.gcd_zero_left]
+    exact (UInt64.toNat_ofNat_of_lt' b.toNat_lt).symm
+  · by_cases hb : b = 0
+    · subst hb
+      rw [gcd_u64_zero_right]
+      show RustM.ok a = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat 0))
+      congr 1
+      apply UInt64.toNat_inj.mp
+      rw [Nat.gcd_zero_right]
+      exact (UInt64.toNat_ofNat_of_lt' a.toNat_lt).symm
+    · -- Both `a` and `b` nonzero: Stein's loop actually runs. See docstring.
+      sorry
+
+/-- The gcd is positive when at least one of `a, b` is nonzero. Derived
+    from `gcd_u64_postcondition` (the result equals `Nat.gcd a.toNat b.toNat`,
+    which is positive iff not both inputs are zero). -/
+private theorem gcd_u64_pos (a b : u64) (hab : a ≠ 0 ∨ b ≠ 0) :
+    0 < (UInt64.ofNat (Nat.gcd a.toNat b.toNat)).toNat := by
+  rw [gcd_toNat_ofNat]
+  rcases Nat.eq_zero_or_pos (Nat.gcd a.toNat b.toNat) with h | h
+  · exfalso
+    rw [gcd_toNat_eq_zero_iff] at h
+    obtain ⟨ha, hb⟩ := h
+    rcases hab with ha' | hb'
+    · apply ha'
+      apply UInt64.toNat_inj.mp
+      rw [ha]; rfl
+    · apply hb'
+      apply UInt64.toNat_inj.mp
+      rw [hb]; rfl
+  · exact h
+
+/-! ## RustM monadic-reduction helpers.
+
+    These lemmas are `rfl` at the `Option (Except _ _)` level but
+    `simp only` does not pick them up automatically; spelling them out
+    locally lets the four `lcm_*` proofs below collapse the bind chain
+    in one `simp only` pass. -/
+
+@[simp] private theorem rustM_ok_bind {α β : Type} (v : α) (f : α → RustM β) :
+    (RustM.ok v >>= f) = f v := rfl
+
+@[simp] private theorem rustM_fail_bind {α β : Type} (e : Error) (f : α → RustM β) :
+    (RustM.fail e >>= f : RustM β) = RustM.fail e := rfl
+
+/-- `RustM.fail e = RustM.ok v` is impossible: `Option.some (.error e) ≠ Option.some (.ok v)`.
+    Proved by two-step `injection`. -/
+private theorem rustM_fail_ne_ok {α : Type} (e : Error) (v : α) :
+    (RustM.fail e : RustM α) ≠ RustM.ok v := by
+  intro h
+  injection h with h1
+  injection h1
+>>> REPLACE

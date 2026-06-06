@@ -1,0 +1,77 @@
+<<< SEARCH
+/-- `insert_sorted_at` at OOB with `inserted = true` returns `acc` unchanged. -/
+private theorem insert_sorted_at_oob_inserted
+=== 
+/-! ## Key observation about `dedupe_at`.
+
+The Hax extraction of the Rust `dedupe_at` body has a subtle semantic
+difference from the original Rust source. The Rust source uses
+short-circuiting boolean `||`:
+
+    if i == 0 || sorted[i] != sorted[i - 1] { ... }
+
+The Hax-extracted Lean code uses `||?` which is `pure (a || b)` — a
+non-short-circuiting boolean operator that requires both arguments to be
+fully evaluated as `Bool` first. The do-notation evaluation in Lean then
+forces *both* arms of the `||?` to be fully evaluated through their own
+`←` extractions before the `||` is applied.
+
+In particular, `(← (i -? (1 : usize)))` is *always* evaluated, even when
+`i = 0`. Since `0 -? 1 = .fail .integerOverflow` (usubOverflow on
+`(0,1)` is `true`), this causes `dedupe_at sorted 0 acc` to **fail with
+`Error.integerOverflow` whenever `sorted` is non-empty** (i.e. whenever
+the outer `i >= len` check doesn't already return).
+
+Consequently, the hypothesis `dedupe_at sorted 0 (empty) = RustM.ok v`
+in `dedupe_at_correct` forces `sorted.val.size = 0` — at which point the
+result `v = empty` and the three conjuncts are vacuous.
+
+This is captured below as `dedupe_at_zero_nonempty_fails`. -/
+
+private theorem dedupe_at_zero_nonempty_fails
+    (sorted : RustSlice i64)
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hpos : 0 < sorted.val.size) :
+    clever_033_unique.dedupe_at sorted (0 : usize) acc
+      = RustM.fail Error.integerOverflow := by
+  conv => lhs; unfold clever_033_unique.dedupe_at
+  have h_ofNat : (USize64.ofNat sorted.val.size).toNat = sorted.val.size :=
+    USize64.toNat_ofNat_of_lt' sorted.size_lt_usizeSize
+  have h_cond_outer : decide (USize64.ofNat sorted.val.size ≤ (0 : usize)) = false := by
+    rw [decide_eq_false_iff_not]
+    intro hle
+    rw [USize64.le_iff_toNat_le, h_ofNat] at hle
+    have h_zero : (0 : usize).toNat = 0 := rfl
+    rw [h_zero] at hle
+    omega
+  have h_zero_lt : (0 : usize).toNat < sorted.val.size := by
+    have h_zero : (0 : usize).toNat = 0 := rfl
+    rw [h_zero]; exact hpos
+  have h_idx0 : (sorted[(0 : usize)]_? : RustM i64) = RustM.ok (sorted.val[0]'hpos) := by
+    show (if h : (0 : usize).toNat < sorted.val.size then pure (sorted.val[(0:usize)])
+            else .fail .arrayOutOfBounds) = _
+    rw [dif_pos h_zero_lt]; rfl
+  have h_sub_fail : ((0 : usize) -? (1 : usize) : RustM usize)
+      = RustM.fail Error.integerOverflow := by
+    show (rust_primitives.ops.arith.Sub.sub (0 : usize) (1 : usize) : RustM usize) = _
+    show (if BitVec.usubOverflow (0 : usize).toBitVec (1 : usize).toBitVec
+          then (.fail .integerOverflow : RustM usize)
+          else pure ((0 : usize) - 1)) = _
+    have h_ov : BitVec.usubOverflow (0 : usize).toBitVec (1 : usize).toBitVec = true := by decide
+    rw [h_ov]; rfl
+  have h_eq_true : (rust_primitives.cmp.eq (0 : usize) (0 : usize) : RustM Bool)
+      = RustM.ok true := by
+    show (pure (decide ((0 : usize) = 0)) : RustM Bool) = RustM.ok true
+    rfl
+  simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+             rust_primitives.cmp.ge, pure_bind, RustM_ok_bind,
+             h_cond_outer, Bool.false_eq_true, ↓reduceIte,
+             h_eq_true, h_idx0, h_sub_fail]
+  -- After the simp, the goal should reduce to showing that the bind
+  -- through the failing `i -? 1` propagates to `RustM.fail`. The
+  -- monadic structure here is `RustM.fail _ >>= _ = RustM.fail _`.
+  rfl
+
+/-- `insert_sorted_at` at OOB with `inserted = true` returns `acc` unchanged. -/
+private theorem insert_sorted_at_oob_inserted
+>>> REPLACE

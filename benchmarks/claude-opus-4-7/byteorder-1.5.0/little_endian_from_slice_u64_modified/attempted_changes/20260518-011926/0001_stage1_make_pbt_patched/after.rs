@@ -1,0 +1,97 @@
+//! Extracted from `byteorder` 1.5.0:
+//! `impl ByteOrder for LittleEndian { fn from_slice_u64(numbers: &mut [u64]) { .. } }`
+//! at src/lib.rs:2262.
+//!
+//! `LittleEndian` is a zero-sized marker type in the source, so the `&self`
+//! receiver is dropped here and the method is exposed as a free function.
+
+#[inline]
+pub fn from_slice_u64(numbers: &mut [u64]) {
+    if cfg!(target_endian = "big") {
+        for n in numbers {
+            *n = n.to_le();
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Transferred from the doc-test on the `ByteOrder::from_slice_u64`
+    // trait method (src/lib.rs:1653-1659), monomorphized to the
+    // `LittleEndian` impl: `BigEndian::from_slice_u64` -> local
+    // `from_slice_u64`, and `to_be` -> `to_le`.
+    #[test]
+    fn doctest_little_endian() {
+        let mut numbers = [5, 65000];
+        from_slice_u64(&mut numbers);
+        assert_eq!(numbers, [5u64.to_le(), 65000u64.to_le()]);
+    }
+
+    // Simple deterministic xorshift PRNG so the property is exercised over
+    // many inputs without pulling in a proptest dependency.
+    fn next_u64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    // POSTCONDITION (core contract clause): after the call, every element
+    // equals the original value of that element mapped through `to_le()`.
+    // This fully characterises the function: it maps each element through
+    // `to_le` and changes nothing else (length, order, untouched elements).
+    //
+    // A buggy implementation that byte-swaps unconditionally, reverses or
+    // permutes the slice, zeroes/overwrites elements, or processes the
+    // wrong number of elements would be caught.
+    #[test]
+    fn prop_postcondition_each_element_mapped_through_to_le() {
+        let mut state: u64 = 0x9E3779B97F4A7C15;
+        // Lengths include the empty-slice edge case (must not panic / no-op).
+        for &len in &[0usize, 1, 2, 3, 7, 16, 64] {
+            for _ in 0..256 {
+                let mut numbers: Vec<u64> = (0..len).map(|_| next_u64(&mut state)).collect();
+                // Seed in some boundary values among the random data.
+                if len >= 2 {
+                    numbers[0] = 0;
+                    numbers[len - 1] = u64::MAX;
+                }
+                let original = numbers.clone();
+
+                from_slice_u64(&mut numbers);
+
+                assert_eq!(numbers.len(), original.len());
+                for i in 0..original.len() {
+                    assert_eq!(numbers[i], original[i].to_le());
+                }
+            }
+        }
+    }
+
+    // POSTCONDITION at value boundaries: explicit check that the per-element
+    // mapping holds for extreme and structured bit patterns, not just the
+    // PRNG-generated values.
+    #[test]
+    fn prop_postcondition_boundary_values() {
+        let mut numbers = [
+            0u64,
+            u64::MAX,
+            1,
+            u64::MAX - 1,
+            0x00FF_00FF_00FF_00FF,
+            0xFF00_FF00_FF00_FF00,
+            0x0123_4567_89AB_CDEF,
+        ];
+        let original = numbers;
+
+        from_slice_u64(&mut numbers);
+
+        for i in 0..original.len() {
+            assert_eq!(numbers[i], original[i].to_le());
+        }
+    }
+}

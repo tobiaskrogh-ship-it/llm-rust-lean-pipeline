@@ -1,0 +1,84 @@
+/// Check if in given list of numbers, are any two numbers closer to each
+/// other than given threshold.
+pub fn has_close_elements(numbers: &[f64], threshold: f64) -> bool {
+    let n = numbers.len();
+    let mut found = false;
+    let mut i = 0;
+    // Avoid `return` from inside a `while` loop: Hax extracts that shape
+    // into `rust_primitives.hax.while_loop_return`, which is not defined
+    // in the Hax Lean prelude (only `while_loop` is). Use a `found` flag
+    // and a compound loop condition instead.
+    while i < n && !found {
+        let mut j = 0;
+        while j < n && !found {
+            if i != j {
+                let diff = (numbers[i] - numbers[j]).abs();
+                if diff < threshold {
+                    found = true;
+                }
+            }
+            j += 1;
+        }
+        i += 1;
+    }
+    found
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Reference spec: there exist two distinct indices whose values lie
+    /// strictly within `threshold` of each other.
+    fn exists_close_pair(numbers: &[f64], threshold: f64) -> bool {
+        for i in 0..numbers.len() {
+            for j in 0..numbers.len() {
+                if i != j && (numbers[i] - numbers[j]).abs() < threshold {
+                    return true;
+                }
+            }
+        }
+        false
+    }
+
+    proptest! {
+        /// Soundness (postcondition, `true` branch):
+        /// if `has_close_elements` returns `true`, then a distinct pair of
+        /// indices with `|numbers[i] - numbers[j]| < threshold` actually exists.
+        #[test]
+        fn prop_soundness_true_implies_witness(
+            numbers in prop::collection::vec(-1.0e6f64..1.0e6, 0..16),
+            threshold in -1.0e6f64..1.0e6,
+        ) {
+            if has_close_elements(&numbers, threshold) {
+                prop_assert!(exists_close_pair(&numbers, threshold));
+            }
+        }
+
+        /// Completeness (postcondition, `false` branch):
+        /// if `has_close_elements` returns `false`, then *every* distinct pair
+        /// of indices satisfies `|numbers[i] - numbers[j]| >= threshold`.
+        #[test]
+        fn prop_completeness_false_implies_no_witness(
+            numbers in prop::collection::vec(-1.0e6f64..1.0e6, 0..16),
+            threshold in -1.0e6f64..1.0e6,
+        ) {
+            if !has_close_elements(&numbers, threshold) {
+                prop_assert!(!exists_close_pair(&numbers, threshold));
+            }
+        }
+
+        /// Guarded special case (failure-like condition on the `threshold`
+        /// argument): for any non-positive `threshold`, `|diff| >= 0 >=
+        /// threshold` so no pair can ever satisfy the strict inequality, and
+        /// the function must return `false` regardless of `numbers`.
+        #[test]
+        fn prop_nonpositive_threshold_returns_false(
+            numbers in prop::collection::vec(-1.0e6f64..1.0e6, 0..16),
+            threshold in -1.0e6f64..=0.0,
+        ) {
+            prop_assert!(!has_close_elements(&numbers, threshold));
+        }
+    }
+}

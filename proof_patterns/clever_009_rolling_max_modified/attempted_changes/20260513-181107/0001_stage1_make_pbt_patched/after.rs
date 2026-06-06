@@ -1,0 +1,58 @@
+/// From a given list of integers, generate a list of the rolling maximum
+/// element found until each position in the sequence.
+/// (CLEVER's signature column for problem 9 lists `sum_product(...) -> (int, int)`
+/// but its docstring describes rolling-max. We follow the docstring.)
+pub fn rolling_max(numbers: &[i64]) -> Vec<i64> {
+    let mut result: Vec<i64> = Vec::new();
+    let mut max_so_far: i64 = i64::MIN;
+    for &n in numbers {
+        if n > max_so_far {
+            max_so_far = n;
+        }
+        result.push(max_so_far);
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Boundary case: empty input produces empty output.
+    /// (Captures the postcondition on the degenerate input where the
+    /// general "prefix-max at each index" property is vacuously true,
+    /// but still constrains the implementation to return an empty Vec
+    /// rather than panicking or fabricating elements.)
+    #[test]
+    fn empty_input_yields_empty_output() {
+        let out = rolling_max(&[]);
+        assert!(out.is_empty());
+    }
+
+    proptest! {
+        /// Postcondition (length): the output has exactly the same
+        /// length as the input. A buggy implementation that drops or
+        /// duplicates elements would be caught here.
+        #[test]
+        fn output_length_equals_input_length(numbers in proptest::collection::vec(any::<i64>(), 0..64)) {
+            let out = rolling_max(&numbers);
+            prop_assert_eq!(out.len(), numbers.len());
+        }
+
+        /// Core postcondition: for every index `i`, `result[i]` equals
+        /// the maximum of `numbers[0..=i]`. This is the defining
+        /// specification of the rolling maximum; an implementation
+        /// that returned any other valid-looking sequence (e.g. the
+        /// rolling minimum, the input unchanged, or a one-off shift)
+        /// would fail this test.
+        #[test]
+        fn each_element_is_prefix_max(numbers in proptest::collection::vec(any::<i64>(), 1..64)) {
+            let out = rolling_max(&numbers);
+            for i in 0..numbers.len() {
+                let expected = *numbers[0..=i].iter().max().unwrap();
+                prop_assert_eq!(out[i], expected);
+            }
+        }
+    }
+}

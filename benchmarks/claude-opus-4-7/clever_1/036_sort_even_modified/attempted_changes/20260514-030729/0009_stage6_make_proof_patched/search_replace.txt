@@ -1,0 +1,220 @@
+<<< SEARCH
+private theorem num_evens_le : ∀ k, num_evens k ≤ k := by
+  intro k
+  induction k with
+  | zero => show num_evens 0 ≤ 0; decide
+  | succ k ih =>
+    show (if k % 2 = 0 then 1 else 0) + num_evens k ≤ k + 1
+    by_cases hk : k % 2 = 0
+    · rw [if_pos hk]; omega
+    · rw [if_neg hk]; omega
+===
+private theorem num_evens_le : ∀ k, num_evens k ≤ k := by
+  intro k
+  induction k with
+  | zero => show num_evens 0 ≤ 0; decide
+  | succ k ih =>
+    show (if k % 2 = 0 then 1 else 0) + num_evens k ≤ k + 1
+    by_cases hk : k % 2 = 0
+    · rw [if_pos hk]; omega
+    · rw [if_neg hk]; omega
+
+/-- `usize` mod by `2` reflects `Nat` mod, when the `usize` index fits below
+    `USize64.size` (always true for `RustSlice` indices). -/
+private theorem usize_mod_two_toNat (i : usize) :
+    (i %? (2 : usize) : RustM usize) = RustM.ok (USize64.ofNat (i.toNat % 2)) := by
+  show (rust_primitives.ops.arith.Rem.rem i (2 : usize) : RustM usize) = _
+  -- The Hax `Rem` for `usize` is total: it returns `pure (BitVec.umod ...)` which
+  -- equals `USize64.ofNat (i.toNat % 2)` semantically.
+  rfl
+
+/-! ## Step lemmas for `rebuild_at`.
+
+The function has two recursive branches (even/odd `i`) plus the OOB
+return.  Each step lemma is parametrised by the in-bounds hypothesis on
+`i`, the parity bool, the accumulator-size-fits-`USize` hypothesis, and
+— in the even branch — a hypothesis that `j.toNat < sorted.val.size`
+discharging the inner `sorted[j]_?` partial op. -/
+
+/-- Even branch: `i < l.size, i % 2 = 0, j < sorted.size`. -/
+private theorem rebuild_at_step_even
+    (l sorted : RustSlice i64) (i j : usize)
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi : i.toNat < l.val.size)
+    (heven : i.toNat % 2 = 0)
+    (hj : j.toNat < sorted.val.size)
+    (h_acc : acc.val.size + 1 < USize64.size) :
+    clever_036_sort_even.rebuild_at l sorted i j acc =
+      clever_036_sort_even.rebuild_at l sorted (i + 1) (j + 1)
+        (push_one acc (sorted.val[j.toNat]'hj) h_acc) := by
+  conv => lhs; unfold clever_036_sort_even.rebuild_at
+  have h_size_lt : l.val.size < USize64.size := l.size_lt_usizeSize
+  have h_usize_size : USize64.size = 2 ^ 64 := usize_size_eq
+  have h_ofNat : (USize64.ofNat l.val.size).toNat = l.val.size :=
+    USize64.toNat_ofNat_of_lt' h_size_lt
+  have h_cond_outer : decide (USize64.ofNat l.val.size ≤ i) = false := by
+    rw [decide_eq_false_iff_not]
+    intro hle
+    rw [USize64.le_iff_toNat_le, h_ofNat] at hle
+    omega
+  -- Discharge `i %? 2` to `pure (i % 2)`.
+  have h_imod : (i %? (2 : usize) : RustM usize) = RustM.ok (i % 2 : usize) := rfl
+  -- Reduce `(i % 2) == 0` to `decide (i.toNat % 2 = 0)`.
+  have h_mod_toNat : (i % (2 : usize)).toNat = i.toNat % 2 := by
+    rw [USize64.toNat_mod, usize_two_toNat]
+  have h_eq_cond : ((i % (2 : usize)) == (0 : usize)) = true := by
+    rw [show ((i % (2 : usize)) == (0 : usize)) = decide ((i % (2 : usize)) = (0 : usize)) from rfl]
+    rw [decide_eq_true_iff]
+    apply USize64.toNat_inj.mp
+    rw [h_mod_toNat]
+    show i.toNat % 2 = (0 : usize).toNat
+    show i.toNat % 2 = 0
+    exact heven
+  have h_idx_sorted :
+      (sorted[j]_? : RustM i64) = RustM.ok (sorted.val[j.toNat]'hj) := by
+    show (if h : j.toNat < sorted.val.size then pure (sorted.val[j])
+            else .fail .arrayOutOfBounds)
+        = RustM.ok (sorted.val[j.toNat]'hj)
+    rw [dif_pos hj]; rfl
+  have h_no_ov_i : i.toNat + 1 < 2^64 := by
+    rw [h_usize_size] at h_size_lt; omega
+  have h_no_bv_i :
+      BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = false := by
+    generalize hbo : BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = bo
+    cases bo with
+    | false => rfl
+    | true =>
+      exfalso
+      have hii := (USize64.uaddOverflow_iff i 1).mp hbo
+      rw [usize_one_toNat] at hii
+      omega
+  have h_add_i : (i +? (1 : usize) : RustM usize) = RustM.ok (i + 1) := by
+    show (rust_primitives.ops.arith.Add.add i 1 : RustM usize) = RustM.ok (i + 1)
+    show (if BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec
+          then (.fail .integerOverflow : RustM usize)
+          else pure (i + 1)) = _
+    rw [h_no_bv_i]; rfl
+  have h_no_ov_j : j.toNat + 1 < 2^64 := by
+    have h_sorted_lt : sorted.val.size < USize64.size := sorted.size_lt_usizeSize
+    rw [h_usize_size] at h_sorted_lt; omega
+  have h_no_bv_j :
+      BitVec.uaddOverflow j.toBitVec (1 : usize).toBitVec = false := by
+    generalize hbo : BitVec.uaddOverflow j.toBitVec (1 : usize).toBitVec = bo
+    cases bo with
+    | false => rfl
+    | true =>
+      exfalso
+      have hii := (USize64.uaddOverflow_iff j 1).mp hbo
+      rw [usize_one_toNat] at hii
+      omega
+  have h_add_j : (j +? (1 : usize) : RustM usize) = RustM.ok (j + 1) := by
+    show (rust_primitives.ops.arith.Add.add j 1 : RustM usize) = RustM.ok (j + 1)
+    show (if BitVec.uaddOverflow j.toBitVec (1 : usize).toBitVec
+          then (.fail .integerOverflow : RustM usize)
+          else pure (j + 1)) = _
+    rw [h_no_bv_j]; rfl
+  simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+             rust_primitives.cmp.ge, pure_bind, RustM_ok_bind,
+             h_cond_outer, Bool.false_eq_true, ↓reduceIte,
+             h_imod, rust_primitives.cmp.eq, h_eq_cond, h_idx_sorted]
+  rw [show (rust_primitives.unsize
+            (RustArray.ofVec #v[sorted.val[j.toNat]'hj] : RustArray i64 1)
+            : RustM (rust_primitives.sequence.Seq i64))
+          = RustM.ok ⟨#[sorted.val[j.toNat]'hj], one_lt_usize_size⟩ from rfl]
+  simp only [RustM_ok_bind]
+  have h_app_size :
+      acc.val.size + (#[sorted.val[j.toNat]'hj] : Array i64).size < USize64.size := by
+    show acc.val.size + 1 < USize64.size
+    exact h_acc
+  rw [show (alloc.vec.Impl_2.extend_from_slice i64 alloc.alloc.Global acc
+              ⟨#[sorted.val[j.toNat]'hj], one_lt_usize_size⟩
+            : RustM (alloc.vec.Vec i64 alloc.alloc.Global))
+        = RustM.ok (push_one acc (sorted.val[j.toNat]'hj) h_acc) from by
+    unfold alloc.vec.Impl_2.extend_from_slice
+    rw [dif_pos h_app_size]
+    rfl]
+  simp only [RustM_ok_bind]
+  rw [h_add_i, RustM_ok_bind, h_add_j]
+  rfl
+
+/-- Odd branch: `i < l.size, i % 2 = 1`.  No constraint on `j`. -/
+private theorem rebuild_at_step_odd
+    (l sorted : RustSlice i64) (i j : usize)
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi : i.toNat < l.val.size)
+    (hodd : i.toNat % 2 = 1)
+    (h_acc : acc.val.size + 1 < USize64.size) :
+    clever_036_sort_even.rebuild_at l sorted i j acc =
+      clever_036_sort_even.rebuild_at l sorted (i + 1) j
+        (push_one acc (l.val[i.toNat]'hi) h_acc) := by
+  conv => lhs; unfold clever_036_sort_even.rebuild_at
+  have h_size_lt : l.val.size < USize64.size := l.size_lt_usizeSize
+  have h_usize_size : USize64.size = 2 ^ 64 := usize_size_eq
+  have h_ofNat : (USize64.ofNat l.val.size).toNat = l.val.size :=
+    USize64.toNat_ofNat_of_lt' h_size_lt
+  have h_cond_outer : decide (USize64.ofNat l.val.size ≤ i) = false := by
+    rw [decide_eq_false_iff_not]
+    intro hle
+    rw [USize64.le_iff_toNat_le, h_ofNat] at hle
+    omega
+  have h_imod : (i %? (2 : usize) : RustM usize) = RustM.ok (i % 2 : usize) := rfl
+  have h_mod_toNat : (i % (2 : usize)).toNat = i.toNat % 2 := by
+    rw [USize64.toNat_mod, usize_two_toNat]
+  have h_eq_cond : ((i % (2 : usize)) == (0 : usize)) = false := by
+    rw [show ((i % (2 : usize)) == (0 : usize)) = decide ((i % (2 : usize)) = (0 : usize)) from rfl]
+    rw [decide_eq_false_iff_not]
+    intro h_eq
+    have := congrArg USize64.toNat h_eq
+    rw [h_mod_toNat] at this
+    show False
+    rw [hodd] at this
+    exact absurd this (by decide)
+  have h_idx_l :
+      (l[i]_? : RustM i64) = RustM.ok (l.val[i.toNat]'hi) := by
+    show (if h : i.toNat < l.val.size then pure (l.val[i])
+            else .fail .arrayOutOfBounds)
+        = RustM.ok (l.val[i.toNat]'hi)
+    rw [dif_pos hi]; rfl
+  have h_no_ov_i : i.toNat + 1 < 2^64 := by
+    rw [h_usize_size] at h_size_lt; omega
+  have h_no_bv_i :
+      BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = false := by
+    generalize hbo : BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec = bo
+    cases bo with
+    | false => rfl
+    | true =>
+      exfalso
+      have hii := (USize64.uaddOverflow_iff i 1).mp hbo
+      rw [usize_one_toNat] at hii
+      omega
+  have h_add_i : (i +? (1 : usize) : RustM usize) = RustM.ok (i + 1) := by
+    show (rust_primitives.ops.arith.Add.add i 1 : RustM usize) = RustM.ok (i + 1)
+    show (if BitVec.uaddOverflow i.toBitVec (1 : usize).toBitVec
+          then (.fail .integerOverflow : RustM usize)
+          else pure (i + 1)) = _
+    rw [h_no_bv_i]; rfl
+  simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+             rust_primitives.cmp.ge, pure_bind, RustM_ok_bind,
+             h_cond_outer, Bool.false_eq_true, ↓reduceIte,
+             h_imod, rust_primitives.cmp.eq, h_eq_cond,
+             h_idx_l]
+  rw [show (rust_primitives.unsize
+            (RustArray.ofVec #v[l.val[i.toNat]'hi] : RustArray i64 1)
+            : RustM (rust_primitives.sequence.Seq i64))
+          = RustM.ok ⟨#[l.val[i.toNat]'hi], one_lt_usize_size⟩ from rfl]
+  simp only [RustM_ok_bind]
+  have h_app_size :
+      acc.val.size + (#[l.val[i.toNat]'hi] : Array i64).size < USize64.size := by
+    show acc.val.size + 1 < USize64.size
+    exact h_acc
+  rw [show (alloc.vec.Impl_2.extend_from_slice i64 alloc.alloc.Global acc
+              ⟨#[l.val[i.toNat]'hi], one_lt_usize_size⟩
+            : RustM (alloc.vec.Vec i64 alloc.alloc.Global))
+        = RustM.ok (push_one acc (l.val[i.toNat]'hi) h_acc) from by
+    unfold alloc.vec.Impl_2.extend_from_slice
+    rw [dif_pos h_app_size]
+    rfl]
+  simp only [RustM_ok_bind]
+  rw [h_add_i]
+  rfl
+>>> REPLACE

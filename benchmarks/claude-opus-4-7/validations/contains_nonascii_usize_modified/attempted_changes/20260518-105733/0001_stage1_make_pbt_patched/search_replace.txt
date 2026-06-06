@@ -1,0 +1,99 @@
+<<< SEARCH
+#[cfg(test)]
+mod tests {
+    use super::contains_nonascii;
+
+    #[test]
+    fn all_ascii_returns_false() {
+        assert!(!contains_nonascii(0));
+        // word with each byte set to 0x7F
+        let ascii: usize = usize::from_ne_bytes([0x7F; size_of::<usize>()]);
+        assert!(!contains_nonascii(ascii));
+        // single ASCII byte at low position
+        assert!(!contains_nonascii(0x41));
+    }
+
+    #[test]
+    fn any_high_bit_set_returns_true() {
+        // each byte 0x80
+        let m: usize = usize::from_ne_bytes([0x80; size_of::<usize>()]);
+        assert!(contains_nonascii(m));
+        // single non-ASCII byte
+        assert!(contains_nonascii(0x80));
+        assert!(contains_nonascii(0xFF));
+    }
+
+    #[test]
+    fn mixed_word_with_one_nonascii_byte() {
+        // [0x7F, 0x7F, ..., 0x7F, 0x80] (last byte non-ascii)
+        let mut bytes = [0x7Fu8; size_of::<usize>()];
+        let n = bytes.len();
+        bytes[n - 1] = 0x80;
+        let w = usize::from_ne_bytes(bytes);
+        assert!(contains_nonascii(w));
+    }
+}
+===
+#[cfg(test)]
+mod tests {
+    use super::contains_nonascii;
+
+    /// Specification oracle, deliberately independent of the bit-mask trick
+    /// used by the implementation: a word "contains nonascii" iff at least
+    /// one of its native-endian bytes has its high bit set, i.e. byte value
+    /// `>= 0x80` (== 128).
+    fn spec_contains_nonascii(x: usize) -> bool {
+        x.to_ne_bytes().iter().any(|&b| b >= 0x80)
+    }
+
+    /// Full contract. `contains_nonascii` is total (no precondition, never
+    /// panics, returns a plain `bool`), so its entire contract is the single
+    /// postcondition: the result equals the per-byte high-bit disjunction.
+    ///
+    /// The structured input space makes this property catch the realistic
+    /// ways the contract could be violated:
+    ///
+    /// * sweeping a non-ascii byte (`0x80` and `0xFF`) through *every* byte
+    ///   position rules out an implementation that inspects only some bytes
+    ///   of the word (e.g. only the low byte, or treats `x` as an integer
+    ///   magnitude);
+    /// * the `0x7F` cases (all-`0x7F` word and a lone `0x7F` per position)
+    ///   pin the threshold at exactly `>= 128`, ruling out an off-by-one
+    ///   such as `> 0x80` or `>= 0x7F`;
+    /// * `0`, `usize::MAX`, all-`0x01` and assorted small values guard
+    ///   against a constant return value.
+    #[test]
+    fn result_equals_per_byte_high_bit_oracle() {
+        const N: usize = size_of::<usize>();
+
+        let mut words = vec![
+            0usize,
+            usize::MAX,
+            0x41,
+            0x80,
+            0xFF,
+            usize::from_ne_bytes([0x7F; N]),
+            usize::from_ne_bytes([0x01; N]),
+        ];
+        for i in 0..N {
+            for probe in [0x80u8, 0xFF, 0x7F] {
+                let mut b = [0u8; N];
+                b[i] = probe;
+                words.push(usize::from_ne_bytes(b));
+                // same probe but on an otherwise all-ascii word
+                let mut b = [0x7Fu8; N];
+                b[i] = probe;
+                words.push(usize::from_ne_bytes(b));
+            }
+        }
+
+        for w in words {
+            assert_eq!(
+                contains_nonascii(w),
+                spec_contains_nonascii(w),
+                "contract violated for word {w:#018x}"
+            );
+        }
+    }
+}
+>>> REPLACE

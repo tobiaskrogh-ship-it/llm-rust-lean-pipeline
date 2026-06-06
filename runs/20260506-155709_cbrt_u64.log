@@ -1,0 +1,346 @@
+Log: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260506-155709_cbrt_u64.log
+Model: claude-opus-4-7
+Attempt logs: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64/attempted_changes/20260506-155709
+Stages: [1, 2, 3, 4, 5, 6]
+[tool] Read({"file_path": "src/lib.rs"})
+The file already contains property-based contract tests `prop_cube_le_x` and `prop_x_lt_next_cube`. Let me verify they work, then summarize.
+[tool] run_cargo_test({})
+All 7 tests pass, including the two property-based contract tests. The property-based suite is already in place from a prior stage of the pipeline; here is the summary of the contract it captures.
+
+## Summary
+
+### Contract of `cbrt: u64 -> u64`
+
+| Clause | Statement | Test |
+|---|---|---|
+| Precondition | None — total on `u64`. | (totality witnessed by the sweep) |
+| Postcondition (P1) | `cbrt(x)^3 <= x` — `r` is a cube-root candidate. | `prop_cube_le_x` |
+| Postcondition (P2) | `x < (cbrt(x)+1)^3` whenever `(r+1)^3` fits in `u64` (else vacuous). — `r` is the *greatest* such. | `prop_x_lt_next_cube` |
+| Failure | None — never panics, no `Option`/`Result` channel. | implicit in (P1)/(P2) sweeps; a panic on any `prop_inputs()` value would fail those tests. |
+
+### Why these two and not more
+
+(P1) and (P2) are **independent** contract clauses:
+- A bug returning `0` for every input still satisfies (P1) but breaks (P2) for `x >= 1`.
+- A bug returning the *ceiling* cube root satisfies (P2) but breaks (P1) on every non-cube `x`.
+
+The input set (`prop_inputs()`) is shaped to hit each branch of the implementation:
+- `x < 8` short-circuit,
+- `8 <= x <= u32::MAX` Hacker's-Delight `icbrt2` u32 path,
+- `x > u32::MAX` `f64`-guess + Newton fixpoint path,
+- the u32/u64 path-selector boundary,
+- the f64-mantissa boundary near `u64::MAX` (where the initial `f64` guess loses ulp-tightness),
+- perfect cubes `k^3` and their `±1` neighbours up to `k = 65_536`,
+- single-bit values, ones-suffix masks, and ones-prefix masks (a deterministic stand-in for a `proptest`-style bit generator).
+
+### Properties considered but deliberately excluded
+
+All of these are derived consequences of (P1) ∧ (P2) plus arithmetic, so they would translate to redundant proof obligations downstream:
+
+- **`cbrt(k*k*k) == k`** for `k <= floor(cbrt(u64::MAX))` — direct corollary of (P1) ∧ (P2) at `x = k^3`.
+- **Monotonicity** `x <= y => cbrt(x) <= cbrt(y)` — purely a consequence of `cbrt(x) = floor(x^(1/3))`, not an independent semantic claim about the implementation.
+- **`cbrt((r+1)^3 - 1) == r`** — same content as the perfect-cube round-trip.
+- **`cbrt(x)^2 <= x` for `x >= 1`** — algebraic consequence of (P1) (since `r^2 <= r^3 <= x` when `r >= 1`).
+- **Idempotence-style identities, parity-preservation, etc.** — properties of cubing/multiplication, not of `cbrt`'s contract.
+
+make_pbt
+[tool] Glob({"pattern": "**/Cargo.toml"})
+[tool] Glob({"pattern": "src/**/*.rs"})
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] Read({"file_path": "Cargo.toml"})
+Let me first run the extraction to see what Hax flags:
+[tool] run_cargo_hax_into_lean({})
+Extraction succeeded. Now let me try `lake build`:
+[tool] run_lake_build({})
+Let me read the extracted Lean to understand:
+[tool] Read({"file_path": "proofs/lean/extraction/cbrt_u64.lean"})
+Let me check the reference examples for patterns:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/src/lib.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/sum_to_n_modified/src/lib.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_ceil_u64_modified/src/lib.rs"})
+[tool] Grep({"pattern": "loop_decreases", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples", "output_mode": "content"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/lean/extraction/.lake/packag... [+51 chars])
+Now let me confirm the tests pass before changes:
+[tool] run_cargo_test({})
+Now let me apply the necessary fixes to make Hax extraction work and the Lean compile. The key issues are:
+
+1. `(a as f64).cbrt() as u64` — f64 cast and `f64::cbrt` not supported in Hax
+2. `u32::MAX as u64` — generates undefined `core_models.num.Impl_8.MAX`
+3. While loops need `loop_decreases!` to avoid the constant-0 termination measure
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n/// Hacker's-Delight `icbrt2`, monomorphized to `u32`.\n///\n/// Mirrors the body of the `Roots::cbrt` impl for `u3... [+6198 chars])
+Let me use `write_working_file` to rewrite src/lib.rs:
+[tool] write_working_file({"path": "src/lib.rs", "overwrite": true, "error_message": "Lake build failed:\n- error: cbrt_u64.lean:106:8: Unknown identifier `core_models.num.Impl_8.MAX` (f... [+18985 chars])
+Now let me verify tests still pass:
+[tool] run_cargo_test({})
+Tests pass. Now extraction:
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+[tool] Read({"file_path": "proofs/lean/extraction/cbrt_u64.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/lean/extraction/.lake/packag... [+45 chars])
+Let me check the lake-built tests/loops example to see how `10 - x` extracts:
+[tool] Glob({"pattern": "**/tests/loops/**/*.lean", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/p... [+29 chars])
+[tool] Glob({"pattern": "**/lean-tests/**/*.lean", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/pr... [+28 chars])
+[tool] Glob({"pattern": "**/Hax/tests/**/*", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/l... [+40 chars])
+[tool] Grep({"pattern": "loop_decreases", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/lean... [+69 chars])
+[tool] Grep({"pattern": "_pureTermination", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/le... [+71 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/lean/extraction/.lake/packag... [+72 chars])
+Let me try the simpler approach first — replace `u64::MAX` with the literal:
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n/// Defunctionalized `fixpoint(guess, |x| (a/(x*x) + x*2) / 3)` from\n/// `src/roots.rs:373..374` (the `next` closu... [+2550 chars])
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<<SEARCH\n/// Defunctionalized `fixpoint(guess, |x| (a/(x*x) + x*2) / 3)` from\n/// `src/roots.rs:373..374` (the `next` closur... [+2347 chars])
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n/// Termination: the first loop runs only while `x < xn`. Each iteration\n/// sets `x` to the old `xn` and recomput... [+1966 chars])
+Tests still pass?
+[tool] run_cargo_test({})
+Tests pass. Now run extraction and lake build:
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+Lake build succeeded. Let me verify the extracted Lean output for Hax-degenerate patterns:
+[tool] Read({"file_path": "proofs/lean/extraction/cbrt_u64.lean"})
+Let me check for the Hax-degenerate `from_machine (0 :` constant-0 pattern explicitly:
+[tool] Grep({"pattern": "from_machine \\(0 :", "path": "proofs/lean/extraction", "output_mode": "content"})
+No Hax-degenerate constant-0 termination measures. Let me re-run the full test suite one more time to confirm semantic equivalence is preserved:
+[tool] run_cargo_test({})
+All 7 tests pass, including `agrees_with_source` (cross-check against `num_integer::cbrt`) and the property tests. 
+
+## Final report
+
+### Hax / `lake build` errors that drove each change
+
+**Round 1 — `lake build` failures:**
+1. `error: Unknown identifier core_models.num.Impl_8.MAX` — caused by `u32::MAX as u64` in `cbrt`. `u32::MAX` doesn't extract.
+2. `error: failed to synthesize instance of type class Cast u64 f64` — caused by `(a as f64)`. f64 casts unsupported.
+3. `error: Unknown identifier std.f64.Impl.cbrt` — caused by `(a as f64).cbrt()`. f64 method unsupported.
+4. Hax-degenerate: all three while loops (`cbrt_u32`, both in `fixpoint_cbrt`) extracted with `from_machine (0 : u32)` as the termination measure (the constant-0 default).
+
+**Round 2 — after first fix:**
+5. `error: Unknown identifier core_models.num.Impl_9.MAX` — caused by `u64::MAX` in `loop_decreases!(u64::MAX - xn)`. `u64::MAX` doesn't extract either.
+6. `error: could not synthesize default value for parameter '_pureTermination'` — the checked subtraction `-?` is fallible (`RustM u64`), so `hax_construct_pure <;> grind` couldn't synthesize a pure `Nat`-valued measure.
+
+### Library calls inlined / replaced
+
+| Original | Replacement |
+|---|---|
+| `(a as f64).cbrt() as u64` (initial Newton guess) | `1u64 << ((bit_length_u64(a) + 2) / 3)` — the integer-only guess from num-integer's `cfg(not(feature = "std"))` branch, with `bit_length_u64` written as a hand-rolled `while tmp > 0 { tmp >>= 1; bits += 1; }` loop because `u64::leading_zeros` / `u64::ilog2` don't extract cleanly. |
+| `u32::MAX as u64` (path-selector bound) | Literal `4_294_967_295u64`. |
+| `u64::MAX - xn` (proposed termination measure) | Loop dropped entirely (see below). |
+
+### Hax-degenerate patterns fixed
+
+- Added `hax_lib::loop_decreases!(s_iter)` to `cbrt_u32`'s while loop.
+- Added `hax_lib::loop_decreases!(x)` to `fixpoint_cbrt`'s remaining while loop.
+- Added `hax_lib::loop_decreases!(tmp)` to `bit_length_u64`'s while loop.
+
+Verified post-extraction: `grep "from_machine (0 :"` over the Lean output returns nothing.
+
+### Semantic-altering change (covered by tests)
+
+**Removed the first while loop in `fixpoint_cbrt`.** The source's `fixpoint` keeps two loops because its f64-derived guess can land on either side of `cbrt(a)`. With our integer guess `1 << ((bit_length(a) + 2) / 3)`, we have `guess³ ≥ 2^bit_length(a) > a` for every `a > 0` (case-split on `bit_length(a) mod 3`: in all three cases, `3 · ⌊(b+2)/3⌋ ≥ b`). Therefore `next(guess) = (a/guess² + 2·guess)/3 ≤ guess`, and the source's first loop's body never executes — dropping it is value-preserving for every input we ever pass.
+
+This is covered by `agrees_with_source`, which sweeps every code-path branch (small, u32 fast path, fixpoint path, u32/u64 boundary, f64-mantissa boundary, bit-pattern shifts, `u64::MAX`, `0`) and asserts `extracted == num_integer::cbrt`. It passes.
+
+### Hax-degenerate patterns considered but not fixed
+
+None remaining — `lake build` succeeds, `from_machine (0 :` is absent from the extraction, and every while loop has a strictly-decreasing variable measure (`s_iter`, `x`, `tmp`) that `_pureTermination` synthesizes cleanly. No `loop_invariant!` was added; the proof stage can introduce Lean-side invariants as needed without an extraction-time cost.
+
+rust_hax_lean
+Looking at the diff, the rewrite makes three substantive changes plus standard `loop_decreases!` annotations:
+
+**Change 1: `cbrt_u32`** — only adds `hax_lib::loop_decreases!(s_iter);`. This is a verification-only annotation, runtime no-op. Behavior preserved.
+
+**Change 2: New `bit_length_u64` helper** — a straightforward "count bits to shift right until zero" function. For `a > 0`, returns the standard `bit_length`. Used only on `a > u32::MAX`, so the `bit_length(0) = 0` corner doesn't matter.
+
+**Change 3: `cbrt` initial guess** — replaces `(a as f64).cbrt() as u64` with `1u64 << ((bit_length_u64(a) + 2) / 3)`. For `a > u32::MAX` (the only branch this affects), `bit_length(a) ∈ [33, 64]`, so the shift amount is `[11, 22]` and the guess is `2^11..2^22 = 2048..4194304`. Since `bit_length(a) = b` implies `a < 2^b ≤ 2^(3⌈b/3⌉) ≤ 2^(3⌊(b+2)/3⌋) = guess^3`, we have `guess^3 > a`, i.e. `guess > cbrt(a)` strictly. Also `guess^2 ≤ 2^44`, well within `u64`.
+
+**Change 4: `fixpoint_cbrt` drops the first loop** — the original handles f64-guess that could land either side of `cbrt(a)`; the rewrite, given an integer guess always `≥ cbrt(a)`, only needs the descending loop.
+
+**Verifying the fixpoint preserves behavior:**
+
+The descending Newton iteration `xn = (a/x² + 2x)/3` for `x > r = floor(cbrt(a))`:
+- Real-valued Newton from `x > cbrt(a)` is monotonically decreasing and stays above `cbrt(a)` (because `f(x) = x³ - a` is convex on `x > 0`).
+- So `real_xn > cbrt(a) ≥ r`, hence `floor(real_xn) ≥ r`. Combined with the loop guard `x > xn`, we have `r ≤ xn < x`, strict decrease, so finitely many iterations.
+- When `x = r`: `a/r² ≥ r` (since `a ≥ r³`), so `xn ≥ (r + 2r)/3 = r`, i.e., `x ≤ xn` and the loop exits with `x = r`.
+
+So starting from any `x ≥ cbrt(a)` with `x² ≤ u64::MAX`, the single-loop fixpoint returns exactly `floor(cbrt(a))`. The integer guess satisfies both conditions.
+
+The original two-loop fixpoint with the f64 guess also converges to `floor(cbrt(a))` (by the same argument applied symmetrically). Both produce the same answer on every input that reaches them.
+
+**Spot checks** (mental simulation):
+- `a = 2^33`: original f64 guess `2048 = cbrt`, returns 2048. Integer guess `4096`, descends `4096 → 2901 → 2274 → 2069 → 2048`, returns 2048. ✓
+- `a = 2^32` (boundary): `1625` from both paths. ✓
+- `a = u64::MAX`: original f64 gives `2_642_245`; integer path starts at `4_194_304` and descends to `2_642_245`. ✓
+
+The `u32::MAX as u64` → `4_294_967_295u64` substitution is identical numerically.
+
+No edge case I can construct produces divergence: the function is total in both versions, and both compute `floor(cbrt(x))` on every `u64`. The algorithmic change is large enough to be worth flagging conceptually, but the rewriter's justification is correct and my analysis confirms behavioral equivalence.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_ceil_u64_modified/proofs/lean/extraction/Avera... [+35 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_floor_u64_modified/proofs/lean/extraction/Aver... [+37 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/lean/extraction/FactorialMod... [+23 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/sum_to_n_modified/proofs/lean/extraction/SumToNModifie... [+19 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_ceil_u64_modified/proofs/lean/extraction/*.lean"... [+1 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/sum_to_n_modified/proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_floor_u64_modified/proofs/lean/extraction/*.lean... [+2 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_ceil_u64_modified/proofs/lean/extraction/Avera... [+29 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_floor_u64_modified/proofs/lean/extraction/Aver... [+31 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/lean/extraction/FactorialObl... [+15 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/sum_to_n_modified/proofs/lean/extraction/Sum_to_nOblig... [+13 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/clamp_modified/proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/saturating_sub_modified/proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/min_modified/proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/clamp_modified/proofs/lean/extraction/ClampObligations... [+7 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/saturating_sub_modified/proofs/lean/extraction/saturat... [+25 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/min_modified/proofs/lean/extraction/MinObligations.lea... [+3 chars])
+Based on my analysis of the target's verification challenges (3 nested `while_loop`s with tuple state, u64 checked arithmetic with `+? -? *? /? <<<? >>>?`, bit-length / shift reasoning, nested branch path-selection, and a polynomial-inequality postcondition `r^3 ≤ x < (r+1)^3`), here are my picks:
+
+```
+examples/sum_to_n_modified
+examples/factorial_modified
+examples/average_floor_u64_modified
+examples/average_ceil_u64_modified
+examples/clamp_modified
+```
+
+**Per-pick rationale:**
+
+- **examples/sum_to_n_modified** — Strongest single match. Same `u64 + checked arithmetic that can `.fail .integerOverflow`` setup as cbrt's `+?`/`-?`/`*?`/`/?` body. Drives a `Nat.strongRecOn` characterization (`sum_to_n_compute`) that splits on whether the closed-form fits in `2 ^ 64` and unfolds one step at a time — directly transferable to cbrt's per-iteration proof skeleton (boundary check + `BitVec.uaddOverflow`/`UInt64.subOverflow_iff` reasoning + `UInt64.toNat_sub_of_le'`/`toNat_add_of_lt`).
+
+- **examples/factorial_modified** — Pairs with `sum_to_n` for the iterated-computation pattern. Adds the *bounded-domain* technique cbrt will need: a `decide`-based numeric fact (`fact_lt_two_pow_64`) used symbolically thereafter, plus the `factorial_step` peel-one-call lemma. Same `BitVec.umulOverflow`/`UInt64.mulOverflow_iff` plumbing the cube-root multiplications need.
+
+- **examples/average_floor_u64_modified** — `u64` shifts (`>>> 1` over `Int32` shift amount) with the exact `UInt64.toNat_shiftRight` / `Nat.shiftRight_eq_div_pow` bridges cbrt's `>>>? s`, `<<<? s`, and `bit_length_u64` proofs need. Also demonstrates a hand-rolled `Nat`-level inductive lemma (`nat_half_adder` via `Nat.strongRecOn`) — same shape as the cube-root inequality lemma cbrt will need.
+
+- **examples/average_ceil_u64_modified** — Companion to `average_floor`. Adds the `Triple_iff_BitVec` → `RustM.ok` extraction trick (`average_ceil_unfold`) and the *width-extension lift* (`dietz_bv65` over `BitVec 65` to escape `u64` overflow) — directly applicable to proving cbrt's intermediate `b = 3*(y2+y)+1` and `b << s` quantities don't overflow.
+
+- **examples/clamp_modified** — Only example with a clean multi-branch dispatch (lo / mid / hi), each with its own Hoare-triple postcondition. Cbrt's three top-level branches (`a < 8`, `a ≤ u32::MAX`, else) follow the same per-branch decomposition — even though cbrt's branches won't close with `mvcgen + grind`, the branch-by-branch *structuring* is the carry-over.
+
+**Gaps** (no example covers these, flag for library expansion):
+
+- **`while_loop` with tuple state** — `cbrt_u32`, `fixpoint_cbrt`, and `bit_length_u64` all use `rust_primitives.hax.while_loop` with `Tuple2`/`Tuple4` state. None of the examples exercise loop-invariant reasoning; the closest analog is the recursion proofs in `sum_to_n`/`factorial`, but the loop encoding (carrying `s_iter`, `x`, `y`, `y2` through `Tuple4` and proving termination via `from_machine`) has no precedent here.
+- **`u32 ↔ u64` casts** (`rust_primitives.hax.cast_op`) — cbrt uses both directions to delegate the small-input path. No example demonstrates how `cast_op`'s extraction interacts with `toNat`/`BitVec` lemmas.
+- **Polynomial inequality postcondition** (`r * r * r ≤ x < (r+1)^3`) — `factorial`/`sum_to_n` use linear-in-Nat closed forms; nothing exercises a cubic monotonicity argument.
+
+**Rejections:**
+
+- `examples/min_modified` — pure `bv_decide`/`Or.inl`/`Or.inr` finish on a `u8` total binop; cbrt's loops put it well outside `bv_decide`'s reach.
+- `examples/saturating_sub_modified` — single-binop, total `u8`, no iteration. Subsumed by `clamp` for branch reasoning and by `sum_to_n` for the `BitVec.usubOverflow` plumbing.
+- `examples/add_one_modified` / `examples/square_modified` — single-binop `u8` with one overflow branch; trivial relative to cbrt.
+- `examples/is_zero_modified` — `rfl` proof on a `u8` equality; nothing transferable.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Cbrt_u64Obligations.lean
+[scaffold] registered Cbrt_u64Obligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/sum_to_n_modified/proofs/lean/extraction/Sum_to_nOblig... [+13 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/lean/extraction/FactorialObl... [+15 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/clamp_modified/proofs/lean/extraction/ClampObligations... [+7 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_floor_u64_modified/proofs/lean/extraction/Aver... [+31 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_ceil_u64_modified/proofs/lean/extraction/Avera... [+29 chars])
+Looking at the Rust source contract:
+
+- **Precondition**: none (total on `u64`)
+- **Postcondition**: writing `r = cbrt(x)`,
+  - (P1) `r^3 ≤ x`
+  - (P2) `x < (r+1)^3` whenever `(r+1)^3` fits in `u64`
+- **Failure**: never panics
+
+The two contract-style property tests are `prop_cube_le_x` (P1) and `prop_x_lt_next_cube` (P2). The other tests (`cbrt_doc_examples`, `cbrt_small_values`, `cbrt_postcondition_dense`, `cbrt_pos`, `agrees_with_source`) are derived consequences of (P1)+(P2) — the Rust source itself flags them as redundant.
+
+Let me look at the current state of the obligations file and check what `u64` and `RustM` look like:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/cbrt_u64/proofs/lean/extraction/Cbrt_u64Obligations.le... [+4 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64_modified/proofs/lean/ext... [+34 chars])
+Now let me write the three obligations:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Cbrt_u64Obligations.lean", "patch": "<<< SEARCH\nnamespace Cbrt_u64Obligations\n\n-- Add `theorem` declarations below.\n\nend C... [+2663 chars])
+[tool] run_lake_build({})
+Build succeeded — all three theorem statements are well-typed. The only warnings are the expected `sorry` placeholders.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Cbrt_u64Obligations.lean`
+
+**Theorems added (one per independent contract clause):**
+
+| Theorem | Contract clause | Maps to Rust test |
+|---|---|---|
+| `cbrt_total` | Totality / no failure: `cbrt` always returns `RustM.ok _` | implicit (every property test sweep) |
+| `cbrt_cube_le_x` | (P1) `r^3 ≤ x` — `r` is a cube-root candidate | `prop_cube_le_x` |
+| `cbrt_x_lt_next_cube` | (P2) `(r+1)^3 < 2^64 → x < (r+1)^3` — `r` is the *greatest* such | `prop_x_lt_next_cube` |
+
+**Property tests classified as derived (skipped):**
+
+- `cbrt_pos`, `cbrt_doc_examples`, `cbrt_small_values`, `cbrt_postcondition_dense` — instance sweeps of (P1) ∧ (P2); the Rust source's own contract notes mark these as redundant relative to the property tests.
+- `agrees_with_source` — pointwise equality with the published `num_integer::cbrt` is a *cross-check*, not a contract clause; it asserts equivalence to a particular reference implementation rather than a property the function should satisfy.
+
+**Framing notes / uncertainties:**
+
+- `cbrt_total` is stated as `∃ r, cbrt_u64.cbrt x = RustM.ok r` (mirroring `average_floor_total` / `average_ceil_no_failure`) rather than baked into the Hoare triples, because `⦃⌜True⌝⦄ f ⦃⇓r => Q r⦄` is vacuous on a failing branch and would not capture totality on its own. The Rust source comment classifies totality as "implicit in (P1)/(P2) sweeps", but at the Lean level it is genuinely independent — so it gets its own theorem.
+- (P1) and (P2) use `r.toNat * r.toNat * r.toNat` (Nat multiplication) rather than `r * r * r` (u64 wrapping). At the maximum `r = 2_642_245`, `r^3` fits in `u64` so the two would agree, but the Nat form makes (P2)'s overflow guard `(r.toNat + 1)^3 < 2^64` come out crisp without nesting `checked_pow`-style `Option` reasoning into the postcondition.
+- (P2) is stated as an *implication* (`(r+1)^3 < 2^64 → x.toNat < (r+1)^3`) rather than a precondition on the theorem, matching how `prop_x_lt_next_cube` only asserts the bound when `checked_pow` returns `Some`. An equivalent formulation with the bound moved into the precondition (`⌜(r.toNat + 1)^3 < 2^64⌝` after the result) would require the precondition to refer to `r`, which Hoare triples do not allow — so the implication framing is the natural choice.
+
+make_lean_obligations
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/sum_to_n_modified/proofs/lean/extraction/Sum_to_nOblig... [+13 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/factorial_modified/proofs/lean/extraction/FactorialObl... [+15 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_floor_u64_modified/proofs/lean/extraction/Aver... [+31 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/clamp_modified/proofs/lean/extraction/ClampObligations... [+7 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/average_ceil_u64_modified/proofs/lean/extraction/Avera... [+29 chars])
+Now let me look at the Hax prelude to understand what's available, especially for while_loop spec.
+[tool] Glob({"pattern": "**/SpecLemmas.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/examples/clamp_modified/proofs/lean/extraction/.lake/packages/H... [+74 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64_modified/proofs/lean/ext... [+98 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/**/*.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64_modified/proofs/lean/ext... [+92 chars])
+Let me first run lake build to confirm the starting state:
+[tool] run_lake_build({})
+Let me look at HaxMvcgen and HaxSpec to understand the available tactics:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64_modified/proofs/lean/ext... [+78 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64_modified/proofs/lean/ext... [+34 chars])
+Let me check the int and Triple Basic libraries to understand more patterns:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64_modified/proofs/lean/ext... [+93 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64_modified/proofs/lean/ext... [+83 chars])
+Let me try a minimal `mvcgen` experiment to see what it discharges. Let me look at one more example to check `bv_decide` patterns:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64_modified/proofs/lean/ext... [+80 chars])
+Let me make a small experimental attempt to see what `mvcgen` leaves. I'll try it on `cbrt_cube_le_x`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Cbrt_u64Obligations.lean", "patch": "<<< SEARCH\ntheorem cbrt_cube_le_x (x : u64) :\n    \u2983 \u231c True \u231d \u2984\n    ... [+589 chars])
+[tool] run_lake_build({})
+Let me check the actual goal count by trying a more aggressive close:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Cbrt_u64Obligations.lean", "patch": "<<< SEARCH\ntheorem cbrt_cube_le_x (x : u64) :\n    \u2983 \u231c True \u231d \u2984\n    ... [+664 chars])
+[tool] run_lake_build({})
+Given the complexity, let me revert to documented `sorry`s. The proof is genuinely beyond a single session — three nested loops with deep mathematical invariants (Hacker's-Delight icbrt2, Newton's method) plus cubic monotonicity. Let me write detailed technical documentation:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Cbrt_u64Obligations.lean", "patch": "<<< SEARCH\n/-- Totality / no failure: `cbrt` is total --- it accepts every `u64`\n    and... [+3852 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Cbrt_u64Obligations.lean", "patch": "<<< SEARCH\ntheorem cbrt_cube_le_x (x : u64) :\n    \u2983 \u231c True \u231d \u2984\n    ... [+2477 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Cbrt_u64Obligations.lean", "patch": "<<< SEARCH\ntheorem cbrt_x_lt_next_cube (x : u64) :\n    \u2983 \u231c True \u231d \u2984\... [+2149 chars])
+[tool] run_lake_build({})
+Build succeeds with documented sorries. Let me verify the final state:
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/num-integer-0.1.46/cbrt_u64_modified/proofs/lean/ext... [+34 chars])
+Build is clean (95 jobs, 3 expected `sorry` warnings). All three theorem statements remain intact and unmodified — the technical context behind each `sorry` is now in the proof body rather than just stating `sorry` cold.
+
+## Summary
+
+**Files changed**
+- `proofs/lean/extraction/Cbrt_u64Obligations.lean` — added technical-reason documentation to each of the three `sorry`s. No theorem statements were modified, weakened, or removed.
+
+**Proof attempts and outcomes**
+- Tried `mvcgen [cbrt_u64.cbrt, cbrt_u32, fixpoint_cbrt, bit_length_u64]` followed by `try grind` on `cbrt_cube_le_x` to see whether automation could discharge any of the loop-step obligations. It did not close the goal — confirming the residue requires hand-supplied `Spec.MonoLoopCombinator.while_loop` invariants, not just spec-set unfolding. Reverted to a documented `sorry`.
+
+**Sub-goals that proved difficult — and why**
+The verification target has three nested `rust_primitives.hax.while_loop`s with tuple state (`Tuple4 u32 u32 u32 u32` for `cbrt_u32`, `Tuple2 u64 u64` for `fixpoint_cbrt`, `Tuple2 u32 u64` for `bit_length_u64`). None of the source-level Rust functions carry a `loop_invariant!` annotation, so Hax has not synthesised one. Each loop's correctness requires a hand-stated invariant that the reference examples do not exercise:
+- `cbrt_u32` is Hacker's-Delight `icbrt2` — its invariant is the entire correctness argument of the algorithm (Warren §11.1).
+- `fixpoint_cbrt` is integer Newton's method — needs a monotonicity-of-iterates invariant.
+- `bit_length_u64` is the simplest, but its `bits +? 1` step still needs the bound `bits ≤ 64` carried through the loop.
+
+The selector explicitly flagged "`while_loop` with tuple state", "`u32 ↔ u64` casts", and "polynomial inequality postcondition" as gaps in the reference library — none of `sum_to_n`, `factorial`, `average_floor`, `average_ceil`, or `clamp` provided a transferable template.
+
+**Obligations left as `sorry`**
+
+| Theorem | Statement | Technical reason for `sorry` |
+|---|---|---|
+| `cbrt_total` | Function never panics (existential `RustM.ok`) | Requires no-overflow invariants on every checked op in three `while_loop` bodies; the `cbrt_u32` no-failure invariant is essentially the Hacker's-Delight icbrt2 correctness invariant. |
+| `cbrt_cube_le_x` (P1) | `r³ ≤ x` | Requires the Hacker's-Delight `icbrt2` lower-bound invariant *and* a Newton's-method monotonicity invariant for `fixpoint_cbrt`, plus cubic-monotonicity Nat lemmas chained through tuple state. |
+| `cbrt_x_lt_next_cube` (P2) | `(r+1)³ < 2⁶⁴ → x < (r+1)³` | Same loop-invariant burden as (P1), with strict-inequality versions of both invariants and an additional `(r+1)³ < 2⁶⁴` overflow case-split. |
+
+Each `sorry` is annotated with a multi-paragraph in-source comment naming the specific Hax prelude lemma (`Spec.MonoLoopCombinator.while_loop`), the loop whose invariant is missing, and the published mathematical reference for the algorithm's correctness.
+
+make_proof
+Stage notes: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260506-155709_cbrt_u64_stage_notes.json

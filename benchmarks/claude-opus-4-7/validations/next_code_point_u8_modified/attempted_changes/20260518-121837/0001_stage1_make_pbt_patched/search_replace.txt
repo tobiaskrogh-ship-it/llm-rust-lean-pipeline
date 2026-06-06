@@ -1,0 +1,104 @@
+<<< SEARCH
+    #[test]
+    fn sequence_of_codepoints() {
+        let s = "Aé€😀".as_bytes();
+        let mut it = s.iter();
+        unsafe {
+            assert_eq!(next_code_point(&mut it), Some(0x41));
+            assert_eq!(next_code_point(&mut it), Some(0xE9));
+            assert_eq!(next_code_point(&mut it), Some(0x20AC));
+            assert_eq!(next_code_point(&mut it), Some(0x1F600));
+            assert_eq!(next_code_point(&mut it), None);
+        }
+    }
+}
+===
+    #[test]
+    fn sequence_of_codepoints() {
+        let s = "Aé€😀".as_bytes();
+        let mut it = s.iter();
+        unsafe {
+            assert_eq!(next_code_point(&mut it), Some(0x41));
+            assert_eq!(next_code_point(&mut it), Some(0xE9));
+            assert_eq!(next_code_point(&mut it), Some(0x20AC));
+            assert_eq!(next_code_point(&mut it), Some(0x1F600));
+            assert_eq!(next_code_point(&mut it), None);
+        }
+    }
+
+    // ----------------------------------------------------------------
+    // Property-based contract tests
+    //
+    // These are expressed as deterministic, domain-exhaustive checks
+    // (no external proptest dependency) so that they remain meaningful
+    // as downstream proof obligations.
+    // ----------------------------------------------------------------
+
+    /// Decode exactly one code point from the UTF-8 encoding of `c`.
+    /// Returns the decoded value and the number of bytes left unread.
+    fn decode_one(c: char) -> (Option<u32>, usize) {
+        let mut buf = [0u8; 4];
+        let encoded = c.encode_utf8(&mut buf);
+        let bytes = encoded.as_bytes();
+        let mut it = bytes.iter();
+        // SAFETY: `bytes` is the UTF-8 encoding of a `char`, hence valid UTF-8.
+        let cp = unsafe { next_code_point(&mut it) };
+        (cp, it.len())
+    }
+
+    /// Postcondition (core decode contract), checked over the *entire*
+    /// domain of Unicode scalar values (all `u32` for which `char::from_u32`
+    /// succeeds — every width and every range boundary, surrogates excluded):
+    ///
+    /// * the returned value equals the scalar value that was encoded, and
+    /// * the call consumes *exactly* the bytes of that encoding
+    ///   (iterator empty afterwards => not too few / not too many bytes read).
+    ///
+    /// This simultaneously pins the 1-, 2-, 3- and 4-byte branches and the
+    /// `utf8_first_byte` / `utf8_acc_cont_byte` reconstruction across the
+    /// full input space. A buggy implementation that returned any other
+    /// valid scalar, or that mis-counted continuation bytes, would fail.
+    #[test]
+    fn prop_roundtrip_every_scalar_value() {
+        for u in 0u32..=0x10_FFFF {
+            if let Some(c) = char::from_u32(u) {
+                let (cp, remaining) = decode_one(c);
+                assert_eq!(cp, Some(u), "decoded value mismatch for U+{u:04X}");
+                assert_eq!(
+                    remaining, 0,
+                    "did not consume the full encoding for U+{u:04X}"
+                );
+            }
+        }
+    }
+
+    /// Independent claim: iterator-advancement / resumption.
+    ///
+    /// Over a long buffer containing many code points of mixed widths,
+    /// successive calls yield exactly `s.chars()` (as `u32`), then `None`,
+    /// and stay `None`. This is *not* implied by the single-code-point
+    /// roundtrip above: it additionally pins that each call advances the
+    /// shared iterator by precisely one code point's UTF-8 width (no
+    /// over- or under-read into the following code point) and that the
+    /// `None` termination occurs exactly at end-of-input and is stable.
+    #[test]
+    fn prop_sequence_matches_chars_iterator() {
+        let sample = "\u{0}\u{1}A~\u{7F}\u{80}é\u{7FF}\u{800}€\u{D7FF}\
+                      \u{E000}\u{FFFF}\u{10000}😀\u{10FFFF}本語";
+        let big = sample.repeat(64);
+        let bytes = big.as_bytes();
+        let mut it = bytes.iter();
+        for expected in big.chars() {
+            // SAFETY: `bytes` comes from a `String`, hence valid UTF-8.
+            let cp = unsafe { next_code_point(&mut it) };
+            assert_eq!(cp, Some(expected as u32));
+        }
+        // Termination: exhausted exactly at the end...
+        let end = unsafe { next_code_point(&mut it) };
+        assert_eq!(end, None);
+        // ...and remains `None` on further calls.
+        let end_again = unsafe { next_code_point(&mut it) };
+        assert_eq!(end_again, None);
+    }
+}
+>>> REPLACE

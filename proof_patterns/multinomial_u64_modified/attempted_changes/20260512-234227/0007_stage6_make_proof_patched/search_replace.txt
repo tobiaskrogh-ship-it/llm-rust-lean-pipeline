@@ -1,0 +1,149 @@
+<<< SEARCH
+/-- `binomial(n, n) = RustM.ok 1` for every `n : u64`. After unfolding
+    `binomial`, the outer `(k >? n)` test is `pure false` (since `n > n`
+    is false), so we land in the else branch; the second test
+    `(k >? (n -? k))` is `pure (decide (n > 0))` (since `n - n = 0`,
+    no underflow), and the if-true branch sets `k_pick = n - n = 0`
+    while the if-false branch sets `k_pick = k = n`. With `k = n`, the
+    if-false branch only fires when `n = 0`, so `k_pick = 0` in *every*
+    case. Therefore `steps = 0` at the start of the inner `while_loop`,
+    and `binomial_empty_loop_value n` discharges the loop. -/
+private theorem binomial_diag (n : u64) :
+    multinomial_u64.binomial n n = RustM.ok 1 := by
+  /- Stuck sub-goal: After `unfold multinomial_u64.binomial` and
+     `unfold rust_primitives.hax.while_loop`, and after rewriting the
+     two `pure`-returning conditionals (`n >? n = pure false` and
+     `n -? n = pure 0`), the goal reduces to:
+        `if false = true then pure 0
+         else do let __do_lift ← n >? 0
+                 if __do_lift = true then while_loop … ⟨1,n,1,0⟩ … >>= pure ∘ _2
+                 else while_loop … ⟨1,n,1,n⟩ … >>= pure ∘ _2`
+     The `if false = true` collapses via `simp`. The remaining
+     case-split is on `decide (n > 0)`, and in BOTH cases `_3 = 0` at
+     the inner-loop init (because when the else branch fires, we have
+     `n = 0`, so the second init `⟨1, n, 1, n⟩ = ⟨1, 0, 1, 0⟩`).
+     `binomial_empty_loop_value` discharges each case.
+     The if-then-else inside the do-block does not commute cleanly with
+     a single `rw`; the second case needs Lean to *propagate* the
+     `decide (n > 0) = false` hypothesis (which implies `n = 0`) all
+     the way down to the inner-loop init so that `n` in the literal
+     `⟨1, n, 1, n⟩` rewrites to `0`. Discharging this requires a
+     `mvcgen`-style automated stepper inside the do-block or a manual
+     `Triple.bind` decomposition of the inner conditional.
+     Structural unblock: a small `Triple.bind_if` lemma stating
+        `⦃P⦄ (c >>= fun b => if b then x else y) ⦃Q⦄ ↔
+         (⦃P ∧ c = pure true⦄ x ⦃Q⦄ ∧ ⦃P ∧ c = pure false⦄ y ⦃Q⦄)`
+     would let the case-split feed straight into the per-branch
+     `binomial_empty_loop_value` application and close this in ~15 lines.
+     `binomialCond`, `binomialBody`, `binomialLoop`, `binomialEmptyInv`,
+     `binomial_empty_loop_triple`, and `binomial_empty_loop_value` are
+     all in scope above, ready to use for both branches. -/
+  sorry
+===
+/-- Helper: `n -? n = pure 0` for any `n : u64`. -/
+private theorem u64_sub_self (n : u64) : (n -? n : RustM u64) = pure (0 : u64) := by
+  show (rust_primitives.ops.arith.Sub.sub n n : RustM u64) = pure 0
+  show (if BitVec.usubOverflow n.toBitVec n.toBitVec then
+          (.fail .integerOverflow : RustM u64)
+        else pure (n - n)) = pure 0
+  have h_no_overflow : BitVec.usubOverflow n.toBitVec n.toBitVec = false := by
+    simp [BitVec.usubOverflow]
+  rw [h_no_overflow]
+  have h_nn : n - n = (0 : u64) := by
+    apply UInt64.toNat_inj.mp
+    rw [UInt64.toNat_sub_of_le' (le_refl n)]
+    simp
+  rw [h_nn]
+
+/-- Helper: `n >? n = pure false` for any `n : u64`. -/
+private theorem u64_gt_self (n : u64) : (n >? n : RustM Bool) = pure false := by
+  show rust_primitives.cmp.gt n n = pure false
+  show pure (decide (n > n)) = pure false
+  simp
+
+/-- `binomial(n, n) = RustM.ok 1` for every `n : u64`. The proof goes via
+    a Hoare triple, using `binomial_empty_loop_value` for the inner loop.
+
+    Outline:
+      1. Build the triple `⦃True⦄ binomial n n ⦃⇓ r => r = 1⦄`.
+      2. Convert to an equation via `RustM.Triple_iff_BitVec`. -/
+private theorem binomial_diag_triple (n : u64) :
+    ⦃⌜True⌝⦄ multinomial_u64.binomial n n ⦃⇓ r => ⌜r = (1 : u64)⌝⦄ := by
+  unfold multinomial_u64.binomial
+  -- After unfolding, the outer test (k >? n) becomes (n >? n) = pure false.
+  rw [u64_gt_self n]
+  simp only [pure_bind, Bool.false_eq_true, ↓reduceIte]
+  -- Now: ⦃True⦄ do { let k_pick ← (do let v ← n -? n; let c ← n >? v; if c then n -? n else pure n); ...; while_loop ... } ⦃r = 1⦄
+  -- Reduce (n -? n) = pure 0 (appears twice in the inner if-then-else)
+  rw [u64_sub_self n]
+  simp only [pure_bind]
+  -- Now: ⦃True⦄ do { let k_pick ← (do let c ← n >? 0; if c then pure 0 else pure n); ...; while_loop ... } ⦃r = 1⦄
+  -- Reduce (n >? 0) = pure (decide (n.toNat > 0))
+  have h_gt_zero : (n >? (0 : u64) : RustM Bool) = pure (decide (n.toNat > 0)) := by
+    show rust_primitives.cmp.gt n 0 = pure (decide (n.toNat > 0))
+    show pure (decide (n > (0 : u64))) = pure (decide (n.toNat > 0))
+    congr 1
+    rw [UInt64.lt_iff_toNat_lt]
+    rfl
+  rw [h_gt_zero]
+  simp only [pure_bind]
+  -- Now we have: ⦃True⦄ (if decide (n.toNat > 0) then pure 0 else pure n) >>= fun k_pick => ... while_loop ⟨1, n, 1, k_pick⟩ ... ⦃r = 1⦄
+  -- Case split on whether n > 0
+  by_cases hn : n.toNat > 0
+  · -- n > 0 case: k_pick = 0
+    rw [show decide (n.toNat > 0) = true from decide_eq_true hn]
+    simp only [↓reduceIte, pure_bind]
+    -- Goal: ⦃True⦄ (while_loop ... ⟨1, n, 1, 0⟩ ...) >>= fun s => pure s._2 ⦃r = 1⦄
+    -- This is exactly binomial_empty_loop_value bound to pure.
+    show ⦃⌜True⌝⦄
+        (binomialLoop ⟨(1 : u64), n, (1 : u64), (0 : u64)⟩ >>=
+          fun s => match s with | ⟨_, _, r, _⟩ => pure r)
+        ⦃⇓ r => ⌜r = (1 : u64)⌝⦄
+    apply Triple.bind _ _ (binomial_empty_loop_value n)
+    intro s
+    cases s with
+    | mk d n_var r steps =>
+      refine Triple.pure r ?_
+      intro hr; exact hr
+  · -- n = 0 case: k_pick = n, but n = 0
+    push_neg at hn
+    have hn_eq : n.toNat = 0 := Nat.le_zero.mp hn
+    have hn0 : n = 0 := by
+      apply UInt64.toNat_inj.mp; rw [hn_eq]; rfl
+    rw [show decide (n.toNat > 0) = false from decide_eq_false (by omega)]
+    simp only [↓reduceIte, pure_bind]
+    -- Goal: ⦃True⦄ (while_loop ... ⟨1, n, 1, n⟩ ...) >>= fun s => pure s._2 ⦃r = 1⦄
+    -- After hn0, the init becomes ⟨1, 0, 1, 0⟩.
+    rw [hn0]
+    show ⦃⌜True⌝⦄
+        (binomialLoop ⟨(1 : u64), (0 : u64), (1 : u64), (0 : u64)⟩ >>=
+          fun s => match s with | ⟨_, _, r, _⟩ => pure r)
+        ⦃⇓ r => ⌜r = (1 : u64)⌝⦄
+    apply Triple.bind _ _ (binomial_empty_loop_value 0)
+    intro s
+    cases s with
+    | mk d n_var r steps =>
+      refine Triple.pure r ?_
+      intro hr; exact hr
+
+private theorem binomial_diag (n : u64) :
+    multinomial_u64.binomial n n = RustM.ok 1 := by
+  have h := binomial_diag_triple n
+  rw [RustM.Triple_iff_BitVec] at h
+  simp only [decide_true, Bool.not_true, Bool.false_or,
+             Bool.and_eq_true, decide_eq_true_eq] at h
+  obtain ⟨hok, hval⟩ := h
+  cases hf : multinomial_u64.binomial n n with
+  | none =>
+    rw [hf] at hok
+    simp [RustM.toBVRustM] at hok
+  | some result =>
+    cases result with
+    | ok v =>
+      rw [hf] at hval
+      simp [RustM.toBVRustM] at hval
+      exact congrArg RustM.ok hval
+    | error e =>
+      rw [hf] at hok
+      cases e <;> simp [RustM.toBVRustM] at hok
+>>> REPLACE

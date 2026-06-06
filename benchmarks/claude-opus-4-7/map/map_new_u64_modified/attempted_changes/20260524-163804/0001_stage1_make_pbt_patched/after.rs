@@ -1,0 +1,162 @@
+//! Extracted from `core::iter::adapters::map::Map::new`.
+//!
+//! Original:
+//! ```ignore
+//! pub(in crate::iter) fn new(iter: I, f: F) -> Map<I, F> {
+//!     Map { iter, f }
+//! }
+//! ```
+//!
+//! Monomorphized with `I = core::ops::Range<u64>` and `F = fn(u64) -> u64`.
+
+use core::ops::Range;
+
+/// Concrete monomorphization of `core::iter::adapters::map::Map<I, F>`.
+#[derive(Clone)]
+pub struct Map {
+    pub iter: Range<u64>,
+    pub f: fn(u64) -> u64,
+}
+
+impl Map {
+    /// Construct a new `Map` wrapping `iter` with mapper `f`.
+    pub fn new(iter: Range<u64>, f: fn(u64) -> u64) -> Map {
+        Map { iter, f }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---------- existing source-style tests ----------
+
+    fn plus3(x: u64) -> u64 {
+        x + 3
+    }
+
+    #[test]
+    fn map_new_stores_fields() {
+        let m = Map::new(0..10, plus3);
+        assert_eq!(m.iter, 0..10);
+        assert_eq!((m.f)(4), 7);
+    }
+
+    #[test]
+    fn map_new_round_trip() {
+        // Mirror the construction shape used in `test_double_ended_map`:
+        //   xs.iter().map(|&x| x * -1)
+        // Adapted to a Range<u64> source and a u64-safe mapper.
+        let m = Map::new(1..7, |x| x * 2);
+        let collected: Vec<u64> = m.iter.map(m.f).collect();
+        assert_eq!(collected, vec![2, 4, 6, 8, 10, 12]);
+    }
+
+    // ---------- property-based tests ----------
+    //
+    // `Map::new` is a pure two-field constructor. Its contract has exactly
+    // two independent postconditions:
+    //
+    //   (P1) the stored `iter` equals the input `iter` (bit-for-bit: both
+    //        `start` and `end` are preserved, including degenerate ranges
+    //        where `start >= end`);
+    //   (P2) the stored `f` is the same function pointer as the input `f`
+    //        (equivalently, it produces the same output as `f` on every
+    //        `u64` input).
+    //
+    // There are no preconditions and no failure modes — the function is
+    // total and infallible. We do not test:
+    //   * extensional facts about *what* the mapper computes (e.g. that
+    //     `Map::new(.., |x| x*x)` preserves parity) — those are facts about
+    //     multiplication, not about `Map::new`;
+    //   * iteration semantics (`Iterator::next`, `size_hint`, etc.) — they
+    //     belong to the trait impls, not to the constructor;
+    //   * `Clone` behaviour — not exercised by `new`.
+
+    // Sample mappers chosen to be distinct as function pointers.
+    fn id(x: u64) -> u64 { x }
+    fn double(x: u64) -> u64 { x.wrapping_mul(2) }
+    fn const_zero(_x: u64) -> u64 { 0 }
+    fn shift(x: u64) -> u64 { x.wrapping_add(0xDEAD_BEEF) }
+
+    /// (P1) `iter` field is preserved verbatim across a grid of ranges,
+    /// including empty, singleton, and max-value boundaries.
+    #[test]
+    fn prop_iter_field_preserved() {
+        let boundaries: [u64; 7] = [
+            0,
+            1,
+            2,
+            42,
+            1_000,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for &s in &boundaries {
+            for &e in &boundaries {
+                let r = s..e;
+                let m = Map::new(r.clone(), id);
+                assert_eq!(m.iter.start, s, "start lost for {}..{}", s, e);
+                assert_eq!(m.iter.end, e, "end lost for {}..{}", s, e);
+                assert_eq!(m.iter, r, "range lost for {}..{}", s, e);
+            }
+        }
+    }
+
+    /// (P2) The stored `f` agrees with the input `f` on every probed input.
+    /// Probed over several distinct mappers and a grid of `u64` values that
+    /// includes the boundaries `0` and `u64::MAX`.
+    #[test]
+    fn prop_f_field_behaves_identically() {
+        let mappers: [fn(u64) -> u64; 4] = [id, double, const_zero, shift];
+        let probes: [u64; 8] = [
+            0,
+            1,
+            2,
+            7,
+            123_456_789,
+            u64::MAX / 2,
+            u64::MAX - 1,
+            u64::MAX,
+        ];
+        for &f in &mappers {
+            let m = Map::new(0..1, f);
+            for &x in &probes {
+                assert_eq!((m.f)(x), f(x), "mapper diverged at x = {}", x);
+            }
+        }
+    }
+
+    /// (P2, stronger form) The stored `f` is the *same* function pointer as
+    /// the input — not merely an extensionally-equal function. This rules
+    /// out implementations that, e.g., wrap the input in a thunk.
+    #[test]
+    fn prop_f_field_is_same_pointer() {
+        let mappers: [fn(u64) -> u64; 4] = [id, double, const_zero, shift];
+        for &f in &mappers {
+            let m = Map::new(0..0, f);
+            assert_eq!(m.f as usize, f as usize, "function pointer rebound");
+        }
+    }
+
+    /// (P1 × P2) The two fields are independent: varying one does not
+    /// disturb the other. A buggy implementation that, say, swapped fields
+    /// or stored a default range would be caught here.
+    #[test]
+    fn prop_fields_independent() {
+        let ranges: [Range<u64>; 4] = [
+            0..0,
+            0..1,
+            5..10,
+            (u64::MAX - 3)..u64::MAX,
+        ];
+        let mappers: [fn(u64) -> u64; 4] = [id, double, const_zero, shift];
+        for r in &ranges {
+            for &f in &mappers {
+                let m = Map::new(r.clone(), f);
+                assert_eq!(m.iter, *r);
+                assert_eq!(m.f as usize, f as usize);
+            }
+        }
+    }
+}

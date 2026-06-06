@@ -1,0 +1,101 @@
+-- Companion obligations file for the `clever_049_fibfib` extraction.
+-- Each property the Rust function should satisfy belongs here as a separate `theorem`.
+-- Proofs use `sorry` placeholders at this stage; they are filled in by the proof stage.
+
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+import clever_049_fibfib
+
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+
+namespace Clever_049_fibfibObligations
+
+/-! ## Base cases — unit pins (from the `base_cases` Rust test)
+
+The Rust `base_cases` test asserts seven specific seed values:
+`fibfib(0) = 0`, `fibfib(1) = 0`, `fibfib(2) = 1`, `fibfib(3) = 1`,
+`fibfib(4) = 2`, `fibfib(5) = 4`, `fibfib(6) = 7`. Each is one
+independent contract clause; together they pin the seed of the 3-window
+sliding recurrence and forbid trivial (all-zero or shifted)
+implementations from satisfying the rest of the contract. `fibfib_at`
+is defined via `partial_fixpoint`, but the function is computable
+end-to-end, so each unit pin is in principle dischargeable by
+`native_decide` evaluating the fixpoint kernel by kernel (as in the
+`clever_045_fib4` and `clever_038_prime_fib` references). -/
+
+theorem fibfib_at_zero :
+    clever_049_fibfib.fibfib (0 : i64) = RustM.ok (0 : i64) := by
+  sorry
+
+theorem fibfib_at_one :
+    clever_049_fibfib.fibfib (1 : i64) = RustM.ok (0 : i64) := by
+  sorry
+
+theorem fibfib_at_two :
+    clever_049_fibfib.fibfib (2 : i64) = RustM.ok (1 : i64) := by
+  sorry
+
+theorem fibfib_at_three :
+    clever_049_fibfib.fibfib (3 : i64) = RustM.ok (1 : i64) := by
+  sorry
+
+theorem fibfib_at_four :
+    clever_049_fibfib.fibfib (4 : i64) = RustM.ok (2 : i64) := by
+  sorry
+
+theorem fibfib_at_five :
+    clever_049_fibfib.fibfib (5 : i64) = RustM.ok (4 : i64) := by
+  sorry
+
+theorem fibfib_at_six :
+    clever_049_fibfib.fibfib (6 : i64) = RustM.ok (7 : i64) := by
+  sorry
+
+/-! ## Negative-input sentinel (from `negative_inputs_are_zero`)
+
+The `negative_inputs_are_zero` proptest asserts `fibfib(n) = 0` for
+every `n < 0`. This is the function's "out-of-domain" sentinel branch
+in the public wrapper and is independent of any property of the
+tail-recursive worker. The Lean statement universally quantifies over
+all `i64` values with `n.toInt < 0`, which strictly contains the
+proptest's range `i64::MIN ..= -1`. -/
+
+theorem fibfib_negative_returns_zero (n : i64) (h : n.toInt < 0) :
+    clever_049_fibfib.fibfib n = RustM.ok (0 : i64) := by
+  sorry
+
+/-! ## Linear recurrence on the safe nonneg range (from
+    `recurrence_on_nonneg_range`)
+
+The `recurrence_on_nonneg_range` proptest asserts, for `n ∈ [3, 60]`:
+`fibfib(n) = fibfib(n-1) + fibfib(n-2) + fibfib(n-3)`.
+
+The upper bound `n ≤ 60` keeps every intermediate value well below the
+i64 overflow threshold (`fibfib` grows ≈ 1.84^n; i64 fits up to roughly
+`n = 75`). Outside this range Rust wrapping i64 addition would diverge
+from the integer addition the test pretends to compute, so the
+universal `.toInt` formulation is only honest on the safe range — the
+precondition `n.toInt ≤ 60` is the strongest tight bound consistent
+with the i64 model, not test-domain mimicry.
+
+We package the recurrence as: in the safe range, all four `fibfib`
+calls (`n`, `n-1`, `n-2`, `n-3`) succeed and the integer-valued result
+satisfies the additive identity on `.toInt`. -/
+
+theorem fibfib_recurrence
+    (n : i64) (h_lo : 3 ≤ n.toInt) (h_hi : n.toInt ≤ 60) :
+    ∃ v vm1 vm2 vm3 : i64,
+      clever_049_fibfib.fibfib n       = RustM.ok v ∧
+      clever_049_fibfib.fibfib (n - 1) = RustM.ok vm1 ∧
+      clever_049_fibfib.fibfib (n - 2) = RustM.ok vm2 ∧
+      clever_049_fibfib.fibfib (n - 3) = RustM.ok vm3 ∧
+      v.toInt = vm1.toInt + vm2.toInt + vm3.toInt := by
+  sorry
+
+end Clever_049_fibfibObligations

@@ -1,0 +1,85 @@
+-- Companion obligations file for the `clever_004_mean_absolute_deviation` extraction.
+-- Each property the Rust function should satisfy belongs here as a separate `theorem`.
+-- Proofs use `sorry` placeholders at this stage; they are filled in by the proof stage.
+
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+import clever_004_mean_absolute_deviation
+
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+
+namespace Clever_004_mean_absolute_deviationObligations
+
+/-! ## Integer-valued MAD specification
+
+To state functional correctness independently of the recursive
+implementation, we define the mean-absolute-deviation computation in `Int`
+so the spec itself cannot overflow. The shape mirrors the iterative
+`reference_mad` in the Rust source's `tests` module: sum the elements,
+divide by `n` (truncating toward zero, matching `i64 /`), sum the absolute
+deviations, divide by `n` again. -/
+
+/-- Integer-valued slice sum: `slice_sum_int s = Σᵢ s.val[i].toInt`. -/
+private def slice_sum_int (s : RustSlice i64) : Int :=
+  s.val.foldl (init := (0 : Int)) (fun acc x => acc + x.toInt)
+
+/-- Integer-valued slice sum of absolute deviations from a chosen mean. -/
+private def slice_abs_dev_sum_int (s : RustSlice i64) (mean : Int) : Int :=
+  s.val.foldl (init := (0 : Int))
+    (fun acc x => acc + ((x.toInt - mean).natAbs : Int))
+
+/-- Integer-valued MAD: matches the Rust `reference_mad`, using `Int`
+    truncating division (which agrees with Rust `i64 /` for the divisor
+    `n = size`, since `n` is a non-negative `Nat` cast). -/
+private def mad_int (s : RustSlice i64) : Int :=
+  let n : Int := (s.val.size : Int)
+  if n = 0 then 0
+  else
+    let mean := slice_sum_int s / n
+    slice_abs_dev_sum_int s mean / n
+
+/-! ## Contract obligations -/
+
+/-- Empty-slice postcondition.
+
+    Corresponds to the unit test `empty_returns_zero`:
+    `mean_absolute_deviation(&[]) == 0`. Calling on an empty slice is
+    a valid call (no panic) and returns 0. -/
+theorem mean_absolute_deviation_empty (s : RustSlice i64) (hempty : s.val.size = 0) :
+    clever_004_mean_absolute_deviation.mean_absolute_deviation s = RustM.ok 0 := by
+  sorry
+
+/-- Functional-correctness postcondition.
+
+    Corresponds to the proptest `matches_reference_formula`:
+    whenever `mean_absolute_deviation` returns successfully, the
+    returned `i64` equals the integer-valued MAD spec (i.e. it agrees
+    with the iterative `reference_mad`). The "returns successfully"
+    hypothesis encodes the proptest's bounded-input regime, which is
+    chosen precisely so no intermediate sum overflows. -/
+theorem mean_absolute_deviation_matches_spec (s : RustSlice i64) (r : i64)
+    (h : clever_004_mean_absolute_deviation.mean_absolute_deviation s = RustM.ok r) :
+    r.toInt = mad_int s := by
+  sorry
+
+/-- Non-negativity postcondition.
+
+    Corresponds to the proptest `result_is_non_negative`:
+    whenever `mean_absolute_deviation` returns successfully, the
+    returned `i64` is non-negative. Stated as a separate, independent
+    semantic claim (per the Rust test's own comment): an average of
+    absolute values is always ≥ 0, but integer-truncating division on
+    a possibly negative dividend makes this non-trivial to read off
+    from functional correctness, so it gets its own theorem. -/
+theorem mean_absolute_deviation_non_negative (s : RustSlice i64) (r : i64)
+    (h : clever_004_mean_absolute_deviation.mean_absolute_deviation s = RustM.ok r) :
+    0 ≤ r.toInt := by
+  sorry
+
+end Clever_004_mean_absolute_deviationObligations

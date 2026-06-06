@@ -1,0 +1,117 @@
+<<< SEARCH
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // No test for `as_mut_slice` exists in the source crate; minimal test.
+    #[test]
+    fn it_works() {
+        let mut arr: [u64; 3] = [1, 2, 3];
+        {
+            let s: &mut [u64] = as_mut_slice(&mut arr);
+            assert_eq!(s, &mut [1, 2, 3]);
+            s[1] = 20;
+        }
+        assert_eq!(arr, [1, 20, 3]);
+
+        let mut empty: [u64; 0] = [];
+        assert_eq!(as_mut_slice(&mut empty), &mut [] as &mut [u64]);
+    }
+}
+===
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Simple deterministic LCG so the suite exercises many distinct array
+    // contents (including the edge values 0 and u64::MAX) without an external
+    // property-testing crate.
+    fn fill<const N: usize>(seed: u64) -> [u64; N] {
+        let mut a = [0u64; N];
+        let mut s = seed;
+        for slot in a.iter_mut() {
+            s = s.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            // Bias toward boundary values occasionally to cover edges.
+            *slot = match s % 7 {
+                0 => 0,
+                1 => u64::MAX,
+                _ => s,
+            };
+        }
+        a
+    }
+
+    // Postcondition (length): the returned slice spans the whole array, so its
+    // length equals N. Checked across several N including the empty array.
+    #[test]
+    fn prop_length_equals_n() {
+        let mut a0: [u64; 0] = fill(1);
+        assert_eq!(as_mut_slice(&mut a0).len(), 0);
+
+        let mut a1: [u64; 1] = fill(2);
+        assert_eq!(as_mut_slice(&mut a1).len(), 1);
+
+        let mut a5: [u64; 5] = fill(3);
+        assert_eq!(as_mut_slice(&mut a5).len(), 5);
+
+        let mut a64: [u64; 64] = fill(4);
+        assert_eq!(as_mut_slice(&mut a64).len(), 64);
+    }
+
+    // Postcondition (elements): the slice contains exactly the array's elements
+    // in the same order. A reordering / sub-slicing / zeroing bug is caught.
+    #[test]
+    fn prop_elements_match_in_order() {
+        for seed in 0..50u64 {
+            let mut a: [u64; 8] = fill(seed.wrapping_add(11));
+            let expected = a;
+            let s = as_mut_slice(&mut a);
+            assert_eq!(s.len(), expected.len());
+            for i in 0..expected.len() {
+                assert_eq!(s[i], expected[i]);
+            }
+        }
+    }
+
+    // Postcondition (aliasing): the result is a mutable VIEW of the same
+    // storage, not a copy. Writing through the slice at index i must change the
+    // array at exactly index i and leave every other element untouched.
+    // A copy-returning bug or a misaligned-view bug is caught.
+    #[test]
+    fn prop_mutation_writes_through() {
+        for seed in 0..40u64 {
+            let mut a: [u64; 6] = fill(seed.wrapping_add(101));
+            let original = a;
+
+            for i in 0..original.len() {
+                let mut a = a;
+                let new_val = original[i] ^ 0x5555_5555_5555_5555;
+                {
+                    let s = as_mut_slice(&mut a);
+                    s[i] = new_val;
+                }
+                // Index i observes the write...
+                assert_eq!(a[i], new_val);
+                // ...and no other index changed.
+                for j in 0..original.len() {
+                    if j != i {
+                        assert_eq!(a[j], original[j]);
+                    }
+                }
+            }
+
+            // Overwriting the whole slice and dropping it leaves the array
+            // holding exactly those written values, in order.
+            {
+                let s = as_mut_slice(&mut a);
+                for i in 0..s.len() {
+                    s[i] = (i as u64).wrapping_mul(7).wrapping_add(3);
+                }
+            }
+            for i in 0..a.len() {
+                assert_eq!(a[i], (i as u64).wrapping_mul(7).wrapping_add(3));
+            }
+        }
+    }
+}
+>>> REPLACE

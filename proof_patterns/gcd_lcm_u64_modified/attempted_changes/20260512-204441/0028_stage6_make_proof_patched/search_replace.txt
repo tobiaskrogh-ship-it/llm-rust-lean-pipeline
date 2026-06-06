@@ -1,0 +1,107 @@
+<<< SEARCH
+/-- Stein's binary GCD correctness for `gcd_lcm_u64.gcd`.
+
+    **Progress in this pass**:
+    1. Zero-input branches (`x = 0` or `y = 0`): closed inline. The inner
+       `if (m == 0 || n == 0)` short-circuits and the function returns
+       `m ||| n` without entering any loop.
+    2. Both-nonzero branch: opened up. After `unfold gcd_lcm_u64.gcd` and
+       `simp only` reducing the outer if to its else branch via `hxbeq`
+       and `hybeq` (both proving `(x == 0) = false`, `(y == 0) = false`),
+       the residual goal exposes the inner structure: three
+       `trailing_zeros_u64` calls (each itself a `rust_primitives.hax.while_loop`
+       on a `⟨count, y⟩` state), an outer Stein's subtract-and-shift
+       `while_loop`, and a final `m <<<? shift`.
+
+    **Specific stuck sub-goal in this pass (the surviving `sorry`)**:
+    After the simp-only collapse above, the goal is
+
+    ```lean
+    (do
+      let shift ← trailing_zeros_u64 (x ||| y)
+      let m ← x >>>? (← trailing_zeros_u64 x)
+      let n ← y >>>? (← trailing_zeros_u64 y)
+      let ⟨m, n⟩ ← rust_primitives.hax.while_loop … ⟨m,n⟩ … (subtract-and-shift body)
+      m <<<? shift)
+    = RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat))
+    ```
+
+    This needs five chained Hoare-triple proofs (four `trailing_zeros_u64`
+    calls, one outer Stein's loop), each with its own invariant and
+    termination measure, then assembled via `Triple.bind` and converted to
+    the equation form via `RustM.Triple_iff_BitVec` (the canonical two-stage
+    pattern from `while_example/README.md`). The Nat-level reduction
+    helpers `nat_gcd_sub_left_eq`, `nat_gcd_sub_right_eq`, `nat_gcd_two_mul`,
+    `nat_gcd_two_mul_odd`, and `nat_gcd_pow_two_mul` (defined above) are the
+    body-step facts each loop will consume.
+
+    **Structural unblock**: a separately-proved
+    `proof_patterns/stein_gcd_u64` pattern (targeting exactly this nested-
+    loop shape) would close the remaining sorry. Specifically, it needs to
+    add to the proof library:
+    - `trailing_zeros_u64_triple : ⦃⌜x ≠ 0⌝⦄ trailing_zeros_u64 x
+        ⦃⇓ r => ⌜x.toNat = (x.toNat >>> r.toNat) * 2 ^ r.toNat ∧ …⌝⦄`
+      with invariant on `⟨count, y⟩` that `count.toNat ≤ 63` and
+      `x.toNat = y.toNat * 2 ^ count.toNat`.
+    - `gcd_inner_loop_triple` with invariant
+      `Nat.gcd m.toNat n.toNat = Nat.gcd (x.toNat >>> tz x.toNat) (y.toNat >>> tz y.toNat)`
+      and termination measure `m.toNat + n.toNat`.
+    - The closing assembly via `nat_gcd_pow_two_mul` (above) for the
+      `m <<< shift` final step. -/
+===
+/-- Stein's binary GCD correctness for `gcd_lcm_u64.gcd`.
+
+    **Progress in this pass (attempt 3)**:
+    1. Zero-input branches (`x = 0` or `y = 0`): closed inline. The inner
+       `if (m == 0 || n == 0)` short-circuits and the function returns
+       `m ||| n` without entering any loop.
+    2. Both-nonzero branch: restructured via Hoare-triple decomposition
+       (`suffices` + `RustM.Triple_iff_BitVec`), then `mvcgen` is invoked
+       on the function body to break Stein's binary GCD into individual
+       Hoare-triple verification conditions. The `Triple_iff_BitVec` half
+       (converting the triple back into the equational form) is fully
+       written out following the `while_example.modulo_via_subtraction_postcondition`
+       pattern; only the per-VC body-step proofs remain.
+
+    **Specific stuck sub-goals in this pass (the surviving `sorry`s under
+    `all_goals first | … | sorry`)**:
+    After `mvcgen` runs through the function body, the residual verification
+    conditions are:
+    - For each of the three `trailing_zeros_u64` calls: the body-step VC
+      `⦃count.toNat ≤ 63 ∧ x.toNat = y.toNat * 2^count.toNat ∧ y &&& 1 = 0⌝
+         body ⟨count, y⟩
+        ⦃⇓ r => ⌜termination decreases ∧ invariant preserved⌝⦄`, which
+      needs `UInt64.toNat_shiftRight` + `Nat.shiftRight_eq_div_pow` + the
+      fact `y &&& 1 = 0 → y.toNat = 2 * (y.toNat >>> 1)` (latter NOT in
+      the Hax prelude; would have to be developed from
+      `Nat.and_one_eq_zero_iff_div_two` or via `BitVec.getLsbD`).
+    - For the outer Stein subtract-and-shift loop: the body-step VC needs
+      `nat_gcd_sub_left_eq` / `nat_gcd_sub_right_eq` (defined above) plus
+      a chained `nat_gcd_two_mul_odd` after the post-subtraction
+      `trailing_zeros_u64` shift, plus the no-underflow side-condition
+      from the `if m > n` branch.
+    - For the final `m <<<? shift`: the no-overflow VC needs the bound
+      `shift.toNat ≤ 63` (derivable from `trailing_zeros_u64_le_63`)
+      together with the resulting equality `m.toNat * 2^shift.toNat =
+      Nat.gcd x.toNat y.toNat`, proved via `nat_gcd_pow_two_mul`
+      (defined above).
+
+    **Structural unblock**: a separately-verified
+    `proof_patterns/stein_gcd_u64` pattern (targeting exactly this nested-
+    loop shape) would close the remaining sorries. Specifically, it needs
+    to add to the proof library:
+    - `trailing_zeros_u64_triple : ⦃⌜x ≠ 0⌝⦄ trailing_zeros_u64 x
+        ⦃⇓ r => ⌜r.toNat ≤ 63 ∧ x.toNat = (x.toNat >>> r.toNat) * 2 ^ r.toNat⌝⦄`
+      with invariant on `⟨count, y⟩` that `count.toNat ≤ 63` and
+      `x.toNat = y.toNat * 2 ^ count.toNat`.
+    - `gcd_inner_loop_triple` with invariant
+      `Nat.gcd m.toNat n.toNat = Nat.gcd (x.toNat >>> tz x.toNat) (y.toNat >>> tz y.toNat)`
+      and termination measure `m.toNat + n.toNat`.
+    - The closing assembly via `nat_gcd_pow_two_mul` (above) for the
+      `m <<< shift` final step.
+
+    See the Hax blog post `docs/blog/posts/rust-gcd-1.md` in the Hax package
+    for the corresponding F*/Verus/Aeneas proof structure of the same
+    algorithm — they all axiomatize `trailing_zeros` and rely on
+    SMT-pat-driven specs that the Lean infrastructure does not yet provide. -/
+>>> REPLACE

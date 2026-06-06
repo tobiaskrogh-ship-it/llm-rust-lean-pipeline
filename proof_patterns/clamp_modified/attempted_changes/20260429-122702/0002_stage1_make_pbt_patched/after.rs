@@ -1,0 +1,46 @@
+pub fn clamp(x: u8, lo: u8, hi: u8) -> u8 {
+    if x < lo { lo } else if x > hi { hi } else { x }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // Postcondition: when x is below the lower bound, clamp returns lo.
+        #[test]
+        fn returns_lo_when_below(
+            lo in 1u8..=255u8,          // lo >= 1 so x < lo is reachable
+            hi in 0u8..=255u8,
+            x in 0u8..=255u8,
+        ) {
+            prop_assume!(lo <= hi);
+            prop_assume!(x < lo);
+            prop_assert_eq!(clamp(x, lo, hi), lo);
+        }
+
+        // Postcondition: when x is above the upper bound, clamp returns hi.
+        #[test]
+        fn returns_hi_when_above(
+            lo in 0u8..=255u8,
+            hi in 0u8..=254u8,          // hi <= 254 so x > hi is reachable
+            x in 0u8..=255u8,
+        ) {
+            prop_assume!(lo <= hi);
+            prop_assume!(x > hi);
+            prop_assert_eq!(clamp(x, lo, hi), hi);
+        }
+
+        // Postcondition: when x is already within [lo, hi], clamp returns x unchanged.
+        #[test]
+        fn returns_x_when_in_range(
+            lo in 0u8..=255u8,
+            hi in 0u8..=255u8,
+            x in 0u8..=255u8,
+        ) {
+            prop_assume!(lo <= x && x <= hi);
+            prop_assert_eq!(clamp(x, lo, hi), x);
+        }
+    }
+}

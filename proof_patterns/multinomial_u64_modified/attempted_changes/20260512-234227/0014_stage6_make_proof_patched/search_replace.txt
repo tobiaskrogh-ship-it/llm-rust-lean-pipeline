@@ -1,0 +1,215 @@
+<<< SEARCH
+/-- Postcondition (boundary): every singleton slice returns `1`. -/
+theorem multinomial_singleton
+    (k : RustSlice u64) (n : u64) (h : k.val = #[n]) :
+    multinomial_u64.multinomial k = RustM.ok 1 := by
+  /- Stuck sub-goal: After driving the outer `while_loop` through exactly
+     one iteration (where `idx = 0`, `remaining = 1`), the body executes
+     `r ← 1 *? (← binomial 0 n) = 1 *? (← binomial(n, n) after p := 0+n)`,
+     and we need `binomial n n = RustM.ok 1` to discharge that branch.
+     The helper `binomial_diag` above states this exact fact but is
+     itself left as `sorry`.
+     Structural unblock: (1) closing `binomial_diag` (an instance of the
+     same empty-loop pattern as `outer_empty_loop_triple`) plus (2) a
+     one-iteration variant of `outer_empty_loop_triple` that takes the
+     body's `RustM.ok` postcondition as a hypothesis — together these
+     close the singleton case in ~30 lines following the gcd_while
+     template. -/
+  sorry
+===
+/-! ## Singleton case infrastructure
+
+The outer loop runs through exactly one iteration. We use a two-point
+invariant `s = init ∨ s = afterOne` and let the body step compute
+deterministically. -/
+
+/-- Two-point invariant: state is either the initial `⟨0,0,1,1⟩` or the
+    post-iteration `⟨1, n, 1, 0⟩`. -/
+private def singletonInv (n : u64) (s : Tuple4 usize u64 u64 usize) : Prop :=
+  s = ⟨(0 : usize), (0 : u64), (1 : u64), (1 : usize)⟩ ∨
+  s = ⟨(1 : usize), n, (1 : u64), (0 : usize)⟩
+
+/-- The deterministic computation of one body iteration on the initial state. -/
+private theorem singleton_body_init_step
+    (k : RustSlice u64) (n : u64) (h : k.val = #[n]) :
+    outerBody k ⟨(0 : usize), (0 : u64), (1 : u64), (1 : usize)⟩ =
+    pure ⟨(1 : usize), n, (1 : u64), (0 : usize)⟩ := by
+  -- 1) k[0]_? reduces to pure n using h
+  have h_idx : (k[(0 : usize)]_? : RustM u64) = pure n := by
+    show (if hh : USize64.toNat (0 : usize) < k.val.size then pure (k.val[(0 : usize)])
+          else .fail .arrayOutOfBounds) = pure n
+    have h_bound : USize64.toNat (0 : usize) < k.val.size := by
+      rw [h]; decide
+    rw [dif_pos h_bound]
+    apply congrArg pure
+    rw [h]
+    rfl
+  -- 2) (0 +? n) = pure n  (since 0 + n = n always)
+  have h_add0n : ((0 : u64) +? n : RustM u64) = pure n := by
+    show (rust_primitives.ops.arith.Add.add (0 : u64) n : RustM u64) = pure n
+    show (if BitVec.uaddOverflow (0 : u64).toBitVec n.toBitVec then
+            (.fail .integerOverflow : RustM u64)
+          else pure ((0 : u64) + n)) = pure n
+    have h_no : BitVec.uaddOverflow (0 : u64).toBitVec n.toBitVec = false := by
+      simp [BitVec.uaddOverflow]
+    rw [h_no]
+    have : (0 : u64) + n = n := by
+      apply UInt64.toNat_inj.mp
+      rw [UInt64.toNat_add_of_lt (by simp)]
+      simp
+    rw [this]
+  -- 3) (1 *? 1) = pure 1  (since 1*1 = 1 always, no overflow)
+  have h_mul11 : ((1 : u64) *? (1 : u64) : RustM u64) = pure 1 := by
+    show (rust_primitives.ops.arith.Mul.mul (1 : u64) 1 : RustM u64) = pure 1
+    show (if BitVec.umulOverflow (1 : u64).toBitVec (1 : u64).toBitVec then
+            (.fail .integerOverflow : RustM u64)
+          else pure ((1 : u64) * 1)) = pure 1
+    have h_no : BitVec.umulOverflow (1 : u64).toBitVec (1 : u64).toBitVec = false := by
+      decide
+    rw [h_no]
+    rfl
+  -- 4) (0 +? 1 : usize) = pure 1
+  have h_idx_inc : ((0 : usize) +? (1 : usize) : RustM usize) = pure (1 : usize) := by
+    show (rust_primitives.ops.arith.Add.add (0 : usize) (1 : usize) : RustM usize) = pure 1
+    show (if BitVec.uaddOverflow (0 : usize).toBitVec (1 : usize).toBitVec then
+            (.fail .integerOverflow : RustM usize)
+          else pure ((0 : usize) + 1)) = pure 1
+    have h_no : BitVec.uaddOverflow (0 : usize).toBitVec (1 : usize).toBitVec = false := by
+      decide
+    rw [h_no]
+    rfl
+  -- 5) (1 -? 1 : usize) = pure 0
+  have h_rem_dec : ((1 : usize) -? (1 : usize) : RustM usize) = pure (0 : usize) := by
+    show (rust_primitives.ops.arith.Sub.sub (1 : usize) (1 : usize) : RustM usize) = pure 0
+    show (if BitVec.usubOverflow (1 : usize).toBitVec (1 : usize).toBitVec then
+            (.fail .integerOverflow : RustM usize)
+          else pure ((1 : usize) - 1)) = pure 0
+    have h_no : BitVec.usubOverflow (1 : usize).toBitVec (1 : usize).toBitVec = false := by
+      decide
+    rw [h_no]
+    rfl
+  -- Now combine: the body's do-block reduces step-by-step.
+  show (do
+        let i : u64 ← k[(0 : usize)]_?
+        let p : u64 ← ((0 : u64) +? i)
+        let r : u64 ← ((1 : u64) *? (← multinomial_u64.binomial p i))
+        let idx : usize ← ((0 : usize) +? (1 : usize))
+        let remaining : usize ← ((1 : usize) -? (1 : usize))
+        pure (rust_primitives.hax.Tuple4.mk idx p r remaining) :
+        RustM (rust_primitives.hax.Tuple4 usize u64 u64 usize)) =
+        pure ⟨(1 : usize), n, (1 : u64), (0 : usize)⟩
+  rw [h_idx]
+  simp only [pure_bind]
+  rw [h_add0n]
+  simp only [pure_bind]
+  rw [binomial_diag n]
+  show ((1 : u64) *? (1 : u64) >>= _) = _
+  rw [h_mul11]
+  simp only [pure_bind]
+  rw [h_idx_inc]
+  simp only [pure_bind]
+  rw [h_rem_dec]
+  simp only [pure_bind]
+
+/-- Hoare triple for the outer loop in the singleton case. -/
+private theorem singleton_outer_loop_triple
+    (k : RustSlice u64) (n : u64) (h : k.val = #[n]) :
+    ⦃⌜singletonInv n ⟨(0 : usize), (0 : u64), (1 : u64), (1 : usize)⟩⌝⦄
+      outerLoop k ⟨(0 : usize), (0 : u64), (1 : u64), (1 : usize)⟩
+    ⦃⇓ r => ⌜singletonInv n r ∧ ¬ outerCond r = true⌝⦄ := by
+  apply Std.Do.Spec.MonoLoopCombinator.while_loop
+    ⟨(0 : usize), (0 : u64), (1 : u64), (1 : usize)⟩
+    Lean.Loop.mk outerCond (outerBody k) (singletonInv n)
+    (fun s => USize64.toNat s._3)
+  intro s hcond hinv
+  cases hinv with
+  | inl hinv1 =>
+    -- s = ⟨0, 0, 1, 1⟩. Body produces ⟨1, n, 1, 0⟩ deterministically.
+    subst hinv1
+    rw [singleton_body_init_step k n h]
+    -- Goal: wp⟦pure ⟨1,n,1,0⟩⟧ Q reduces to Q ⟨1,n,1,0⟩.
+    refine ⟨?_, ?_⟩
+    · -- termination: USize64.toNat 0 < USize64.toNat 1, i.e., 0 < 1
+      show USize64.toNat (0 : usize) < USize64.toNat (1 : usize)
+      decide
+    · -- invariant: ⟨1, n, 1, 0⟩ satisfies singletonInv (right disjunct)
+      right; rfl
+  | inr hinv2 =>
+    -- s = ⟨1, n, 1, 0⟩, but cond says s._3 > 0; contradiction.
+    exfalso
+    subst hinv2
+    show False
+    have h_cond_eq : outerCond ⟨(1 : usize), n, (1 : u64), (0 : usize)⟩ =
+                     decide (USize64.toNat (0 : usize) > USize64.toNat (0 : usize)) := rfl
+    rw [h_cond_eq] at hcond
+    exact absurd hcond (by decide)
+
+/-- Strengthened postcondition for singleton: `r = 1` at loop exit. -/
+private theorem singleton_outer_loop_value
+    (k : RustSlice u64) (n : u64) (h : k.val = #[n]) :
+    ⦃⌜True⌝⦄
+      outerLoop k ⟨(0 : usize), (0 : u64), (1 : u64), (1 : usize)⟩
+    ⦃⇓ r => ⌜r._2 = (1 : u64)⌝⦄ := by
+  have h_triple := singleton_outer_loop_triple k n h
+  have h' :
+      ⦃⌜singletonInv n ⟨(0 : usize), (0 : u64), (1 : u64), (1 : usize)⟩⌝⦄
+        outerLoop k ⟨(0 : usize), (0 : u64), (1 : u64), (1 : usize)⟩
+      ⦃⇓ r => ⌜r._2 = (1 : u64)⌝⦄ := by
+    apply Triple.of_entails_right _ _ _ _ h_triple
+    apply PostCond.entails.of_left_entails
+    intro r ⟨hinv, _⟩
+    cases hinv with
+    | inl heq => rw [heq]
+    | inr heq => rw [heq]
+  apply Triple.of_entails_left _ _ _ _ h'
+  intro _
+  left; rfl
+
+/-- Hoare triple for the function: `multinomial #[n] = ok 1`. -/
+private theorem multinomial_singleton_triple
+    (k : RustSlice u64) (n : u64) (h : k.val = #[n]) :
+    ⦃⌜True⌝⦄
+      multinomial_u64.multinomial k
+    ⦃⇓ r => ⌜r = (1 : u64)⌝⦄ := by
+  have h_len : core_models.slice.Impl.len u64 k = pure (1 : usize) := by
+    unfold core_models.slice.Impl.len rust_primitives.slice.slice_length
+    rw [h]
+    rfl
+  unfold multinomial_u64.multinomial
+  unfold rust_primitives.hax.while_loop
+  rw [h_len]
+  show ⦃⌜True⌝⦄
+      (outerLoop k ⟨(0 : usize), (0 : u64), (1 : u64), (1 : usize)⟩ >>=
+        fun s => match s with | ⟨_, _, r, _⟩ => pure r)
+      ⦃⇓ r => ⌜r = (1 : u64)⌝⦄
+  apply Triple.bind _ _ (singleton_outer_loop_value k n h)
+  intro s
+  cases s with
+  | mk idx p r remaining =>
+    refine Triple.pure r ?_
+    intro hr
+    exact hr
+
+/-- Postcondition (boundary): every singleton slice returns `1`. -/
+theorem multinomial_singleton
+    (k : RustSlice u64) (n : u64) (h : k.val = #[n]) :
+    multinomial_u64.multinomial k = RustM.ok 1 := by
+  have h_triple := multinomial_singleton_triple k n h
+  rw [RustM.Triple_iff_BitVec] at h_triple
+  simp only [decide_true, Bool.not_true, Bool.false_or,
+             Bool.and_eq_true, decide_eq_true_eq] at h_triple
+  obtain ⟨hok, hval⟩ := h_triple
+  cases hf : multinomial_u64.multinomial k with
+  | none =>
+    rw [hf] at hok
+    simp [RustM.toBVRustM] at hok
+  | some result =>
+    cases result with
+    | ok v =>
+      rw [hf] at hval
+      simp [RustM.toBVRustM] at hval
+      exact congrArg RustM.ok hval
+    | error e =>
+      rw [hf] at hok
+      cases e <;> simp [RustM.toBVRustM] at hok
+>>> REPLACE

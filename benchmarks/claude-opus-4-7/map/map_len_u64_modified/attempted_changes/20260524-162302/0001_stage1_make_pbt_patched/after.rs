@@ -1,0 +1,145 @@
+//! Extracted from
+//! `core::iter::adapters::map::<impl ExactSizeIterator for Map<I, F>>::len`.
+//!
+//! Original:
+//! ```ignore
+//! fn len(&self) -> usize {
+//!     self.iter.len()
+//! }
+//! ```
+//!
+//! Monomorphized with `I = core::ops::Range<u64>` and `F = fn(u64) -> u64`.
+//!
+//! Note: `Range<u64>` does not implement `ExactSizeIterator` on stable
+//! (its `len` method is unstable / unavailable because a `u64` range can
+//! exceed `usize` on 32-bit targets). Per the skill's "inline trait method
+//! calls" rule we inline the obvious concrete body for the inner `len`:
+//!     (self.iter.end - self.iter.start) as usize
+//! which is the same value `ExactSizeIterator::len` would return.
+
+use core::ops::Range;
+
+/// Concrete monomorphization of `core::iter::adapters::map::Map<I, F>`.
+pub struct Map {
+    pub iter: Range<u64>,
+    pub f: fn(u64) -> u64,
+}
+
+impl Map {
+    /// Return the remaining length, delegating to the inner iterator's `len`
+    /// (inlined as `end - start` for `Range<u64>`).
+    pub fn len(&self) -> usize {
+        (self.iter.end - self.iter.start) as usize
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // No direct source test for `Map::len` alone. Skill rule: write a
+    // minimum of one trivial test.
+    #[test]
+    fn len_is_inner_len() {
+        let m = Map { iter: 0..10, f: |x| x + 3 };
+        assert_eq!(m.len(), 10);
+    }
+
+    #[test]
+    fn len_decreases_with_consumption() {
+        let mut m = Map { iter: 0..10, f: |x| x + 3 };
+        assert_eq!(m.len(), 10);
+        m.iter.next();
+        assert_eq!(m.len(), 9);
+        m.iter.next_back();
+        assert_eq!(m.len(), 8);
+    }
+
+    #[test]
+    fn len_is_zero_for_empty_range() {
+        let m = Map { iter: 5..5, f: |x| x + 3 };
+        assert_eq!(m.len(), 0);
+    }
+
+    // --- Property-based tests ------------------------------------------------
+    //
+    // The contract of `Map::len` is:
+    //   * precondition: `iter.start <= iter.end` (otherwise the inner
+    //     subtraction underflows)
+    //   * postcondition: returns `(iter.end - iter.start) as usize`
+    //
+    // Everything else (purity, independence from `f`, behaviour as the range
+    // shrinks) is a separate, independently checkable semantic claim and is
+    // pinned down below.
+
+    /// Core postcondition: `len() == (end - start) as usize` for a wide
+    /// spread of well-formed `Range<u64>` values, including the boundary
+    /// values `0` and `u64::MAX` and the empty case `start == end`.
+    ///
+    /// On a 64-bit target this also exercises range widths that would
+    /// truncate on a 32-bit target (e.g. `0..u64::MAX`), since on 64-bit
+    /// `usize == u64` the cast is the identity and the equality still
+    /// holds with the documented formula.
+    #[test]
+    fn len_equals_end_minus_start_for_wellformed_ranges() {
+        let cases: &[(u64, u64)] = &[
+            (0, 0),
+            (0, 1),
+            (1, 1),
+            (0, 10),
+            (5, 10),
+            (100, 200),
+            (0, 1_000_000),
+            (u64::MAX, u64::MAX),
+            (u64::MAX - 1, u64::MAX),
+            (u64::MAX - 100, u64::MAX),
+        ];
+        for &(start, end) in cases {
+            let m = Map { iter: start..end, f: |x| x };
+            assert_eq!(
+                m.len(),
+                (end - start) as usize,
+                "len mismatch for {}..{}", start, end,
+            );
+        }
+    }
+
+    /// Independence claim: the value of `len` does not depend on `f`.
+    /// A buggy implementation that consulted `f` (e.g. called it on the
+    /// endpoints, used a hash of the function pointer, ...) would be
+    /// caught by this test; this is a genuinely separate semantic claim
+    /// from the postcondition above.
+    #[test]
+    fn len_is_independent_of_f() {
+        let fs: &[fn(u64) -> u64] = &[
+            |x| x,
+            |x| x.wrapping_mul(7).wrapping_add(13),
+            |_| 0,
+            |x| !x,
+        ];
+        for &(start, end) in &[(0u64, 0u64), (5, 17), (100, 100), (0, 1000)] {
+            let expected = (end - start) as usize;
+            for &f in fs {
+                let m = Map { iter: start..end, f };
+                assert_eq!(m.len(), expected);
+            }
+        }
+    }
+
+    /// Purity claim: `len` takes `&self` and must not mutate observable
+    /// state, so repeated calls on the same `Map` must agree. A buggy
+    /// implementation that, say, advanced `iter` as a side effect would
+    /// be caught here.
+    #[test]
+    fn len_is_pure() {
+        let m = Map { iter: 42..1000, f: |x| x.wrapping_add(1) };
+        let l1 = m.len();
+        let l2 = m.len();
+        let l3 = m.len();
+        assert_eq!(l1, l2);
+        assert_eq!(l2, l3);
+        // And the value still matches the postcondition after several
+        // observations.
+        assert_eq!(l1, (1000u64 - 42) as usize);
+    }
+}

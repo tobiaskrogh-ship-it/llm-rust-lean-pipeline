@@ -1,0 +1,270 @@
+Log: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260513-143720_while_example.log
+Model: claude-opus-4-7
+Attempt logs: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/starting_examples/while_example/attempted_changes/20260513-143720
+Stages: [1, 2, 3, 4, 5, 6, 7, 8]
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] Glob({"pattern": "**/Cargo.toml"})
+[tool] Glob({"pattern": "proof_patterns/**/src/lib.rs"})
+[tool] Glob({"pattern": "proof_patterns/**"})
+[tool] Grep({"pattern": "proptest", "path": ".", "output_mode": "files_with_matches", "head_limit": 10})
+Now I have enough context. Let me design the property-based tests.
+
+**Contract analysis for `modulo_via_subtraction(a, b) -> u64`:**
+
+- **Precondition**: `b > 0` (with `b == 0`, the loop never terminates: `x >= 0` is always true for u64 and `x -= 0` is a no-op).
+- **Postcondition**: returns `a % b`.
+
+**Independent contract claims** (mirroring the gcd analogy from the rules):
+- *Congruence*: result is congruent to `a` modulo `b`.
+- *Smallest non-negative*: result is strictly less than `b`.
+
+These two together characterize `a % b`. The clean spec-equivalence test `result == a % b` packages both, but per the gcd analogy I'll also keep the *range* claim as its own test — it's exactly what the natural loop invariant would prove, and it catches a different family of buggy implementations (e.g. one that stops one subtraction early, or returns `a` unchanged).
+
+I'll be careful with input sizes: the loop runs `a / b` times, so I avoid pairs like `(u64::MAX, 7)` from the original suite that would either hang or rely on LLVM rewriting the loop into `%`.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n#[cfg(test)]\nmod tests {\n    use super::*;\n\n    #[test]\n    fn matches_native_mod() {\n        for (a, b) in [... [+3096 chars])
+[tool] write_working_file({"path": "src/lib.rs", "overwrite": true, "error_message": "Replacing the original ad-hoc tests with two property-style tests that capture the contract clauses ... [+4102 chars])
+[tool] run_cargo_test({})
+Both tests pass. Here's the summary of what's in the suite and why.
+
+## Test suite summary
+
+### `matches_native_mod` — Postcondition
+- **Captures**: full postcondition `result == a % b` whenever the precondition `b > 0` holds.
+- **Coverage**: exhaustive sweep `a ∈ 0..=64, b ∈ 1..=16` (catches every small-quotient case) plus boundary pairs near `u64::MAX` (catches large-magnitude cases that small sweeps miss).
+- **Catches**: any implementation that returns the wrong value for any valid input.
+
+### `result_less_than_divisor` — Range invariant (independent claim)
+- **Captures**: the "smallest non-negative" half of the modulo contract — `result < b` whenever `b > 0`.
+- **Why it's not redundant with `matches_native_mod`**: it's the exact natural loop invariant for this implementation. Per the gcd analogy in the rules ("common divisor" + "greatest" are independent claims), modulo's contract splits into "congruent to `a` mod `b`" + "smallest non-negative". This test pins down the latter without referring to the native `%` spec, which is useful as a separate proof obligation downstream.
+- **Catches**: implementations that overshoot (e.g. return `a + b`, or stop one subtraction early, or return `a` unchanged).
+
+### Precondition
+- The implicit precondition `b > 0` is documented and respected by both tests' input generators (`b` always starts at `1`). I did not add a test for the failure mode (`b == 0`) because it is non-termination, not a panic — there is nothing to assert against in finite time.
+
+## Properties considered but excluded
+
+- **Congruence: `(a - result) % b == 0`** — derived from `result == a % b`. Including it as a third test would be triply redundant given `matches_native_mod`.
+- **Edge case `a < b ⇒ result == a`** — derived from the postcondition (zero-iteration case of the spec).
+- **Edge case `a == k * b ⇒ result == 0`** — derived from the postcondition.
+- **`b == 1 ⇒ result == 0`** — derived; trivially covered by the small sweep.
+- **Algebraic identities of `%`** (e.g. `(a + b) % b == a % b`, `(a * k) % b` etc.) — these are facts about modulo arithmetic, not about *this implementation*, and would only re-test properties of the native `%` operator.
+- **Pairs like `(u64::MAX, 7)`** (present in the original suite) — naive evaluation would loop ~2⁶¹ times. The original test only succeeded because LLVM happened to recognize the pattern; this is fragile, so I replaced those cases with `(u64::MAX, large_b)` pairs that exercise the same magnitude regime in O(1) iterations.
+
+make_pbt
+[tool] Glob({"pattern": "**/Cargo.toml"})
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Read({"file_path": "src/lib.rs"})
+The Rust source already matches the canonical minimal `while_example` shape from the skill: no `loop_invariant!`, no `loop_decreases!`, no `requires`. Let me run the pipeline in order to verify the existing state.
+[tool] run_cargo_test({})
+Tests pass. Now run Hax extraction.
+[tool] run_cargo_hax_into_lean({})
+Extraction succeeded. Now lake build.
+[tool] run_lake_build({})
+All three pipeline gates pass on the existing source — no rewrite required.
+
+Let me also verify the extracted Lean has no Hax-degenerate patterns (constant-0 termination measure, pureP synth failure, keyword collision):
+[tool] Grep({"pattern": "from_machine \\(0 : u32\\)", "path": "proofs/lean/extraction", "glob": "*.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/while_example.lean"})
+The `from_machine (0 : u32)` constant-0 measure appears in the extracted file, but per the skill's guidance, this is only a problem when there's also an auto-generated `@[hax_spec]` block (which requires a `#[hax_lib::requires(...)]` clause on the Rust function). Verify no such block exists:
+[tool] Grep({"pattern": "hax_spec", "path": "proofs/lean/extraction/while_example.lean"})
+No `@[hax_spec]` block — the constant-0 termination measure is harmless because no auto-spec is generated. The lake build confirms this end-to-end (it built `While_exampleObligations` cleanly).
+
+Also check for the other Hax-degenerate signatures:
+[tool] Grep({"pattern": "partial_fixpoint|failed to synthesize.*Cast Bool|unexpected token", "path": "proofs/lean/extraction/while_example.lean"})
+All clean.
+
+## Summary
+
+**No rewrite required.** The working crate's `src/lib.rs` already matches the canonical minimal `while_example` shape documented in the skill: a single `while` loop with no `loop_invariant!`, no `loop_decreases!`, no `#[hax_lib::requires(...)]`. This is the recommended shape precisely because the natural invariant (`x % b == a % b`) uses a partial op that Hax's `pureP/grind` synthesis cannot lift — exactly the failure mode described in `rewrite_patterns/loop_invariant_partial_op.rs`.
+
+Pipeline gates all green on the as-found source:
+
+| Gate | Result |
+|---|---|
+| `run_cargo_test` | ✅ 2 tests pass (`matches_native_mod`, `result_less_than_divisor`) |
+| `run_cargo_hax_into_lean` | ✅ extraction succeeded; `while_example.lean` unchanged |
+| `run_lake_build` | ✅ 95 jobs built, including `While_exampleObligations` |
+
+**Hax / lake build errors that drove changes:** none — no edits made.
+
+**Library calls inlined and their replacements:** none — the body uses only `>=`, `-=`, and `=` over `u64`, all of which Hax models.
+
+**Patterns considered but not changed:**
+
+- **`while_loop_to_recursion.rs` (preference rewrite):** The skill recommends tail recursion for cleaner proofs, but the **reference for this exact crate is `proof_patterns/while_example`** — a closed-proof example where the `Spec.MonoLoopCombinator.while_loop` proof already exists and is known to work. Rewriting to recursion here would deviate from the canonical reference for this target. Left as a `while` loop.
+- **`loop_invariant_partial_op.rs`:** Already in the documented `// after` shape (no invariant, no decreases). Confirms the source is correct as-is.
+
+**Semantics-altering changes:** none.
+
+**Hax-degenerate patterns flagged for proof stage:**
+
+- The extracted Lean contains `rust_primitives.hax.int.from_machine (0 : u32)` as the loop's termination measure. Per the skill, this constant-0 measure is **harmless** here because no `@[hax_spec]` block was generated (the source has no `#[hax_lib::requires(...)]`). The proof stage will prove termination directly in Lean using `Spec.MonoLoopCombinator.while_loop`, exactly as the reference `proof_patterns/while_example` demonstrates. No action needed at this stage.
+
+rust_hax_lean
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/starting_examples/while_example/attempted_changes... [+43 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/starting_examples/while_example/attempted_changes... [+21 chars])
+The attempt log contains only `stage1_make_pbt` entries — no `stage2_rust_hax_lean` patches. According to the skill rules, I should only harvest from `stage2_rust_hax_lean_patched` attempts, and there are none in this run.
+
+## Final report
+
+**Patterns written:** 0
+
+**Attempts inspected but skipped:**
+- `0001_stage1_make_pbt_error/` — stage1 attempt (make_pbt), not stage2 rust_hax_lean. Skipped per skill scope.
+- `0002_stage1_make_pbt_written/` — stage1 attempt (make_pbt), not stage2 rust_hax_lean. Skipped per skill scope.
+
+**Notes for human attention:**
+- This run's log contains no `stage2_rust_hax_lean_*` subdirectories at all. Either the rewrite stage did not run, the run terminated before stage2 began, or the run reached stage2 with no patches needed. The only attempts present are two `stage1_make_pbt` entries (one `error`, one `written`). Nothing to harvest into `rewrite_patterns/`.
+
+harvest_rewrite_patterns
+The two files are byte-identical. There are no changes between the original and the Hax-rewritten version — same function body, same `while x >= b { x -= b; }` loop, same tests, same comments, same constants. No verification-only macros were added, no inlinings or structural rewrites occurred.
+
+Since nothing changed, runtime behavior is trivially preserved on every input.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target's proof obstacles, I need to identify the core challenges:
+
+1. **while loop on u64** with no Rust-level invariant (lifted to Lean)
+2. **`Spec.MonoLoopCombinator.while_loop`** spec application
+3. **subtraction-no-underflow** discharge in body step
+4. **bv-nat-bridge** (`UInt64.toNat_sub_of_le'`, `UInt64.toNat_inj`, etc.)
+5. **triple-to-equation** lift via `RustM.Triple_iff_BitVec`
+6. **Lean-side invariant strengthening** (`b > 0` carried as a comparison-only Rust invariant; real residue invariant added in Lean)
+
+Let me inspect the most promising candidates by their tags before deciding.
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/Gcd_wh... [+30 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/src/lib.rs"})
+[tool] Glob({"pattern": "proof_patterns/while_example/**/*"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/**/*.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/Gcd_wh... [+30 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/**/*.lean"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/README.md"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/Gcd_wh... [+21 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/README.md"})
+I've now seen enough. The target is the canonical `while + repeated subtraction + residue invariant` archetype, and the library's `while_example` is its README-marked reference. `gcd_while_modified` is the only other example that exercises the same two-stage pipeline (`Spec.MonoLoopCombinator.while_loop` → `RustM.Triple_iff_BitVec` + Nat-level invariant on u64 loop state). Everything else is a different archetype.
+
+Per the skill: a weak 3rd–5th pick is worse than no pick. I'm capping at 2.
+
+---
+
+## Selected examples
+
+```
+proof_patterns/while_example
+proof_patterns/gcd_while_modified
+```
+
+### Rationale per pick
+
+- **`proof_patterns/while_example`** — Exact archetype match (it ships the README at `proof_patterns/while_example/README.md` that documents the canonical pattern for `while`-loop targets, and its `While_exampleObligations.lean` is the closed-proof reference). Same Rust shape (`while x >= b { x -= b }` over u64), same dropped-Rust-invariant + `b > 0` precondition, same `loopInv`/`loopTerm` skeleton, same `body_step_nat` lemma asserting (no-underflow ∧ termination ∧ invariant-preserved), same `Spec.MonoLoopCombinator.while_loop` + `Triple.of_entails_{right,left}` consequence chain, same `RustM.Triple_iff_BitVec` Stage-2 lift, same residue-mod reasoning via `UInt64.toNat_sub_of_le'` + `Nat.mod_eq_of_lt`. The proof agent should pattern-match against this file before doing anything else — features overlap is total: `loop-invariant`, `subtraction-no-underflow`, `bv-nat-bridge`, `lean-side-invariant-strengthening`, `residue-invariant`, `triple-to-equation`.
+
+- **`proof_patterns/gcd_while_modified`** — Same two-stage pipeline (Stage-1 triple over `Loop.MonoLoopCombinator.while_loop` via `Spec.MonoLoopCombinator.while_loop`, Stage-2 `RustM.Triple_iff_BitVec` + `cases` on `RustM` constructors). Differs in surface (`(a, b) ↦ (b, a % b)` tuple state, `Nat.gcd_rec` invariant) but demonstrates the same proof obstacles the target faces: discharging a partial Rust operator (`a %? b` here, equivalent in shape to the target's `x -? b`) via an `if`-on-overflow/division-by-zero unfold + a `pure`-rewrite inside the body step, plus the `UInt64.ofNat … = .toNat` round-trip at the post-strengthening step. Features overlap: `loop-invariant`, `triple-to-equation`, `bv-nat-bridge` — three of the target's six proof tags. Useful as a secondary reference for the post-strengthening boilerplate when adapting from while_example's single-u64 state to whatever shape the target settles on.
+
+### Gaps
+
+- No library example combines `residue-invariant` with anything other than the target archetype itself, so cross-checking that specific reasoning step only has one reference (while_example). If the proof needed to be done independently of while_example, the library would not cover it.
+
+### Rejections (considered, dropped)
+
+- **`recursion_example`** — shares `subtraction-no-underflow` + `bv-nat-bridge` but uses `partial_fixpoint` + strong induction; would mislead toward a recursion-based proof for a loop target.
+- **`contains_u64_modified`** — recursion + strong induction + slice indexing; wrong control-flow archetype.
+- **`average_floor_u64_modified` / `average_ceil_u64_modified`** — straight-line `bv-nat-bridge` with half-adder/Dietz identity; no loop, no invariant, no triple-to-equation step.
+- **`saturating_sub_modified`** — `if`-guarded subtraction on u8; no loop.
+- **`gcd_while_modified`-adjacent totals (`min_modified`, `clamp_modified`, `is_zero_modified`)** — total straight-line `if`/comparison logic; nothing in common with the loop archetype.
+- **`factorial_modified` / `sum_to_n_modified`** — recursive overflow-failing functions; wrong control flow and wrong outcome shape (failure-cased, not total-with-precondition).
+- **`add_one_modified` / `square_modified` / `abs_diff_i64_modified`** — single-binop overflow-failure shapes; irrelevant.
+- **`slice_get_u64_modified`** — `branch-split-totality` over slice index bounds; nothing loop-related.
+
+select_examples
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/While_examp... [+20 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/While_exampleObligations.lean"})
+Let me also check the gcd_while_modified reference for further context, and inspect Rust source and Lakefile.
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/Gcd_wh... [+21 chars])
+Now I have a clear picture. Reviewing the two contract-style property tests in the Rust source:
+
+1. **`matches_native_mod`**: postcondition `result == a % b` when `b > 0` — already captured by the existing `modulo_via_subtraction_postcondition` theorem.
+2. **`result_less_than_divisor`**: independent range claim `result < b` when `b > 0` — explicitly described in the Rust source as an independent contract clause ("the 'smallest non-negative' half of the modulo contract"). This is missing.
+
+The gcd reference shows the canonical pattern (`gcd_while_divides_a`, `gcd_while_divides_b`, `gcd_while_greatest`) for such derived-from-closed-form contract clauses: `∃ r, f = RustM.ok r ∧ <property>`.
+
+I'll add the missing theorem, modeled on that pattern.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/While_exampleObligations.lean", "patch": "<<< SEARCH\n    | error e =>\n      rw [hf] at hok\n      cases e <;> simp [RustM.toB... [+1629 chars])
+Now let me verify the obligations file builds:
+[tool] run_lake_build({})
+Build succeeds. Let me confirm the final state of the file:
+[tool] Read({"file_path": "proofs/lean/extraction/While_exampleObligations.lean", "offset": 185, "limit": 35})
+## Summary
+
+**File edited:** `proofs/lean/extraction/While_exampleObligations.lean`
+
+**Pre-existing theorems (already in place when this stage began, covering one of the two Rust contract-style tests):**
+- `modulo_via_subtraction_triple` — Hoare-triple postcondition: `b > 0 ⟹ result = UInt64.ofNat (a.toNat % b.toNat)`. Captures the `matches_native_mod` Rust property test.
+- `modulo_via_subtraction_postcondition` — equational form of the same clause via `RustM.Triple_iff_BitVec`.
+
+**Theorem added by this stage:**
+- `modulo_via_subtraction_lt_divisor` — independent range claim: `b > 0 ⟹ ∃ r, modulo_via_subtraction a b = RustM.ok r ∧ r.toNat < b.toNat`. Captures the `result_less_than_divisor` Rust property test. Proof discharged immediately via the closed form + `Nat.mod_lt`, in the `∃ r, f = RustM.ok r ∧ <property>` style used by `gcd_while_divides_a`/`gcd_while_divides_b`/`gcd_while_greatest` in the reference.
+
+**Property tests classified as derived facts:** none. Both Rust tests are contract clauses (the source itself flags `result_less_than_divisor` as "Independent range claim", analogous to gcd's "greatest" clause).
+
+**Coverage check:** every contract-style property test in `src/lib.rs` now corresponds to at least one theorem in the obligations file.
+
+**Uncertainty:** none — `lake build` confirms all statements are well-typed (in fact, all proofs close, since the new range claim follows directly from the pre-existing closed form).
+
+make_lean_obligations
+
+[make_proof] attempt 1/2
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proofs/lean/extraction/While_exampleObligations.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/claude-opus-4-7/starting_examples/while_example_modi... [+59 chars])
+The file is already complete per the previous agent's notes. Let me verify with `lake build` as ground truth.
+[tool] run_lake_build({})
+`lake build` succeeds with zero warnings — no `sorry`s present, all theorems closed.
+
+## Final Output
+
+**Files changed:** None this turn. The obligations file `proofs/lean/extraction/While_exampleObligations.lean` was already in a fully-closed state when this stage began (per the previous agent's notes documenting the addition of `modulo_via_subtraction_lt_divisor`).
+
+**Theorems in the file, all closed:**
+1. `body_step_nat` — private helper: under `loopInv ∧ b ≤ x`, the loop body produces `x - b` without underflow, strictly decreases the termination measure, and preserves the strong invariant. Closes via `UInt64.subOverflow_iff`, `UInt64.toNat_sub_of_le'`, and a `Nat.add_mod_right`-based residue argument.
+2. `modulo_via_subtraction_triple` — Hoare-triple postcondition: `b > 0 ⟹ result = UInt64.ofNat (a.toNat % b.toNat)`. Built via `Spec.MonoLoopCombinator.while_loop` + `body_step_nat` + post-condition strengthening via `Nat.mod_eq_of_lt` + precondition weakening via `Triple.of_entails_left`.
+3. `modulo_via_subtraction_postcondition` — equational form via `RustM.Triple_iff_BitVec` + case-split on the `RustM` result.
+4. `modulo_via_subtraction_lt_divisor` — range claim `∃ r, f a b = RustM.ok r ∧ r.toNat < b.toNat`, derived from the closed form via `Nat.mod_lt` + `UInt64.toNat_ofNat'`.
+
+**Sub-goals that were difficult and how resolved:** N/A this turn — all resolutions are recorded in the file itself and in the previous-stage notes. The two non-trivial steps in the closed proof are (a) discharging `UInt64.subOverflow x b = false` via the `subOverflow_iff` bridge under `b ≤ x` (so `omega` can finish), and (b) the residue-invariance step `(x - b).toNat % b.toNat = a.toNat % b.toNat` which uses `Nat.add_mod_right` after rewriting `(x - b) + b = x`.
+
+**Obligations left as `sorry`:** None.
+[make_proof] attempt 1 done — 0 sorry remain
+[make_proof] closed after 1 attempt(s)
+
+make_proof
+Comparing the target's proof obstacles against the library:
+
+The target (`while_example_modified`) computes `a % b` via repeated subtraction in a while loop and proves correctness via:
+- `Spec.MonoLoopCombinator.while_loop` with strong invariant `b>0 ∧ x≤a ∧ x%b = a%b`
+- Lean-side invariant strengthening (since Rust-level `%` can't be lifted)
+- Subtraction no-underflow discharge via `UInt64.subOverflow`
+- Triple-to-equation conversion via `RustM.Triple_iff_BitVec`
+- Residue invariant `x%b = a%b`
+- Range claim via `Nat.mod_lt`
+
+Now comparing to the existing `while_example` manifest:
+```
+features: loop-invariant, subtraction-no-underflow, bv-nat-bridge,
+          lean-side-invariant-strengthening, residue-invariant, triple-to-equation
+summary: Computes a%b on u64 via repeated subtraction in a while loop;
+         requires b>0 — invariant x%b=a%b proved Lean-side via while_loop spec.
+```
+
+This is the *same algorithm*, the *same proof shape*, and every obstacle tag (`loop-invariant`, `subtraction-no-underflow`, `bv-nat-bridge`, `lean-side-invariant-strengthening`, `residue-invariant`, `triple-to-equation`) is already present. The only addition in the "modified" version is a derived range-claim corollary (`modulo_via_subtraction_lt_divisor`) which is one short application of `Nat.mod_lt` on top of the closed-form equation — a trivial extension, not a new obstacle. The tactic skeleton (`Spec.MonoLoopCombinator.while_loop` + `Triple.of_entails_right`/`of_entails_left` + `Triple_iff_BitVec` discharge) is essentially line-for-line the canonical pattern that `while_example` already teaches.
+
+No new obstacle, no structurally distinct tactic shape — adding this entry would dilute selection rather than enrich it.
+
+SKIPPED — covered by `while_example`.
+
+harvest_proof_patterns
+Stage notes: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260513-143720_while_example_stage_notes.json
+[cleanup] freed 220.1MB from benchmarks/claude-opus-4-7/starting_examples/while_example_modified

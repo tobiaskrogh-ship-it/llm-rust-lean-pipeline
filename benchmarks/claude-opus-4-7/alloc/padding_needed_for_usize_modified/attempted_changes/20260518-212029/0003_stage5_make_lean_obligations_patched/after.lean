@@ -1,0 +1,87 @@
+-- Companion obligations file for the `padding_needed_for_usize` extraction.
+-- Each property the Rust function should satisfy belongs here as a separate `theorem`.
+-- Proofs use `sorry` placeholders at this stage; they are filled in by the proof stage.
+
+import Hax
+import Std.Tactic.Do
+import Std.Do.Triple
+import Std.Tactic.Do.Syntax
+import padding_needed_for_usize
+
+open Std.Do
+open Std.Tactic
+
+set_option mvcgen.warning false
+set_option linter.unusedVariables false
+
+namespace Padding_needed_for_usizeObligations
+
+/-- A `usize` is a valid alignment iff it is a power of two. This is the
+    mathematical meaning of Rust's `usize::is_power_of_two`; the extracted
+    `is_power_of_two_usize` computes it via the bit-trick
+    `n != 0 && (n & (n - 1)) == 0`, and the short-circuit `&&` guards the
+    `n - 1` against underflow at `n = 0`. A power of two is `≥ 1`, so this
+    also discharges the `align -? 1` no-underflow side condition. -/
+def IsPow2 (a : usize) : Prop := ∃ k : Nat, a.toNat = 2 ^ k
+
+/-- Special-case / failure clause — captures the Rust property test
+    `prop_non_power_of_two_returns_max`: when `align` is not a power of two
+    (this includes `align == 0`), `padding_needed_for` returns `usize::MAX`
+    (inlined to the 64-bit literal `18446744073709551615`) regardless of
+    `size`. The branch is unconditionally total: `is_power_of_two_usize`
+    short-circuits on `align = 0` and never underflows. -/
+theorem padding_needed_for_non_power_of_two (size align : usize)
+    (h : ¬ IsPow2 align) :
+    padding_needed_for_usize.padding_needed_for size align
+      = RustM.ok (18446744073709551615 : usize) := by
+  sorry
+
+/-- Concrete anchor — captures the Rust unit test `doc_example` (the doc
+    comment's worked example): the padding after a block of size 9 for
+    alignment 4 is 3. -/
+theorem padding_needed_for_doc_example :
+    padding_needed_for_usize.padding_needed_for (9 : usize) (4 : usize)
+      = RustM.ok (3 : usize) := by
+  sorry
+
+/-- Postcondition clause A — captures the Rust property test
+    `prop_result_aligns_size_up`: for a power-of-two `align`, the returned
+    padding `r` rounds `size` up so the following address is aligned, i.e.
+    `(size + r) % align == 0`. `hnof` is the function's implicit
+    precondition — `size + (align - 1)` does not overflow `usize` — which
+    the property test enforces by keeping `size < 1000`. -/
+theorem padding_needed_for_result_aligns_size_up (size align : usize)
+    (hpow : IsPow2 align)
+    (hnof : size.toNat + (align.toNat - 1) < 2 ^ 64) :
+    ∃ r : usize,
+      padding_needed_for_usize.padding_needed_for size align = RustM.ok r
+      ∧ (size.toNat + r.toNat) % align.toNat = 0 := by
+  sorry
+
+/-- Postcondition clause B (minimality) — captures the Rust property test
+    `prop_padding_is_minimal`: for a power-of-two `align`, the padding is the
+    *smallest* value with property A, i.e. strictly less than `align`.
+    Independent of A: a result overshooting by a whole `align` block still
+    satisfies A but fails B, so together they uniquely pin the result. -/
+theorem padding_needed_for_padding_is_minimal (size align : usize)
+    (hpow : IsPow2 align)
+    (hnof : size.toNat + (align.toNat - 1) < 2 ^ 64) :
+    ∃ r : usize,
+      padding_needed_for_usize.padding_needed_for size align = RustM.ok r
+      ∧ r.toNat < align.toNat := by
+  sorry
+
+/-- Totality / no-panic under the implicit precondition. The property tests
+    only ever call the function and never expect a panic; for a power-of-two
+    `align` (hence `≥ 1`, so `align - 1` does not underflow) with
+    `size + (align - 1)` not overflowing, the function returns successfully.
+    (The non-power-of-two branch is unconditionally total — see
+    `padding_needed_for_non_power_of_two`.) -/
+theorem padding_needed_for_total (size align : usize)
+    (hpow : IsPow2 align)
+    (hnof : size.toNat + (align.toNat - 1) < 2 ^ 64) :
+    ∃ r : usize,
+      padding_needed_for_usize.padding_needed_for size align = RustM.ok r := by
+  sorry
+
+end Padding_needed_for_usizeObligations

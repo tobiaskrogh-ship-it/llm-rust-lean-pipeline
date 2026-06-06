@@ -1,0 +1,187 @@
+<<< SEARCH
+/-! ## Helper lemma: binomial on the diagonal returns 1
+
+`binomial(n, n) = RustM.ok 1` for every `n : u64`. This is the single
+external dependency required by `multinomial_singleton` and the first
+half of `multinomial_sum_overflow_panics`. Sketch: the outer `if k > n`
+test is `false`; the chosen `k_pick` is `n - n = 0`, so the inner
+`while_loop` starts with `steps = 0` and immediately returns init,
+giving `r = 1`. Closing this would itself be an instance of the empty-
+loop pattern below; we state it here so the dependent proofs can use it. -/
+private theorem binomial_diag (n : u64) :
+    multinomial_u64.binomial n n = RustM.ok 1 := by
+  /- Stuck sub-goal: After unfolding `multinomial_u64.binomial`, the do-
+     block branches on `(n >? n) : RustM Bool` (which is `pure false`),
+     then on `(n >? (n -? n)) : RustM Bool` (which is `pure (decide
+     (n > 0))`), and finally enters a `rust_primitives.hax.while_loop`
+     whose `pureCond.val` is `fun ⟨_, _, _, steps⟩ => decide (steps > 0)`
+     starting from `⟨1, n, 1, 0⟩`. The empty-loop trick used in
+     `outer_empty_loop_triple` below would close this in the same way,
+     but reproducing it here also requires the equation conversion via
+     `RustM.Triple_iff_BitVec` — i.e. two full stages — which is itself
+     the work the four sorries below are blocked on.
+     Structural unblock: a separately-verified `binomial_diag` proven
+     by the same vacuous-body-step + Triple_iff_BitVec pattern as
+     `multinomial_empty` (below) would discharge this and unblock the
+     two dependent obligations. -/
+  sorry
+===
+/-! ## Helper: the binomial inner while_loop, abbrevs
+
+We mirror the outer-loop abbrevs for `binomial`'s inner `while_loop` so
+that `binomial_diag` (binomial(n, n) = ok 1) can re-use the
+vacuous-body-step pattern of `outer_empty_loop_triple`. The state is
+`Tuple4 u64 u64 u64 u64` with components `⟨d, n_var, r, steps⟩` (so
+`_2 = r` and `_3 = steps`). -/
+
+private abbrev binomialCond : Tuple4 u64 u64 u64 u64 → Bool :=
+  fun b => decide (UInt64.toNat b._3 > UInt64.toNat 0)
+
+private abbrev binomialBody :
+    Tuple4 u64 u64 u64 u64 → RustM (Tuple4 u64 u64 u64 u64) :=
+  fun s => match s with
+    | ⟨d, n_var, r, steps⟩ =>
+      (do
+        let r : u64 ← (multinomial_u64.multiply_and_divide r n_var d)
+        let n_var : u64 ← (n_var -? (1 : u64))
+        let d : u64 ← (d +? (1 : u64))
+        let steps : u64 ← (steps -? (1 : u64))
+        pure (rust_primitives.hax.Tuple4.mk d n_var r steps) :
+        RustM (rust_primitives.hax.Tuple4 u64 u64 u64 u64))
+
+private abbrev binomialLoop (init : Tuple4 u64 u64 u64 u64) :
+    RustM (Tuple4 u64 u64 u64 u64) :=
+  Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk binomialCond init binomialBody
+
+private def binomialEmptyInv (s : Tuple4 u64 u64 u64 u64) : Prop :=
+  UInt64.toNat s._3 = 0 ∧ s._2 = (1 : u64)
+
+private theorem binomial_empty_loop_triple (n : u64) :
+    ⦃⌜binomialEmptyInv ⟨(1 : u64), n, (1 : u64), (0 : u64)⟩⌝⦄
+      binomialLoop ⟨(1 : u64), n, (1 : u64), (0 : u64)⟩
+    ⦃⇓ r => ⌜binomialEmptyInv r ∧ ¬ binomialCond r = true⌝⦄ := by
+  apply Std.Do.Spec.MonoLoopCombinator.while_loop
+    ⟨(1 : u64), n, (1 : u64), (0 : u64)⟩
+    Lean.Loop.mk binomialCond binomialBody binomialEmptyInv (fun _ => 0)
+  intro s hcond hinv
+  exfalso
+  obtain ⟨h3, _⟩ := hinv
+  have : (0 : u64).toNat = 0 := rfl
+  rw [show binomialCond s = decide (UInt64.toNat s._3 > UInt64.toNat 0) from rfl,
+      this, h3] at hcond
+  exact absurd hcond (by decide)
+
+private theorem binomial_empty_loop_value (n : u64) :
+    ⦃⌜True⌝⦄
+      binomialLoop ⟨(1 : u64), n, (1 : u64), (0 : u64)⟩
+    ⦃⇓ r => ⌜r._2 = (1 : u64)⌝⦄ := by
+  have h := binomial_empty_loop_triple n
+  have h' :
+      ⦃⌜binomialEmptyInv ⟨(1 : u64), n, (1 : u64), (0 : u64)⟩⌝⦄
+        binomialLoop ⟨(1 : u64), n, (1 : u64), (0 : u64)⟩
+      ⦃⇓ r => ⌜r._2 = (1 : u64)⌝⦄ := by
+    apply Triple.of_entails_right _ _ _ _ h
+    apply PostCond.entails.of_left_entails
+    intro r ⟨hinv, _⟩
+    exact hinv.2
+  apply Triple.of_entails_left _ _ _ _ h'
+  intro _
+  refine ⟨?_, ?_⟩ <;> rfl
+
+/-! ## Helper lemma: binomial on the diagonal returns 1 -/
+
+private theorem binomial_diag_triple (n : u64) :
+    ⦃⌜True⌝⦄
+      multinomial_u64.binomial n n
+    ⦃⇓ r => ⌜r = (1 : u64)⌝⦄ := by
+  /- Strategy: unfold `binomial`, walk through the two if-then-else
+     branches by reducing the conditional `RustM Bool` to a pure `false`
+     (for `k >? n`) and case-splitting on whether `n > 0` (for the
+     inner `k >? (n -? k)`); in every case the `steps` initial value is
+     `0`, so the inner `while_loop` is closed by `binomial_empty_loop_value`. -/
+  unfold multinomial_u64.binomial
+  unfold rust_primitives.hax.while_loop
+  -- The first comparison `n >? n` returns `pure false`.
+  have h_gt_nn : (n >? n : RustM Bool) = pure false := by
+    show rust_primitives.cmp.gt n n = pure false
+    show pure (decide (n > n)) = pure false
+    rw [show decide (n > n) = false from decide_eq_false (by
+      intro hlt; exact absurd hlt (lt_irrefl n))]
+  rw [h_gt_nn]
+  simp only [pure_bind, if_false]
+  -- The second computation: `n -? n` returns `pure 0` (no underflow).
+  have h_sub_nn : (n -? n : RustM u64) = pure 0 := by
+    show rust_primitives.ops.arith.Sub.sub n n = pure 0
+    show (if BitVec.usubOverflow n.toBitVec n.toBitVec then
+            (.fail .integerOverflow : RustM u64)
+          else pure (n - n)) = pure 0
+    rw [show BitVec.usubOverflow n.toBitVec n.toBitVec = false from by
+      rw [show n.toBitVec = n.toBitVec from rfl]
+      generalize n.toBitVec = b
+      cases h : BitVec.usubOverflow b b with
+      | false => rfl
+      | true =>
+        exfalso
+        have : ¬ b.toNat < b.toNat := lt_irrefl _
+        rw [BitVec.usubOverflow] at h
+        simp at h
+        exact this h]
+    show pure (n - n) = pure 0
+    congr 1
+    exact (sub_self n)
+  rw [h_sub_nn]
+  simp only [pure_bind]
+  -- The inner if-condition: `(n >? 0) >>= fun b => if b then (n -? n) else pure n`.
+  -- Both branches give `pure 0` for `k_pick`.
+  have h_kpick : ∀ b : Bool,
+      ((if b then (n -? n : RustM u64) else (pure n : RustM u64)) >>= fun k_pick =>
+        rust_primitives.hax.while_loop _ _ _
+          (rust_primitives.hax.Tuple4.mk (1 : u64) n (1 : u64) k_pick) _ >>=
+        fun s => match s with | ⟨_, _, r, _⟩ => pure r) =
+      ((pure 0 : RustM u64) >>= fun k_pick =>
+        rust_primitives.hax.while_loop _ _ _
+          (rust_primitives.hax.Tuple4.mk (1 : u64) n (1 : u64) k_pick) _ >>=
+        fun s => match s with | ⟨_, _, r, _⟩ => pure r) := by
+    intro b
+    cases b with
+    | true => rw [h_sub_nn]
+    | false =>
+      simp only [pure_bind]
+      sorry
+  /- Stuck sub-goal: the if-then-else inside the do-block has a complex
+     surrounding structure that the rewriting above does not preserve
+     cleanly; the `false` case needs `pure n = pure 0` which is false
+     when `n ≠ 0`. The correct case-split is on `decide (n > 0)`, but
+     splitting requires further restructuring the do-block.
+     Structural unblock: a `mvcgen`-style automated stepper that can
+     simultaneously reduce `(cond >? a) >>= fun b => if b then x else y`
+     and case-split on `cond` would close the rest in ~10 lines. -/
+  sorry
+
+private theorem binomial_diag (n : u64) :
+    multinomial_u64.binomial n n = RustM.ok 1 := by
+  /- This is a one-line corollary of `binomial_diag_triple` via the
+     standard `RustM.Triple_iff_BitVec` + case-split template, BUT
+     `binomial_diag_triple` is itself currently `sorry` (stuck on the
+     if-then-else case split inside the do-block).
+     Structural unblock: closing `binomial_diag_triple` (above) closes
+     this in ~6 lines following the `multinomial_empty` template. -/
+  have h_triple := binomial_diag_triple n
+  rw [RustM.Triple_iff_BitVec] at h_triple
+  simp only [decide_true, Bool.not_true, Bool.false_or,
+             Bool.and_eq_true, decide_eq_true_eq] at h_triple
+  obtain ⟨hok, hval⟩ := h_triple
+  cases hf : multinomial_u64.binomial n n with
+  | none =>
+    rw [hf] at hok
+    simp [RustM.toBVRustM] at hok
+  | some result =>
+    cases result with
+    | ok v =>
+      rw [hf] at hval
+      simp [RustM.toBVRustM] at hval
+      exact congrArg RustM.ok hval
+    | error e =>
+      rw [hf] at hok
+      cases e <;> simp [RustM.toBVRustM] at hok
+>>> REPLACE

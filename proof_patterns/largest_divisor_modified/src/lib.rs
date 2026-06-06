@@ -1,0 +1,75 @@
+/// For a given number n ≥ 2, find the largest divisor of n that is
+/// strictly less than n. For n ≤ 1 returns 0 (no proper divisor exists).
+fn largest_divisor_at(n: i64, d: i64) -> i64 {
+    if d <= 0 {
+        1
+    } else if n % d == 0 {
+        d
+    } else {
+        largest_divisor_at(n, d - 1)
+    }
+}
+
+pub fn largest_divisor(n: i64) -> i64 {
+    if n <= 1 {
+        0
+    } else {
+        largest_divisor_at(n, n - 1)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    // ----- Edge / precondition behavior -----
+
+    proptest! {
+        /// For n ≤ 1 (including 0 and all negatives), the function returns 0:
+        /// no proper divisor is defined in this regime.
+        #[test]
+        fn returns_zero_when_n_at_most_one(n in i64::MIN..=1i64) {
+            prop_assert_eq!(largest_divisor(n), 0);
+        }
+    }
+
+    // ----- Postconditions for the "valid" regime (n ≥ 2) -----
+
+    proptest! {
+        /// Postcondition 1: the returned value divides n.
+        #[test]
+        fn result_divides_n(n in 2i64..=1000) {
+            let d = largest_divisor(n);
+            prop_assert_eq!(n % d, 0);
+        }
+    }
+
+    proptest! {
+        /// Postcondition 2: the returned value is a *proper* divisor, i.e. strictly less than n.
+        /// Independent of "divides": n itself trivially divides n but must be excluded.
+        #[test]
+        fn result_is_strictly_less_than_n(n in 2i64..=1000) {
+            let d = largest_divisor(n);
+            prop_assert!(d < n);
+        }
+    }
+
+    proptest! {
+        /// Postcondition 3: the returned value is the *largest* proper divisor.
+        /// Independent of "is a divisor" — pins down which valid divisor is chosen.
+        /// A buggy implementation that returned e.g. the smallest proper divisor
+        /// (always 1) would satisfy the previous two properties but fail this one.
+        #[test]
+        fn result_is_maximal_among_proper_divisors(n in 2i64..=1000) {
+            let d = largest_divisor(n);
+            for k in (d + 1)..n {
+                prop_assert!(
+                    n % k != 0,
+                    "found a larger proper divisor: n = {}, returned d = {}, but {} also divides n",
+                    n, d, k
+                );
+            }
+        }
+    }
+}

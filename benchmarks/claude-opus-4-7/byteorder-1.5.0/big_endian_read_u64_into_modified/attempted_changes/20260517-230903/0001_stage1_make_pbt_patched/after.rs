@@ -1,0 +1,141 @@
+//! Extracted from `byteorder` 1.5.0:
+//! `<byteorder::BigEndian as byteorder::ByteOrder>::read_u64_into`.
+//!
+//! The original method body uses a `read_slice!` macro that expands to the
+//! loop below. Since the impl pins the type universe to big-endian / `u64`,
+//! we materialize the expansion directly as a free function.
+
+pub fn read_u64_into(src: &[u8], dst: &mut [u64]) {
+    const SIZE: usize = core::mem::size_of::<u64>();
+    // Check types (preserved from the original macro for parity):
+    let src: &[u8] = src;
+    let dst: &mut [u64] = dst;
+    assert_eq!(src.len(), dst.len() * SIZE);
+    for (src, dst) in src.chunks_exact(SIZE).zip(dst.iter_mut()) {
+        *dst = u64::from_be_bytes(src.try_into().unwrap());
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::read_u64_into;
+
+    // Transferred from `slice_lengths!(slice_len_too_small_u64, read_u64_into, ..., 15, [0, 0])`
+    // in byteorder/src/lib.rs (≈3195). Only the BigEndian read arm is
+    // transferable here; the LittleEndian/NativeEndian arms and the write
+    // arms refer to functions we did not extract.
+    mod slice_len_too_small_u64 {
+        use super::read_u64_into;
+
+        #[test]
+        #[should_panic]
+        fn read_big_endian() {
+            let bytes = [0; 15];
+            let mut numbers = [0u64, 0];
+            read_u64_into(&bytes, &mut numbers);
+        }
+    }
+
+    // Transferred from `slice_lengths!(slice_len_too_big_u64, read_u64_into, ..., 17, [0, 0])`.
+    mod slice_len_too_big_u64 {
+        use super::read_u64_into;
+
+        #[test]
+        #[should_panic]
+        fn read_big_endian() {
+            let bytes = [0; 17];
+            let mut numbers = [0u64, 0];
+            read_u64_into(&bytes, &mut numbers);
+        }
+    }
+
+    // Postcondition: when called with a valid length, every output element is
+    // the big-endian decoding of the corresponding 8-byte chunk of `src`.
+    mod postcondition {
+        use super::read_u64_into;
+
+        // dst[i] == big-endian(src[8*i .. 8*i+8]) for all i. The input is
+        // built from a known `values` vector via the trusted std oracle
+        // `u64::to_be_bytes`, so the assertion `dst == values` fails for any
+        // implementation that uses the wrong endianness, maps chunks to the
+        // wrong element, reverses element order, or skips elements. Ranges
+        // over several lengths (including 0) and byte patterns to behave as a
+        // property over the valid-input domain.
+        #[test]
+        fn decodes_each_chunk_big_endian() {
+            let patterns: [u64; 6] = [
+                0,
+                1,
+                0x0000_0000_0000_00FF,
+                0xFF00_0000_0000_0000,
+                0x0123_4567_89AB_CDEF,
+                u64::MAX,
+            ];
+            for n in 0..=4usize {
+                // values[k] depends on k, so per-element ordering is exercised.
+                let mut values = Vec::with_capacity(n);
+                for k in 0..n {
+                    values.push(patterns[k % patterns.len()] ^ (k as u64));
+                }
+                let mut src = Vec::with_capacity(n * 8);
+                for v in &values {
+                    src.extend_from_slice(&v.to_be_bytes());
+                }
+                let mut dst = vec![0u64; n];
+                read_u64_into(&src, &mut dst);
+                assert_eq!(dst, values);
+            }
+        }
+
+        // Independent semantic claim: the decoding is big-endian (most
+        // significant byte first) and chunk i lands in dst[i]. The oracle here
+        // is hand-written and does not rely on `to_be_bytes`, so it pins the
+        // byte orientation even if that std helper were itself wrong.
+        #[test]
+        fn big_endian_orientation_explicit() {
+            let mut one = [0u64];
+            read_u64_into(&[0, 0, 0, 0, 0, 0, 0, 1], &mut one);
+            assert_eq!(one[0], 1);
+
+            let mut hi = [0u64];
+            read_u64_into(&[1, 0, 0, 0, 0, 0, 0, 0], &mut hi);
+            assert_eq!(hi[0], 0x0100_0000_0000_0000);
+
+            let mut two = [0u64; 2];
+            read_u64_into(&[0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 2], &mut two);
+            assert_eq!(two, [1, 2]);
+
+            let mut mixed = [0u64];
+            read_u64_into(&[0xDE, 0xAD, 0xBE, 0xEF, 0x01, 0x23, 0x45, 0x67], &mut mixed);
+            assert_eq!(mixed[0], 0xDEAD_BEEF_0123_4567);
+        }
+    }
+
+    // Precondition: the exact relation `src.len() == dst.len() * SIZE`.
+    mod precondition {
+        use super::read_u64_into;
+
+        // Boundary of the precondition: 0 == 0 * SIZE holds, so empty slices
+        // are a valid no-op call, not a panic.
+        #[test]
+        fn empty_slices_is_noop() {
+            let src: [u8; 0] = [];
+            let mut dst: [u64; 0] = [];
+            read_u64_into(&src, &mut dst);
+            assert_eq!(dst.len(), 0);
+        }
+
+        // Failure condition pinning the *exact* precondition rather than the
+        // weaker `src.len() % SIZE == 0`: src.len() == 16 is a multiple of
+        // SIZE, but dst.len() * SIZE == 8, so the call must still panic. The
+        // existing 15-/17-byte tests do not distinguish these two checks.
+        #[test]
+        #[should_panic]
+        fn len_multiple_of_size_but_mismatched_panics() {
+            let bytes = [0u8; 16];
+            let mut numbers = [0u64];
+            read_u64_into(&bytes, &mut numbers);
+        }
+    }
+
+}

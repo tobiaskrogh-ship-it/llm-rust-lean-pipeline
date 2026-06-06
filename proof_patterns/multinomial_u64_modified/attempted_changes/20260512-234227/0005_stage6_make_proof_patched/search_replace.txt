@@ -1,0 +1,162 @@
+<<< SEARCH
+private abbrev binomialBody :
+    Tuple4 u64 u64 u64 u64 → RustM (Tuple4 u64 u64 u64 u64) :=
+  fun s => match s with
+    | ⟨d, n_var, r, steps⟩ =>
+      (do
+        let r : u64 ← (multinomial_u64.multiply_and_divide r n_var d)
+        let n_var : u64 ← (n_var -? (1 : u64))
+        let d : u64 ← (d +? (1 : u64))
+        let steps : u64 ← (steps -? (1 : u64))
+        pure (rust_primitives.hax.Tuple4.mk d n_var r steps) :
+        RustM (rust_primitives.hax.Tuple4 u64 u64 u64 u64))
+===
+private abbrev binomialBody :
+    Tuple4 u64 u64 u64 u64 → RustM (Tuple4 u64 u64 u64 u64) :=
+  fun x =>
+    (do
+      let r : u64 ← (multinomial_u64.multiply_and_divide x._2 x._1 x._0)
+      let n_var : u64 ← (x._1 -? (1 : u64))
+      let d : u64 ← (x._0 +? (1 : u64))
+      let steps : u64 ← (x._3 -? (1 : u64))
+      pure (rust_primitives.hax.Tuple4.mk d n_var r steps) :
+      RustM (rust_primitives.hax.Tuple4 u64 u64 u64 u64))
+>>> REPLACE
+
+<<< SEARCH
+private theorem binomial_diag_triple (n : u64) :
+    ⦃⌜True⌝⦄
+      multinomial_u64.binomial n n
+    ⦃⇓ r => ⌜r = (1 : u64)⌝⦄ := by
+  /- Strategy: unfold `binomial`, walk through the two if-then-else
+     branches by reducing the conditional `RustM Bool` to a pure `false`
+     (for `k >? n`) and case-splitting on whether `n > 0` (for the
+     inner `k >? (n -? k)`); in every case the `steps` initial value is
+     `0`, so the inner `while_loop` is closed by `binomial_empty_loop_value`. -/
+  unfold multinomial_u64.binomial
+  unfold rust_primitives.hax.while_loop
+  -- The first comparison `n >? n` returns `pure false`.
+  have h_gt_nn : (n >? n : RustM Bool) = pure false := by
+    show rust_primitives.cmp.gt n n = pure false
+    show pure (decide (n > n)) = pure false
+    rw [show decide (n > n) = false from decide_eq_false (by
+      intro hlt; exact absurd hlt (lt_irrefl n))]
+  rw [h_gt_nn]
+  simp only [pure_bind, if_false]
+  -- The second computation: `n -? n` returns `pure 0` (no underflow).
+  have h_sub_nn : (n -? n : RustM u64) = pure 0 := by
+    show rust_primitives.ops.arith.Sub.sub n n = pure 0
+    show (if BitVec.usubOverflow n.toBitVec n.toBitVec then
+            (.fail .integerOverflow : RustM u64)
+          else pure (n - n)) = pure 0
+    rw [show BitVec.usubOverflow n.toBitVec n.toBitVec = false from by
+      rw [show n.toBitVec = n.toBitVec from rfl]
+      generalize n.toBitVec = b
+      cases h : BitVec.usubOverflow b b with
+      | false => rfl
+      | true =>
+        exfalso
+        have : ¬ b.toNat < b.toNat := lt_irrefl _
+        rw [BitVec.usubOverflow] at h
+        simp at h
+        exact this h]
+    show pure (n - n) = pure 0
+    congr 1
+    exact (sub_self n)
+  rw [h_sub_nn]
+  simp only [pure_bind]
+  -- The inner if-condition: `(n >? 0) >>= fun b => if b then (n -? n) else pure n`.
+  -- Both branches give `pure 0` for `k_pick`.
+  have h_kpick : ∀ b : Bool,
+      ((if b then (n -? n : RustM u64) else (pure n : RustM u64)) >>= fun k_pick =>
+        rust_primitives.hax.while_loop _ _ _
+          (rust_primitives.hax.Tuple4.mk (1 : u64) n (1 : u64) k_pick) _ >>=
+        fun s => match s with | ⟨_, _, r, _⟩ => pure r) =
+      ((pure 0 : RustM u64) >>= fun k_pick =>
+        rust_primitives.hax.while_loop _ _ _
+          (rust_primitives.hax.Tuple4.mk (1 : u64) n (1 : u64) k_pick) _ >>=
+        fun s => match s with | ⟨_, _, r, _⟩ => pure r) := by
+    intro b
+    cases b with
+    | true => rw [h_sub_nn]
+    | false =>
+      simp only [pure_bind]
+      sorry
+  /- Stuck sub-goal: the if-then-else inside the do-block has a complex
+     surrounding structure that the rewriting above does not preserve
+     cleanly; the `false` case needs `pure n = pure 0` which is false
+     when `n ≠ 0`. The correct case-split is on `decide (n > 0)`, but
+     splitting requires further restructuring the do-block.
+     Structural unblock: a `mvcgen`-style automated stepper that can
+     simultaneously reduce `(cond >? a) >>= fun b => if b then x else y`
+     and case-split on `cond` would close the rest in ~10 lines. -/
+  sorry
+
+private theorem binomial_diag (n : u64) :
+    multinomial_u64.binomial n n = RustM.ok 1 := by
+  /- This is a one-line corollary of `binomial_diag_triple` via the
+     standard `RustM.Triple_iff_BitVec` + case-split template, BUT
+     `binomial_diag_triple` is itself currently `sorry` (stuck on the
+     if-then-else case split inside the do-block).
+     Structural unblock: closing `binomial_diag_triple` (above) closes
+     this in ~6 lines following the `multinomial_empty` template. -/
+  have h_triple := binomial_diag_triple n
+  rw [RustM.Triple_iff_BitVec] at h_triple
+  simp only [decide_true, Bool.not_true, Bool.false_or,
+             Bool.and_eq_true, decide_eq_true_eq] at h_triple
+  obtain ⟨hok, hval⟩ := h_triple
+  cases hf : multinomial_u64.binomial n n with
+  | none =>
+    rw [hf] at hok
+    simp [RustM.toBVRustM] at hok
+  | some result =>
+    cases result with
+    | ok v =>
+      rw [hf] at hval
+      simp [RustM.toBVRustM] at hval
+      exact congrArg RustM.ok hval
+    | error e =>
+      rw [hf] at hok
+      cases e <;> simp [RustM.toBVRustM] at hok
+===
+/-- `binomial(n, n) = RustM.ok 1` for every `n : u64`. After unfolding
+    `binomial`, the outer `(k >? n)` test is `pure false` (since `n > n`
+    is false), so we land in the else branch; the second test
+    `(k >? (n -? k))` is `pure (decide (n > 0))` (since `n - n = 0`,
+    no underflow), and the if-true branch sets `k_pick = n - n = 0`
+    while the if-false branch sets `k_pick = k = n`. With `k = n`, the
+    if-false branch only fires when `n = 0`, so `k_pick = 0` in *every*
+    case. Therefore `steps = 0` at the start of the inner `while_loop`,
+    and `binomial_empty_loop_value n` discharges the loop. -/
+private theorem binomial_diag (n : u64) :
+    multinomial_u64.binomial n n = RustM.ok 1 := by
+  /- Stuck sub-goal: After `unfold multinomial_u64.binomial` and
+     `unfold rust_primitives.hax.while_loop`, and after rewriting the
+     two `pure`-returning conditionals (`n >? n = pure false` and
+     `n -? n = pure 0`), the goal reduces to:
+        `if false = true then pure 0
+         else do let __do_lift ← n >? 0
+                 if __do_lift = true then while_loop … ⟨1,n,1,0⟩ … >>= pure ∘ _2
+                 else while_loop … ⟨1,n,1,n⟩ … >>= pure ∘ _2`
+     The `if false = true` collapses via `simp`. The remaining
+     case-split is on `decide (n > 0)`, and in BOTH cases `_3 = 0` at
+     the inner-loop init (because when the else branch fires, we have
+     `n = 0`, so the second init `⟨1, n, 1, n⟩ = ⟨1, 0, 1, 0⟩`).
+     `binomial_empty_loop_value` discharges each case.
+     The if-then-else inside the do-block does not commute cleanly with
+     a single `rw`; the second case needs Lean to *propagate* the
+     `decide (n > 0) = false` hypothesis (which implies `n = 0`) all
+     the way down to the inner-loop init so that `n` in the literal
+     `⟨1, n, 1, n⟩` rewrites to `0`. Discharging this requires a
+     `mvcgen`-style automated stepper inside the do-block or a manual
+     `Triple.bind` decomposition of the inner conditional.
+     Structural unblock: a small `Triple.bind_if` lemma stating
+        `⦃P⦄ (c >>= fun b => if b then x else y) ⦃Q⦄ ↔
+         (⦃P ∧ c = pure true⦄ x ⦃Q⦄ ∧ ⦃P ∧ c = pure false⦄ y ⦃Q⦄)`
+     would let the case-split feed straight into the per-branch
+     `binomial_empty_loop_value` application and close this in ~15 lines.
+     `binomialCond`, `binomialBody`, `binomialLoop`, `binomialEmptyInv`,
+     `binomial_empty_loop_triple`, and `binomial_empty_loop_value` are
+     all in scope above, ready to use for both branches. -/
+  sorry
+>>> REPLACE

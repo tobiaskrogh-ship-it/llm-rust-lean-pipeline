@@ -1,0 +1,294 @@
+Log: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260514-020443_034_max_element.log
+Model: claude-opus-4-7
+Attempt logs: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever_2/034_max_element/attempted_changes/20260514-020443
+Stages: [1, 2, 3, 4, 5, 6, 7, 8]
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] Read({"file_path": "Cargo.toml"})
+Looking at the file, a well-formed test suite already exists. Let me verify it compiles and runs, then provide the contract analysis.
+[tool] run_cargo_test({})
+All 4 tests pass. The existing suite already captures the contract concisely; I'll keep it as-is rather than pad with derived properties that would balloon the downstream proof obligations.
+
+## Summary
+
+### Contract clauses captured by each test
+
+| Test | Clause kind | What it pins down |
+|---|---|---|
+| `empty_list_returns_zero` | Postcondition (special case) | The documented sentinel: `max_element(&[]) == 0`. Distinct from every other clause because no quantification over a non-empty list can express it. |
+| `result_is_an_element_of_the_list` | Postcondition (non-empty), part 1 of "greatest element" | The result must actually appear in the input. Rules out impls that fabricate a value (e.g. `i64::MAX`, `max+1`) that would still dominate. |
+| `result_is_an_upper_bound` | Postcondition (non-empty), part 2 of "greatest element" | The result `≥` every element. Rules out impls that pick the wrong element (e.g. `l[0]`, the min, an arbitrary element) — they'd still pass the membership test. |
+| `never_panics` | Totality / failure condition | No precondition; the function is defined on all `&[i64]`, including `&[]`. Implicitly discharged by proptest running to completion on random slices including size 0. |
+
+Together, **membership + upper-bound** uniquely characterise "the maximum" of a non-empty list — neither alone does, which is why they are split into two independent tests.
+
+### Properties considered but deliberately omitted
+
+- **Idempotence / determinism** (`max_element(l) == max_element(l)`): follows from Rust's value semantics and the function being a pure computation; no implementation under consideration could fail it.
+- **Permutation invariance** (`max_element(l) == max_element(shuffle(l))`): a *derived* mathematical fact about "the max of a multiset". Any function satisfying *membership + upper-bound* on every input automatically satisfies this, so it would not catch a new class of bug.
+- **Idempotence under duplication** (`max_element([l; n]) == max_element(l)`): same — derived from membership + upper-bound.
+- **Monotonicity under element increase** (raising one element can only raise the result): derived; would add a proof obligation without constraining the implementation further.
+- **Singleton case** (`max_element(&[x]) == x`): already subsumed by the proptest range `1..32` hitting size-1 vectors, and falls out of membership + upper-bound.
+- **Comparison with `slice::iter().max()`**: would tie the spec to another implementation rather than to the contract; not useful as a proof target.
+- **Algebraic identities of `max`** (commutativity, associativity when threaded through a fold): properties of `max` on `i64`, not of `max_element`; tautological w.r.t. the contract.
+
+The four kept tests are the minimal set that a buggy implementation returning a *different valid-looking* value (wrong element, fabricated element, or panic on empty) would fail.
+
+make_pbt
+I'll start by inspecting the current state of the crate and running the pipeline stages to identify any Hax-incompatibility issues.
+[tool] run_cargo_test({})
+Tests pass. Now run Hax extraction.
+[tool] run_cargo_hax_into_lean({})
+Hax extraction succeeded. Now run lake build.
+[tool] run_lake_build({})
+All three stages pass. Now I should verify the extracted Lean doesn't have Hax-degenerate patterns that would block downstream proof.
+[tool] Read({"file_path": "./proofs/lean/extraction/clever_034_max_element.lean"})
+All three pipeline stages pass cleanly without any rewrites needed. The crate is already in an ideal Hax-compatible shape.
+
+## Final output
+
+### Stages and results
+
+| Stage | Result |
+|---|---|
+| `cargo test` | ✅ 4/4 tests pass |
+| `cargo hax into lean` | ✅ extraction wrote `clever_034_max_element.lean` |
+| `lake build` | ✅ build completed (93 jobs) |
+
+### Hax / lake build errors that drove changes
+
+**None.** No errors encountered at any stage.
+
+### Library calls inlined and their replacements
+
+**None.** The source uses only:
+- `&[i64]` slice indexing (`l[i]`) and `.len()` / `.is_empty()` — modeled in the Hax prelude as `core_models.slice.Impl.len` / `core_models.slice.Impl.is_empty` / indexing via `_?`.
+- Bare integer comparison and arithmetic (`>`, `+`) on `i64` / `usize` — fully modeled.
+- No `.abs()`, no `.pow()`, no `.checked_*` / `.wrapping_*`, no iterator chains, no `f64`, no `String`, no `Vec::push`.
+
+### Patterns considered but not changed
+
+- **`while_loop_to_recursion.rs`**: not applicable — the source is already tail-recursive (`max_at`). The recursion is single-accumulator (`m`), has a clear decreasing measure (`l.len() - i`), and Hax extracts it as `partial_fixpoint` (line 27 of the generated Lean), which is the preferred shape per the recursion-preference rule.
+- **`loop_invariant_partial_op.rs`**: no `while` loops, no annotations, so no `pureP` synthesis risk.
+- **`primitive_int_assoc_const.rs` / `int_abs_to_conditional.rs` / `int_pow_to_recursion.rs`**: no associated constants or methods on integer types used.
+- **`bool_to_int_cast.rs`**: no `bool as <int>` casts.
+- **`lean_keyword_fn_name.rs`**: function names `max_at` and `max_element` are not Lean keywords.
+- **`for_loop_over_slice_to_recursion.rs` / `iter_chain_to_recursion.rs`**: no `for` loops, no iterator chains.
+
+### Semantics-altering changes
+
+**None.** Source is unchanged.
+
+### Hax-degenerate patterns that block proof
+
+**None detected.** The extracted Lean (verified via `Read`):
+- Uses `partial_fixpoint` for the recursion — the recommended shape with clean `Nat.strongRecOn` proof tactics available.
+- No `from_machine (0 : u32)` constant termination measure (no `requires` / `loop_invariant!` annotations were added, so no auto-spec was generated).
+- No `pureP` / `Cast Bool` synthesis failures.
+- No keyword/identifier collisions.
+
+The crate is ready for the proof stage as-is.
+
+rust_hax_lean
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever_2/034_max_element/attempted_changes/202605... [+36 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever_2/034_max_element/attempted_changes/202605... [+14 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever_2/034_max_element/attempted_changes/202605... [+13 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/clever_2/034_max_element/attempted_changes/2026... [+28 chars])
+The attempt log contains only `tool_calls.log` with no per-attempt subdirectories. Inspecting the log shows why:
+
+```
+1  2026-05-14T02:05:01  stage1 make_pbt              run_cargo_test            ok=True rc=0
+2  2026-05-14T02:05:30  stage2 rust_hax_lean         run_cargo_test            ok=True rc=0
+3  2026-05-14T02:05:41  stage2 rust_hax_lean         run_cargo_hax_into_lean   ok=True rc=0
+4  2026-05-14T02:07:57  stage2 rust_hax_lean         run_lake_build            ok=True rc=0
+```
+
+The rewrite stage (`stage2_rust_hax_lean`) ran `cargo test`, `cargo hax into lean`, and `lake build` — all three succeeded on the first try. No `apply_file_patch_tool` or `write_working_file` calls were ever made, so no `*_stage2_rust_hax_lean_patched/` directories exist to mine.
+
+## Final report
+
+**Patterns written:** none.
+
+**Attempts inspected but skipped:** none — there were no rewrite-stage patch attempts in this run. The `034_max_element` crate passed Hax extraction and `lake build` without modification, so the rewrite agent had nothing to fix and produced no `before/after` pairs to harvest.
+
+**Worth a human's attention:** nothing unusual. This is the expected shape of an attempt log when the source crate is already Hax-clean — a single line per successful command and no per-attempt subdirectories. If you were expecting patches here, double-check that you pointed me at the right run (this one is `20260514-020443`).
+
+harvest_rewrite_patterns
+The two files are byte-identical. There are no changes to the function bodies, no inlined helpers, no structural rewrites, no added verification macros, and no test modifications. Since nothing changed, runtime behavior is trivially preserved on all inputs.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target: `max_element` is a tail-recursive scan over an `i64` slice (`max_at l i m`) using `partial_fixpoint`, carrying a running `i64` maximum `m`, indexing with `l[i]_?`, incrementing `i +? 1`, signed `>?` comparison, and returning `0` on empty. The two postconditions are (a) "result is one of the slice's elements" (existential witness) and (b) "result is an upper bound for every element" — exactly the dual of a suffix-min spec. Totality requires no `usize` increment overflow.
+
+## Selected
+
+```
+proof_patterns/rescale_to_unit_modified
+proof_patterns/clever_009_rolling_max_modified
+proof_patterns/contains_u64_modified
+proof_patterns/below_zero_modified
+proof_patterns/000_has_close_elements_modified
+```
+
+### Rationale per pick
+
+- **`proof_patterns/rescale_to_unit_modified`** — Its `min_at` helper is the literal dual of `max_at`: a tail-recursive suffix-extremum over an `i64` slice that proves *both* a pointwise bound (`m ≤ numbers[j]`) *and* an extremum-witness existential (`m = numbers[j*]`). These are exactly the two postconditions our target needs, only flipped to `≥` / max. The `extremum-witness-element` + `elementwise-output-invariant` + `recursive-equation-unfold` triad transfers directly.
+
+- **`proof_patterns/clever_009_rolling_max_modified`** — Prefix-max scan over an `i64` slice with strong induction on `size − i.toNat`, signed `>?` comparison, `usize-add-no-overflow` discharge, and a `recursive-oracle-spec` (`prefix_max_int`). Same surface shape as `max_at`; the oracle pattern shows how to phrase "the maximum so far" as a Lean-side spec.
+
+- **`proof_patterns/contains_u64_modified`** — The canonical "tail-recursive linear scan + iff-decomposed existential postcondition + step lemmas (oob / found / recurse)" recipe. The "result is an element of the list" clause is structurally an existential over slice indices, identical to `contains`. Sets the template for the proof skeleton.
+
+- **`proof_patterns/below_zero_modified`** — Tail-recursive scan over an `i64` slice carrying a running `i64` accumulator with strong-induction-on-suffix, `partial_fixpoint`, and `signed-int-toInt-bridge`. The `running-accumulator-invariant` directly mirrors threading `m` through `max_at`; shows how to relate the accumulator at step `i` to a prefix-oracle.
+
+- **`proof_patterns/000_has_close_elements_modified`** — Another `partial_fixpoint` + strong-induction + `recursive-equation-unfold` + `existential-postcondition` example over `i64` slices. Less close in shape (uses pair-index linearisation), but useful as a second `partial_fixpoint` reference if the simpler recursion patterns don't transfer cleanly.
+
+### Gaps
+
+- No example has the *exact* "carry running maximum + return it" shape paired with both an *upper-bound* and *element-of* postcondition; `rescale_to_unit_modified`'s `min_at` is the closest dual but its outer purpose is a shift, not just returning the extremum.
+- No example pins the empty-slice sentinel case explicitly as a documented special-case postcondition (`empty → 0`), though `clever_009`'s `usize-beq-zero-bridge` is the nearest tool for handling the `is_empty` / `i==0` short-circuit.
+
+### Rejections (considered but not picked)
+
+- **`sum_product_modified`** — tail-recursive `i64`-slice accumulator, but the proof shape revolves around overflow (signed add/mul). Our `max_at` never produces arithmetic on the data; only comparison. Overlap is shallow.
+- **`abs_diff_i64_modified`** — signed-int-toInt-bridge is shared, but no recursion / no slice / no accumulator.
+- **`largest_divisor_modified`** — strong-induction + existential + maximality, but the measure is `descending-recursion-measure` on a single `i64`, not a slice-suffix; the maximality bookkeeping is irrelevant here.
+- **`recursion_example`** — `partial_fixpoint` on `u64` count-down; no slice, no accumulator, no postcondition richer than `= 0`.
+- **`gcd_recursive_modified`** — `partial_fixpoint`, but a numeric recurrence, not a slice scan.
+- **`is_prime_modified`** — recursive scan with dual measures and bit-width-bounded completeness, but the obstacles (mul overflow, √n exit) are unrelated to `max_at`.
+- **`clamp_modified` / `min_modified` / `saturating_sub_modified` / `is_zero_modified`** — total non-recursive single-binop proofs; wrong genre.
+- **`gcd_while_modified` / `while_example`** — `loop-invariant` / `triple-to-equation` patterns, but the target uses recursion with `partial_fixpoint`, not a `while` loop.
+- **`contains_u64_modified`** is *picked*; **`slice_get_u64_modified`** rejected — single-index lookup, no recursion.
+- **`truncate_number_modified` / `average_*_u64_modified` / `factorial_modified` / `sum_to_n_modified` / `square_modified` / `add_one_modified`** — wrong domain (arithmetic on scalars / bit tricks / overflow on `u8`/`u64`), no slice scan structure.
+- **`clever_025_remove_duplicates_modified`** — recursive slice scan, but builds a `Vec` output via `extend_from_slice` with nested helpers; the proof machinery (`build_indices`, `list-getD-append-bridge`, `pairwise-strict-monotone`) is heavier than needed and would mislead.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Clever_034_max_elementObligations.lean
+[scaffold] registered Clever_034_max_elementObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/rescale_to_unit_modified/proofs/lean/extraction/... [+44 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/clever_009_rolling_max_modified/proofs/lean/extr... [+47 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Con... [+27 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Cleve... [+34 chars])
+Now I have a clear sense of the shape. Let me look at the obligations file as it currently exists, then write the theorems.
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_034_max_elementObligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_034_max_elementObligations.lean", "patch": "<<< SEARCH\nnamespace Clever_034_max_elementObligations\n\n-- Add `theorem` ... [+3881 chars])
+Now let me verify the statements are well-typed with `lake build`.
+[tool] run_lake_build({})
+Build succeeded — all four theorems are well-typed (the only warnings are the expected `uses sorry` ones).
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Clever_034_max_elementObligations.lean`
+
+**Theorems added** (one per independent contract clause from the Rust property tests):
+
+1. `max_element_empty_returns_zero` — captures the unit test `empty_list_returns_zero`: empty slice returns the sentinel `0`.
+2. `max_element_total` — captures the proptest `never_panics`: totality, the function always returns `RustM.ok` on every input (no indexing fault, no `usize` increment overflow).
+3. `max_element_returned_is_an_element_of_the_list` — captures the proptest `result_is_an_element_of_the_list`: the result equals some `l[j]`. Stated under `0 < l.val.size` because the empty case returns the sentinel `0`, which need not be in the list.
+4. `max_element_is_an_upper_bound` — captures the proptest `result_is_an_upper_bound`: the result dominates every element of `l`, stated via `.toInt` to bridge `i64` comparison to `Int`. No size precondition needed: the empty case quantifier is vacuous over `j < 0`.
+
+**Independence rationale:** clauses 3 and 4 are mutually independent — a buggy impl returning `i64::MAX` would satisfy 4 but not 3; one returning `l[0]` would satisfy 3 but not 4. Both must appear.
+
+**Property tests classified as derived facts (skipped):** none. All four Rust tests correspond to genuine contract surface (sentinel, totality, two postcondition halves).
+
+**Theorems I'm uncertain about (framing):** none — the shapes mirror the closest reference (`min_at_correct` in `rescale_to_unit`'s file, which proves the dual upper-bound + existential-witness pair for a tail-recursive `i64`-slice extremum). For the upper-bound clause I chose to omit the `0 < l.val.size` hypothesis (vacuously true on empty), which is a small simplification; the proof stage may add it back if it makes the proof cleaner — but the statement is correct as-is.
+
+make_lean_obligations
+
+[make_proof] attempt 1/2
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/rescale_to_unit_modified/proofs/lean/extraction/... [+44 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Con... [+27 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/clever_009_rolling_max_modified/proofs/lean/extr... [+47 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Cleve... [+34 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/**/*.lean"})
+[tool] Glob({"pattern": "**/proof-libs/lean/**/*.lean"})
+[tool] Grep({"pattern": "is_empty", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/epilogue/slice.lean", "output_mode": "content... [+14 chars])
+[tool] Grep({"pattern": "rust_primitives.cmp.gt|rust_primitives.cmp.lt|rust_primitives.cmp.ge", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/H... [+58 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 70, "limit": 50})
+[tool] Grep({"pattern": "is_empty", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content", "-n": true})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/core_models.lean", "offset": 1955, "limit": 15})
+[tool] Grep({"pattern": "lt_iff_toInt_lt", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content", "-n": true})
+[tool] Grep({"pattern": "Int64.lt_iff_toInt_lt|Int64.toInt", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/SInt", "ou... [+33 chars])
+[tool] Grep({"pattern": "Int64\\.lt_iff_toInt_lt", "path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns", "output_mode"... [+42 chars])
+[tool] Grep({"pattern": "slice_length|def Impl.len", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content", "-n": true})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/slice.lean", "offset": 25, "limit": 10})
+[tool] Grep({"pattern": "Int64.toInt_inj|toInt_inj", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content", "-n": true, ... [+17 chars])
+Now I have enough understanding. Let me write the complete obligations file.
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_034_max_elementObligations.lean", "content": "-- Companion obligations file for the `clever_034_max_element` extraction.... [+18706 chars])
+[tool] run_lake_build({})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_034_max_elementObligations.lean", "patch": "<<< SEARCH\n    refine \u27e8m, max_at_oob l i m hi_ge, le_refl _, ?_, Or.in... [+724 chars])
+[tool] run_lake_build({})
+Build succeeded. Let me confirm there are no remaining `sorry`s:
+[tool] Grep({"pattern": "sorry", "path": "proofs/lean/extraction/Clever_034_max_elementObligations.lean", "output_mode": "content", "-n": true})
+All four obligations are closed with no `sorry`. Build is clean.
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Clever_034_max_elementObligations.lean`
+
+**`lake build` status:** ✅ success, no `sorry` warnings, all four obligations closed.
+
+**Structure of the proof** (transferred from `rescale_to_unit_modified`'s dual `min_at_correct` proof):
+
+1. **Helpers** — `RustM_ok_bind`, `usize_one_toNat`, `usize_size_eq`, `usize_add_one_toNat` (same as references).
+2. **`is_empty` reductions** — two specialised lemmas for the `l.is_empty()` branch entered by `max_element`:
+   - `is_empty_true_of_empty` (empty → `ok true`)
+   - `is_empty_false_of_nonempty` (non-empty → `ok false`)
+3. **`max_at` step lemmas** — three branches of the tail-recursive body:
+   - `max_at_oob` (out-of-bounds returns the running `m`)
+   - `max_at_step_gt` (when `l[i] > m`, recurse with new seed `l[i]`)
+   - `max_at_step_le` (when `l[i] ≤ m`, recurse keeping `m`)
+4. **`max_at_correct`** — strong induction on the suffix measure `l.val.size - i.toNat`, producing the dual of the `min_at_correct` invariant:
+   - `m.toInt ≤ r.toInt` (result dominates seed)
+   - `(l[j]).toInt ≤ r.toInt` for `j ∈ [i, size)` (suffix upper-bound)
+   - existential witness: `r = m` or `r = l[j]` for some `j ∈ [i, size)`
+5. **`max_element_aux_nonempty`** — combines `is_empty_false_of_nonempty` + index-at-0 reduction + `max_at_correct` at `(1, l[0])` to derive the upper-bound + element-of clauses for non-empty slices.
+6. **Four top-level theorems** — discharge each obligation:
+   - `max_element_empty_returns_zero` — directly via `is_empty_true_of_empty`
+   - `max_element_total` — splits on `l.val.size = 0` and reuses the two prior aux lemmas
+   - `max_element_returned_is_an_element_of_the_list` — from the existential witness clause of the aux lemma
+   - `max_element_is_an_upper_bound` — extracts `0 < l.val.size` from the hypothesis `j < l.val.size` (vacuous on empty), then uses the upper-bound clause
+
+**Sub-goals that required attention:**
+
+- **`>` vs `<` on `i64`.** The reference `min_at` uses `<?`, our `max_at` uses `>?`. Lean parses `a > b` as `b < a`, so `Int64.lt_iff_toInt_lt` applied to `h_gt : a > b` gives `b.toInt < a.toInt` (the right reversal direction). For `decide ((l[i]) > m) = true`, we use `Int64.lt_iff_toInt_lt.mpr` on `hgt : m.toInt < (l[i]).toInt`.
+- **Initial `le_refl _` build error.** Lean did not find an unqualified `le_refl` — `m.toInt` is `Int`, so the qualified `Int.le_refl _` was needed. One-line patch.
+- **`is_empty` reduction.** `core_models.slice.Impl.is_empty` doesn't appear in any of the four picked reference files (they all branch on length comparisons, not `is_empty`). Reduced it by `show`-unfolding the `do`-block down to `pure (USize64.ofNat l.val.size == (0 : usize))`, then deciding the `BEq` for the two cases.
+
+**Obligations left as `sorry`:** none.
+
+**Theorem statements:** unchanged from the obligations stage — closed exactly as stated.
+[make_proof] attempt 1 done — 0 sorry remain
+[make_proof] closed after 1 attempt(s)
+
+make_proof
+Looking at this proof, I need to compare its verification obstacles against the existing library.
+
+**Core proof obstacles in this entry:**
+1. Strong induction on `size − i.toNat` with seeded tail recursion on an i64 slice
+2. Extremum-witness existential (`r = l[j*]` for some j*)
+3. Three step lemmas (oob / gt / le) discharged by one unfold + simp
+4. `is_empty` reduction lemmas (both true/false branches)
+5. Empty-slice sentinel handling (returns 0)
+6. Contract decomposition into 4 independent theorems via a shared aux lemma (`max_element_aux_nonempty`)
+7. Signed int toInt-bridge for the `>` comparison
+8. usize add-no-overflow via BitVec.uaddOverflow
+
+**Coverage check against the library:**
+
+- **`rescale_to_unit_modified`** already provides `min_at_correct` — the structural dual of `max_at_correct`: strong induction on `size − i.toNat`, three branch step lemmas, extremum-witness existential (`m = numbers[j*]`), seeded recursion, signed int bridges, usize add-no-overflow. The `extremum-witness-element` tag was minted there.
+- **`clever_025_remove_duplicates_modified`** already covers the "shared aux lemma + project conjuncts into independent top-level theorems" pattern (`three-conjunct-contract` + `shared-aux-lemma`).
+- **`contains_u64_modified` / `below_zero_modified`** cover the tail-recursive slice scan + strong induction skeleton.
+
+Every tag I'd assign is already present in ≥2 existing entries, and the tactic shape (three step lemmas + strong induction on `size − i.toNat` with an extremum witness, then project from a shared aux) is line-for-line a re-instance of `rescale_to_unit_modified`'s `min_at` proof composed with the multi-theorem projection from `clever_025_remove_duplicates_modified`.
+
+The minor novelty (`is_empty` reduction lemmas, sentinel-return on empty) is reusable boilerplate, not a new obstacle class — and the seeded-from-index-1 pattern is just a special case of the existing recursive-from-index-i shape.
+
+A future target needing a max/min over a slice with an empty-slice sentinel can derive this proof straightforwardly from `rescale_to_unit_modified` plus a small `is_empty` lemma.
+
+SKIPPED — covered by `rescale_to_unit_modified` (extremum-witness strong induction on `size − i.toNat`) and `clever_025_remove_duplicates_modified` (shared-aux + multi-theorem contract decomposition).
+
+harvest_proof_patterns
+Stage notes: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260514-020443_034_max_element_stage_notes.json
+[cleanup] freed 351.2MB from benchmarks/claude-opus-4-7/clever_2/034_max_element_modified

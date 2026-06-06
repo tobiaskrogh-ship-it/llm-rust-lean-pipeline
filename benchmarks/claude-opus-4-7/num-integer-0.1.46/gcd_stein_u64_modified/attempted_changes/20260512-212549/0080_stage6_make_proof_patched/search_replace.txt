@@ -1,0 +1,147 @@
+<<< SEARCH
+/-- **Functional correctness (closed form).** For every pair of `u64`
+inputs, `gcd_stein` succeeds and returns the integer gcd of the two
+inputs (computed over `Nat`).  This single equation pins down every
+concrete `known_values` case as well as the `zero_zero_is_zero`
+boundary (`Nat.gcd 0 0 = 0`).
+
+**Proof state (after retry attempt 4):**
+
+* `a = 0` branch — closed via `gcd_stein_a_zero` + `Nat.gcd_zero_left`.
+* `b = 0` branch — closed via `gcd_stein_b_zero` + `Nat.gcd_zero_right`.
+* `a ≠ 0 ∧ b ≠ 0` branch — `sorry` remains, but the proof now
+  (1) extracts the three `trailing_zeros_u64` witnesses with their
+  divisibility / oddness clauses, (2) discharges the
+  `(a == 0) || (b == 0) = false` boundary check, (3) unfolds the
+  function and runs a `simp only` that uses the three witnesses
+  (`h_tz_a`, `h_tz_b`, `h_tz_ab`) as rewrite rules — eliminating each
+  `trailing_zeros_u64` call.
+
+**Infrastructure added in retry-4 (above this theorem):**
+
+All five of the algebraic / termination identities the outer-loop
+Hoare triple would need are now **fully proved**:
+
+* `nat_gcd_sub_self_left` — Euclid subtraction step (existing).
+* `nat_gcd_halve_even` — gcd(2k, n) = gcd(k, n) for `n` odd (existing).
+* `nat_gcd_halve_even_pow` — iterated form `gcd(m/2^k, n) = gcd(m, n)`
+  for `n` odd and `2^k ∣ m` (existing).
+* `stein_diff_even_pos` — `m - n` is positive and even when `m, n`
+  are both positive, both odd, and `m > n`.  This is the fact that
+  forces `trailing_zeros_u64 (m - n) ≥ 1` in every Stein iteration.
+* `stein_body_gcd_preserve_left/right` — single-step gcd preservation
+  for the body's two branches:
+  `Nat.gcd ((m - n) / 2^k) n = Nat.gcd m n`  (when `n` odd, `2^k ∣ m-n`)
+  and the symmetric variant for the `m ≤ n` branch.
+* `stein_term_decrease_left/right` — strict decrease of `m + n` as
+  termination measure, granted `k ≥ 1`.
+
+The outer-loop scaffolding (`steinCond`, `steinBody`, `steinLoop`,
+`steinInv`, `steinTerm`) is also defined above so a future pass can
+state `stein_loop_triple` by `apply Spec.MonoLoopCombinator.while_loop`
+and `unfold rust_primitives.hax.while_loop` will reveal `steinLoop`.
+
+**Specific stuck sub-goal after the `simp only` (this theorem's body):**
+
+After the simp rewrites away the three `trailing_zeros_u64` calls
+the goal still contains
+  `rust_primitives.hax.while_loop ... ⟨a >>> k_a.toNat.toUInt64,
+                                       b >>> k_b.toNat.toUInt64⟩ ...`
+plus a final `(m_final <<<? k_ab)`.  Closing this requires three
+*non-mechanical* pieces of work that do not exist yet:
+
+1. **`stein_loop_triple` itself** — a Hoare triple over `steinLoop`
+   with invariant `steinInv (Nat.gcd m_odd n_odd)` and termination
+   `steinTerm`.  Stating it is mechanical (`steinInv`, `steinTerm`
+   are now defined), but the *body step* requires composing the
+   inner `trailing_zeros_u64_correctness` with the branch-specific
+   gcd-preservation lemma `stein_body_gcd_preserve_{left,right}` —
+   roughly 150 lines of `tz_loop_triple`-style proof, with the extra
+   complication that the body contains a *nested* `RustM` call
+   (the inner `trailing_zeros_u64`).
+
+2. **The closed-form bridge** between `Nat.gcd m_odd n_odd` and
+   `Nat.gcd a b`: specifically,
+   `Nat.gcd a.toNat b.toNat = 2^k_ab.toNat * Nat.gcd m_odd.toNat n_odd.toNat`.
+   This depends on the bit-level identity `k_ab = min(k_a, k_b)`
+   (since `tz(a|b) = min(tz(a), tz(b))`).  Once that identity is
+   available, `nat_gcd_halve_even_pow` cancels the residual `2^|k_a - k_ab|`
+   or `2^|k_b - k_ab|` factor against the odd partner.
+
+3. **No-truncation for the final `m_final <<<? k_ab`**:
+   `m_final.toNat * 2 ^ k_ab.toNat < 2^64` follows from item 2
+   (since the product equals `Nat.gcd a.toNat b.toNat` and
+   `gcd_lt_2_64` already shows that bound).  The shift itself
+   then evaluates to `RustM.ok (UInt64.ofNat (m_final.toNat * 2^k_ab.toNat))`
+   via a `UInt64.toNat_shiftLeft` analogue.
+
+**Structural unblock the next pass would need:** prove
+`stein_loop_triple` as a stand-alone theorem.  Every algebraic piece
+it needs has been factored into a named lemma above, so the only
+genuinely-new content is the body-step bind-chain reduction.  The
+`tz_loop_triple` proof in this file is the template — the differences
+are the case-split on `m > n` vs `m ≤ n` and the nested
+`trailing_zeros_u64` call inside the body.  See the in-body comment
+following the `simp only` for the precise goal-shape after the
+trailing-zeros rewrites land. -/
+===
+/-- **Functional correctness (closed form).** For every pair of `u64`
+inputs, `gcd_stein` succeeds and returns the integer gcd of the two
+inputs (computed over `Nat`).  This single equation pins down every
+concrete `known_values` case as well as the `zero_zero_is_zero`
+boundary (`Nat.gcd 0 0 = 0`).
+
+**Proof state (after retry attempt 5):**
+
+* `a = 0` branch — closed via `gcd_stein_a_zero` + `Nat.gcd_zero_left`.
+* `b = 0` branch — closed via `gcd_stein_b_zero` + `Nat.gcd_zero_right`.
+* `a ≠ 0 ∧ b ≠ 0` branch — `sorry` remains, but the *outer loop*
+  Hoare triple `stein_loop_triple` and its existential corollary
+  `stein_loop_ok` are now fully proved above (this is the chunk of
+  work the prior retry's docstring identified as the main structural
+  unblock).  All five algebraic identities and the body-step
+  bind-chain reduction (m -? n no-underflow, inner trailing_zeros
+  call extraction, (m-n) >>>? k bounds-check discharge, gcd-preservation
+  via `stein_body_gcd_preserve_{left,right}`, termination measure
+  decrease via `stein_term_decrease_{left,right}`) are closed.
+
+**What remains for the main branch:**
+
+1. **Closed-form bridge between odd-parts gcd and full gcd:**
+   `Nat.gcd (a.toNat / 2^k_a) (b.toNat / 2^k_b) * 2^k_ab = Nat.gcd a.toNat b.toNat`.
+   This requires the bit-level identity `k_ab = min(k_a, k_b)` (from
+   `tz(a | b) = min(tz(a), tz(b))`), which in turn depends on the
+   pure-Nat or-divisibility fact `2^k ∣ (a ||| b) ↔ 2^k ∣ a ∧ 2^k ∣ b`.
+   This bit-level fact is not in the Hax prelude and would need to be
+   either proved as a helper lemma (likely via `bv_decide`) or
+   developed bit-by-bit using `Nat.land_bitwise_eq_bitwise_and`-style
+   identities.  Once the identity is available, the available
+   `nat_gcd_halve_even_pow` cancels the residual factor cleanly.
+
+2. **Connection from `rust_primitives.hax.while_loop` to `steinLoop`:**
+   The extracted `gcd_stein` calls `rust_primitives.hax.while_loop`
+   with auto-synthesized `pureInv`/`pureCond`/`pureTermination`
+   subtype witnesses.  By definition (see the prelude file
+   `hax/while_loop.lean`) this reduces to
+   `Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk pureCond.val
+    init body`, i.e. the same shape as `steinLoop`.  However, matching
+   the auto-synthesized `pureCond.val` against the explicit
+   `steinCond` requires unfolding the synthesis-tactic invocation,
+   which the current proof doesn't do explicitly.  The pattern in
+   `Gcd_whileObligations.gcd_while_triple` shows how this is done
+   for the simpler `gcd_while` (single-loop, no nested function calls):
+   `unfold rust_primitives.hax.while_loop` exposes the underlying
+   combinator and a `show` cast to the abbreviation form.
+
+3. **No-overflow on the final `m_final <<<? k_ab`:** Bounded by
+   `m_final.toNat * 2^k_ab.toNat = Nat.gcd a.toNat b.toNat < 2^64`
+   (using `gcd_lt_2_64`).  Once (1) gives the equation, the shift
+   evaluates via a `UInt64.toNat_shiftLeft` analogue (needs a
+   prelude bound check pattern like for `>>>?`).
+
+**Structural unblock the next pass would need:** A separately
+verified `nat_or_dvd_pow_two_iff_both` lemma (or equivalent bit-level
+identity proved via `bv_decide` on the BitVec form), then 30 lines
+of mechanical proof connecting the extracted function's while_loop
+call to `steinLoop` and applying `stein_loop_ok`. -/
+>>> REPLACE

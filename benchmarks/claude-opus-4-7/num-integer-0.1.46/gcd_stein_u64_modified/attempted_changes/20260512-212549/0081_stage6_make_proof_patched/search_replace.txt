@@ -1,0 +1,112 @@
+<<< SEARCH
+  -- After unfolding and the boundary discharge, the goal is the else-branch:
+  --   (do let shift ← trailing_zeros_u64 (← (a |||? b));
+  --        let m ← (a >>>? (← trailing_zeros_u64 a));
+  --        let n ← (b >>>? (← trailing_zeros_u64 b));
+  --        let ⟨m, n⟩ ← rust_primitives.hax.while_loop ...;
+  --        (m <<<? shift)) = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat))
+  --
+  -- The next mechanical step would be to use h_tz_ab/h_tz_a/h_tz_b to
+  -- eliminate the three trailing-zeros let-bindings.  Each rewrite
+  -- requires lifting the bare `trailing_zeros_u64 x = RustM.ok k`
+  -- equation to a do-block context, which `simp only [bind_assoc]`
+  -- combined with `pure_bind` can normalize.  The genuinely-hard
+  -- remaining work is the *outer Stein while-loop*, which has the
+  -- same shape as `tz_loop_triple` above but with a more elaborate
+  -- body that itself calls `trailing_zeros_u64`.
+  --
+  -- **Specific stuck sub-goal:** at this point the goal contains
+  -- `rust_primitives.hax.while_loop ... ⟨a >>> k_a, b >>> k_b⟩
+  --   (fun ⟨m, n⟩ => do if m > n then ... else ...)` followed by
+  -- `(m_final <<<? k_ab)`.  Closing this requires:
+  --   (1) An outer-loop Hoare triple `stein_loop_triple` with
+  --       invariant `m, n both odd ∧ m, n both positive ∧
+  --       Nat.gcd m.toNat n.toNat = Nat.gcd (a.toNat / 2^k_a) (b.toNat / 2^k_b)`
+  --       and termination measure `m.toNat + n.toNat`.  The body step
+  --       case-splits on `m > n` vs `m ≤ n` and uses
+  --       `nat_gcd_halve_even_pow` (proved above) plus
+  --       `Nat.gcd_self_sub_left` from Lean core.
+  --   (2) The closed form `Nat.gcd a.toNat b.toNat =
+  --       Nat.gcd (a.toNat / 2^k_a) (b.toNat / 2^k_b) * 2^k_ab`
+  --       — relates the gcd of the odd parts back to the gcd of the
+  --       original inputs, via `Nat.gcd 2 a = 1` reasoning.  This
+  --       step is the algebraic core of Stein's algorithm.
+  --   (3) Showing the final `m_final <<<? k_ab` does not overflow:
+  --       `m_final.toNat * 2 ^ k_ab.toNat = Nat.gcd a.toNat b.toNat <
+  --       2 ^ 64` follows from `gcd_lt_2_64` once we have (2).
+  --
+  -- **Structural unblock the next pass would need:** prove
+  -- `stein_loop_triple` as a stand-alone theorem.  The body step
+  -- is the only genuinely-new content (everything else, including
+  -- the algebraic lemmas, is already in place in this file).  The
+  -- body step requires composing the inner `trailing_zeros_u64`
+  -- spec — `trailing_zeros_u64_correctness` here — with the gcd
+  -- preservation identity `nat_gcd_halve_even_pow` (already
+  -- proved).  The `tz_loop_triple` structure above is the
+  -- template to copy.
+  sorry
+===
+  -- After unfolding and the boundary discharge, the goal is the else-branch:
+  --   (do let shift ← trailing_zeros_u64 (← (a |||? b));
+  --        let m ← (a >>>? (← trailing_zeros_u64 a));
+  --        let n ← (b >>>? (← trailing_zeros_u64 b));
+  --        let ⟨m, n⟩ ← rust_primitives.hax.while_loop ...;
+  --        (m <<<? shift)) = RustM.ok (UInt64.ofNat (Nat.gcd a.toNat b.toNat))
+  --
+  -- **Proof state after retry attempt 5:**
+  --
+  -- The outer Stein loop's Hoare triple `stein_loop_triple` and its
+  -- existential corollary `stein_loop_ok` (above this theorem) are
+  -- *fully proved* with no surviving sub-sorries.  This was the
+  -- structural unblock identified by retry-4's docstring.  Together
+  -- with the existing `trailing_zeros_u64_correctness` lemma,
+  -- everything needed to *characterize* the loop's behaviour at the
+  -- Nat level is in place:
+  --   `stein_loop_ok m₀ n₀ G h_init :
+  --      ∃ v : u64, steinLoop m₀ n₀ = RustM.ok ⟨v, v⟩ ∧ v.toNat = G`
+  --
+  -- **Specific stuck sub-goal:** to apply `stein_loop_ok` here we
+  -- must connect the extracted `rust_primitives.hax.while_loop ...`
+  -- to the abbreviation `steinLoop`.  The two are *definitionally
+  -- equal* (both reduce to
+  -- `Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk steinCond
+  --  ⟨m_odd, n_odd⟩ steinBody`), but the connection is mediated by
+  -- the auto-synthesized `pureCond`/`pureInv`/`pureTermination`
+  -- subtype witnesses Hax generates.  The pattern in
+  -- `Gcd_whileObligations.gcd_while_triple` for this connection is
+  -- `unfold rust_primitives.hax.while_loop` followed by a `show` to
+  -- the abbreviation form.  For Stein, that connection plus a
+  -- closed-form bridge for gcd are the two remaining pieces.
+  --
+  -- **Two remaining gaps (after retry-5):**
+  --
+  -- 1. **Closed-form bridge** between `Nat.gcd m_odd n_odd` (the
+  --    invariant of `stein_loop_ok`) and `Nat.gcd a.toNat b.toNat`:
+  --    specifically,
+  --    `Nat.gcd a.toNat b.toNat = 2^k_ab.toNat * Nat.gcd m_odd n_odd`,
+  --    where `m_odd = a.toNat / 2^k_a.toNat`, `n_odd = b.toNat / 2^k_b.toNat`,
+  --    and `k_ab = min(k_a, k_b)`.  The bit-level identity
+  --    `tz(a|b) = min(tz(a), tz(b))` is needed for the `k_ab = min` step;
+  --    this in turn rests on the pure-Nat fact
+  --    `2^k ∣ (a ||| b) ↔ 2^k ∣ a ∧ 2^k ∣ b`, which isn't in the
+  --    Hax prelude (would likely be a `bv_decide`-discharged lemma
+  --    or a bit-by-bit induction on the trailing-zero count).
+  --    Once `k_ab = min(k_a, k_b)` is available, `nat_gcd_halve_even_pow`
+  --    (proved above) cancels the residual `2^|k_a - k_ab|` or
+  --    `2^|k_b - k_ab|` factor against the odd partner.
+  --
+  -- 2. **No-overflow on `m_final <<<? k_ab`:** Bounded by
+  --    `m_final.toNat * 2^k_ab.toNat = Nat.gcd a.toNat b.toNat < 2^64`
+  --    (from `gcd_lt_2_64`).  Once (1) gives the equation, this
+  --    follows by the same reasoning as `tz_loop_triple`'s shift
+  --    bounds-check, modulo plugging into a `UInt64.toNat_shiftLeft`
+  --    analogue of `UInt64.toNat_shiftRight`.
+  --
+  -- **Structural unblock the next pass would need:** a
+  -- `nat_or_dvd_pow_two_iff_both` lemma (or equivalent bit-level
+  -- identity established via `bv_decide` on the BitVec form), then
+  -- 30 lines connecting the extracted while_loop call to `steinLoop`
+  -- via `unfold rust_primitives.hax.while_loop` and applying
+  -- `stein_loop_ok`.
+  sorry
+>>> REPLACE

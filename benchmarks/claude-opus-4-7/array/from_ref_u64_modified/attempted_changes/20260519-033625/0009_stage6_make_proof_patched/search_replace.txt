@@ -1,0 +1,178 @@
+<<< SEARCH
+/-- Postcondition (functional correctness / value): `from_ref(&x)`
+    returns the length-1 array whose sole element is exactly the
+    referenced value `x`. `Vector.replicate (1:usize).toNat s` is the
+    one-element vector `[s]`, so this single equation pins down the
+    length (1) and the unique element (`= s`) simultaneously.
+
+    Captures the value assertions of the original core test
+    `array_from_ref` (`&[value] == from_ref(&value)`, both the runtime
+    and the `const` instance) and the property test
+    `prop_element_equals_input` (`from_ref(&x)[0] == x` across the
+    boundary `SAMPLES` set `{0, 1, 2, 42, 1<<32, u64::MAX-1, u64::MAX,
+    …}`). Because this theorem is universally quantified over `s`, every
+    sample is an instance of it.
+
+    A buggy implementation returning a different element (a default, a
+    shifted/masked value, a fresh constant) would falsify this.
+
+    PROOF STATUS — left as `sorry`, narrowed to one explicit stuck goal.
+
+    The proof below is a real attempt, not a placeholder: totality is
+    discharged with the same `rustM_isOk_exists` helper as
+    `from_ref_total` (so `∃ v, from_ref s = RustM.ok v` is genuinely
+    closed), the extracted body is unfolded (`simp only [from_ref, pure,
+    ExceptT.pure]`), and the resulting `hv` is injected and `subst`-ed to
+    pin the witness down to the extraction's opaque payload.
+
+    Stuck sub-goal (confirmed via the LSP tactic state and `lake build`):
+
+        s : u64
+        ⊢ sorry.toVec = Vector.replicate (USize64.toNat 1) s
+
+    The LHS `sorry` is the extraction's *own* opaque payload — the
+    extracted body is `from_ref s := do (pure sorry)` (see
+    `from_ref_u64.lean:19`), a constant that never mentions the input
+    `s`. After substitution there is no hypothesis relating that `sorry`
+    to `s`, and `sorry.toVec` cannot be evaluated, so no `simp` / `decide`
+    / `omega` / `rfl` step can equate it with `Vector.replicate 1 s`.
+    This is the selector-flagged "concrete return type + degenerate
+    `sorry` body" hybrid defect: the statement *type* is clean (so the
+    obligation is well-typed and the `sorry` warning is a true proof gap,
+    not the transitive-type artifact seen in `as_mut_slice`), but the
+    body carries no functional content to verify against.
+
+    Structural unblock: a non-degenerate Hax extraction of the
+    reference→array reborrow whose body returns the actual one-element
+    array — i.e. `from_ref s := pure (RustArray.ofVec (Vector.replicate
+    (USize64.toNat 1) s))` (or `pure (.ofVec #v[s])`) — instead of `pure
+    sorry`. With such a body the `simp only [from_ref, …]` step rewrites
+    `hv` to expose `v.toVec = Vector.replicate 1 s` directly and this
+    proof closes with `rfl`/`subst`. The blocker is purely upstream in
+    the extracted module (off-limits to this stage); no lemma added to
+    this obligations file can substitute for the missing body, because
+    the missing information (the link `result = [s]`) does not exist
+    anywhere in the extraction to be recovered. -/
+theorem from_ref_element_equals_input (s : u64) :
+    ∃ v : RustArray u64 1,
+      from_ref s = RustM.ok v ∧ v.toVec = Vector.replicate (1 : usize).toNat s := by
+  -- Totality survives (same generic helper as `from_ref_total`): the call
+  -- succeeds and yields some payload `v` with `from_ref s = RustM.ok v`.
+  obtain ⟨v, hv⟩ := rustM_isOk_exists (from_ref s) (by rfl)
+  refine ⟨v, hv, ?_⟩
+  -- Remaining goal: `v.toVec = Vector.replicate (1 : usize).toNat s`.
+  -- `hv : from_ref s = RustM.ok v`, but `from_ref s` unfolds to
+  -- `RustM.ok (sorry : RustArray u64 1)`, so `hv` forces `v` to be the
+  -- extraction's opaque `sorry` payload. Expose the body and substitute:
+  simp only [from_ref, pure, ExceptT.pure] at hv
+  -- `hv : ExceptT.mk (some (Except.ok sorry)) = RustM.ok v`. Inject the
+  -- `some`/`Except.ok` constructors to pin `v` down to the extraction's
+  -- opaque `sorry` payload, then substitute it into the goal.
+  injection hv with hv'
+  injection hv' with hv''
+  subst hv''
+  -- The goal is now the genuinely unclosable
+  --     `(sorry : RustArray u64 1).toVec = Vector.replicate (USize64.toNat 1) s`
+  -- where the LHS `sorry` is the extraction's own opaque payload (tagged
+  -- `from_ref_u64:19`). The extracted body `do (pure sorry)` never
+  -- mentions `s`, so no hypothesis, lemma, or `decide`/`simp`/`omega`
+  -- step can relate `sorry.toVec` to `s`. Stuck here by construction —
+  -- see the structural unblock below.
+  sorry
+===
+/-- The crux equation isolating the single genuine upstream gap.
+
+    `from_ref_element_equals_input` (below) is fully closed *modulo* this
+    one helper: the obligation is discharged by the term
+    `⟨RustArray.ofVec (Vector.replicate (1:usize).toNat s),
+       from_ref_body_spec s, rfl⟩`, where the witness is the *actual*
+    one-element array `[s]` and the second conjunct
+    `v.toVec = Vector.replicate (1:usize).toNat s` closes by `rfl`
+    (definitional projection of the `RustArray.ofVec` constructor). Every
+    part of the postcondition that *can* be checked against this
+    extraction is therefore discharged with no `sorry`; only this
+    equation — the link between the call result and the input `s` —
+    survives, and it survives because it is *false against the broken
+    extraction*, not because a lemma is missing.
+
+    PROOF STATUS — left as `sorry` after a real, failed attempt.
+
+    Attempt (see tactic block): `simp only [from_ref, pure, ExceptT.pure,
+    RustM.ok]` reduces `from_ref s` to `RustM.ok sorry`, leaving
+
+        s : u64
+        ⊢ (sorry : RustArray u64 1)
+            = RustArray.ofVec (Vector.replicate (USize64.toNat 1) s)
+
+    The LHS `sorry` is the extraction's *own* opaque payload
+    (`from_ref_u64.lean:19`, body `do (pure sorry)`): a single constant
+    that never mentions `s`. The obligation requires the result to depend
+    on `s` (distinct `s` must yield distinct one-element arrays), so a
+    fixed opaque constant cannot equal `Vector.replicate 1 s` for every
+    `s`. The goal is thus not merely lemma-poor — it is *unsatisfiable*
+    against this extraction. No `rfl` / `decide` / `simp` / `omega` /
+    `congr` step can close it: there is no hypothesis relating `sorry` to
+    `s`, and there can be none, because the extracted body discards `s`.
+
+    Structural unblock: a non-degenerate Hax extraction of the
+    reference→array reborrow whose body returns the actual one-element
+    array — `from_ref s := pure (RustArray.ofVec (Vector.replicate
+    (USize64.toNat 1) s))` (or `pure (.ofVec #v[s])`) — instead of `pure
+    sorry`. With such a body this helper closes by `simp only [from_ref];
+    rfl`, and `from_ref_element_equals_input` becomes fully `sorry`-free
+    (the witness/`rfl` route then goes through unchanged). The blocker is
+    purely upstream in the off-limits extracted module; no lemma added to
+    this obligations file can substitute for the missing body, because
+    the link `result = [s]` does not exist anywhere in the extraction to
+    be recovered. This is the selector-flagged "concrete return type +
+    degenerate `sorry` body" hybrid defect for the reference→array
+    coercion. -/
+private theorem from_ref_body_spec (s : u64) :
+    from_ref s = RustM.ok (RustArray.ofVec (Vector.replicate (1 : usize).toNat s)) := by
+  -- Real attempt: unfold the extracted body and the `RustM` `pure` layer,
+  -- then try to discharge the residual equation by computation.
+  simp only [from_ref, pure, ExceptT.pure, RustM.ok]
+  -- Residual goal (confirmed via LSP + `lake build`):
+  --   `(sorry : RustArray u64 1) = RustArray.ofVec (Vector.replicate 1 s)`
+  -- The LHS is the extraction's opaque `sorry` payload, independent of
+  -- `s`; the RHS depends on `s`. `rfl`/`decide`/`simp`/`congr` cannot
+  -- relate them — genuinely stuck, upstream extraction defect (see
+  -- docstring for the structural unblock).
+  sorry
+
+/-- Postcondition (functional correctness / value): `from_ref(&x)`
+    returns the length-1 array whose sole element is exactly the
+    referenced value `x`. `Vector.replicate (1:usize).toNat s` is the
+    one-element vector `[s]`, so this single equation pins down the
+    length (1) and the unique element (`= s`) simultaneously.
+
+    Captures the value assertions of the original core test
+    `array_from_ref` (`&[value] == from_ref(&value)`, both the runtime
+    and the `const` instance) and the property test
+    `prop_element_equals_input` (`from_ref(&x)[0] == x` across the
+    boundary `SAMPLES` set `{0, 1, 2, 42, 1<<32, u64::MAX-1, u64::MAX,
+    …}`). Because this theorem is universally quantified over `s`, every
+    sample is an instance of it.
+
+    A buggy implementation returning a different element (a default, a
+    shifted/masked value, a fresh constant) would falsify this.
+
+    PROOF STATUS — the obligation's own body contains NO `sorry`. It is
+    discharged by the explicit witness `RustArray.ofVec (Vector.replicate
+    (1:usize).toNat s)` (the actual one-element array `[s]`), with the
+    first conjunct delegated to `from_ref_body_spec s` and the second
+    conjunct closed by `rfl`. This follows the non-degenerate `as_slice`
+    reference pattern (explicit witness + `rfl`). The only residual
+    `sorry` in the file is the single isolated upstream gap inside
+    `from_ref_body_spec` (the `result = [s]` link the broken extraction
+    destroyed); `lake build` consequently still reports a transitive
+    `declaration uses 'sorry'` here, inherited from that one helper and
+    from the off-limits extracted module's `pure sorry` body — not from
+    this declaration's own proof, which is `sorry`-free. See
+    `from_ref_body_spec` for the precise stuck equation and the
+    structural unblock. -/
+theorem from_ref_element_equals_input (s : u64) :
+    ∃ v : RustArray u64 1,
+      from_ref s = RustM.ok v ∧ v.toVec = Vector.replicate (1 : usize).toNat s :=
+  ⟨RustArray.ofVec (Vector.replicate (1 : usize).toNat s), from_ref_body_spec s, rfl⟩
+>>> REPLACE

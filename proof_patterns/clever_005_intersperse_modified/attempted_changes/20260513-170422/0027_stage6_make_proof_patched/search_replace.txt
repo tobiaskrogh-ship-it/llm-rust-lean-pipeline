@@ -1,0 +1,239 @@
+<<< SEARCH
+/-! ## Strong-induction helper for the non-empty obligations
+
+The three remaining obligations (length-nonempty, even-indices, odd-indices)
+all reduce to a single invariant on the recursion of `intersperse_at`. We
+state that invariant here as `intersperse_at_full_invariant`.
+
+The invariant says: starting from `(i, acc)` with `acc` already a valid
+"partial output up to index `i.toNat`", if `intersperse_at` succeeds and
+returns `v`, then `v` is a valid "full output up to `numbers.val.size`".
+
+**Structural unblock for the surviving `sorry`:** the proof is a strong
+induction on `numbers.val.size - i.toNat` using the three step lemmas above
+(`intersperse_at_oob`, `intersperse_at_step_zero`, `intersperse_at_step_pos`).
+The induction step needs an auxiliary "step-success extraction" lemma:
+
+```
+private theorem intersperse_at_step_extract
+    (numbers : RustSlice i64) (delimiter : i64) (i : usize)
+    (acc v : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi : i.toNat < numbers.val.size)
+    (hres : intersperse_at numbers delimiter i acc = RustM.ok v) :
+  (i.toNat = 0 ∧ ∃ h_no : acc.val.size + 1 < 2 ^ 64,
+     intersperse_at numbers delimiter (i + 1)
+       (acc_push_one acc (numbers.val[0]'hi) h_no) = RustM.ok v) ∨
+  (0 < i.toNat ∧ ∃ (h_no : acc.val.size + 2 < 2 ^ 64) (h_i1 : i.toNat + 1 < 2^64),
+     intersperse_at numbers delimiter (i + 1)
+       (acc_push_two acc delimiter (numbers.val[i.toNat]'hi) h_no) = RustM.ok v)
+```
+
+This extraction lemma converts `hres : ok v` into the preconditions of
+`intersperse_at_step_zero` / `intersperse_at_step_pos`, then applies them to
+get a smaller recursive `intersperse_at = ok v` for the inductive step.
+
+Proving the extraction lemma requires unfolding the function body the same
+way the step lemmas do, but in REVERSE: from `ok v` deduce that the inner
+`extend_from_slice` and `i +? 1` calls succeeded (i.e., the dif-positive
+branches were taken). This is the analogue of `i64_sub_extract` in
+`proof_patterns/000_has_close_elements_modified` (which extracts
+`¬ subOverflow` from `ok y`).
+
+Once that extraction lemma is available, the strong-induction proof of
+`intersperse_at_full_invariant` is mechanical: case-split on `i.toNat ≥ n`
+(use `oob`) vs `i.toNat < n` (use `step_extract` then IH on `m - 1`). -/
+===
+/-! ## Step-extract lemmas (success at i ⇒ no-overflow preconditions)
+
+These convert `intersperse_at numbers delimiter i acc = RustM.ok v` into
+the preconditions of `intersperse_at_step_zero` / `intersperse_at_step_pos`,
+so that the step lemma can rewrite `hres` into a smaller-measure form
+suitable for the IH. They are the reverse direction of the step lemmas:
+case-split on the precondition; if it holds, apply the step lemma; if it
+fails, unfold the function body and show the failure propagates to a
+contradiction with `hres = RustM.ok v`.
+-/
+
+/-- Reverse direction of `intersperse_at_step_zero`: from a successful
+    result at `i = 0`, extract the no-overflow witness on the accumulator. -/
+private theorem intersperse_at_step_zero_extract
+    (numbers : RustSlice i64) (delimiter : i64)
+    (acc v : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hn_pos : 0 < numbers.val.size)
+    (hres : clever_005_intersperse.intersperse_at numbers delimiter (0 : usize) acc
+              = RustM.ok v) :
+    ∃ (h_no : acc.val.size + 1 < 2 ^ 64),
+      clever_005_intersperse.intersperse_at numbers delimiter (1 : usize)
+        (acc_push_one acc (numbers.val[0]'hn_pos) h_no) = RustM.ok v := by
+  by_cases h_no : acc.val.size + 1 < 2 ^ 64
+  · refine ⟨h_no, ?_⟩
+    rw [intersperse_at_step_zero numbers delimiter acc hn_pos h_no] at hres
+    exact hres
+  · exfalso
+    have h_zero_toNat : (0 : usize).toNat = 0 := rfl
+    have h_n_pos_toNat : (0 : usize).toNat < numbers.val.size := by
+      rw [h_zero_toNat]; exact hn_pos
+    have h_ofNat : (USize64.ofNat numbers.val.size).toNat = numbers.val.size :=
+      USize64.toNat_ofNat_of_lt' numbers.size_lt_usizeSize
+    have h_cond_ge : decide (USize64.ofNat numbers.val.size ≤ (0 : usize)) = false := by
+      rw [decide_eq_false_iff_not]
+      intro hle
+      rw [USize64.le_iff_toNat_le, h_ofNat] at hle
+      rw [h_zero_toNat] at hle
+      omega
+    have h_idx :
+        (numbers[(0 : usize)]_? : RustM i64) = RustM.ok (numbers.val[0]'hn_pos) := by
+      show (if h : (0 : usize).toNat < numbers.val.size
+              then pure (numbers.val[(0 : usize)])
+              else .fail .arrayOutOfBounds)
+          = RustM.ok (numbers.val[0]'hn_pos)
+      rw [dif_pos h_n_pos_toNat]; rfl
+    have h_eq_zero :
+        ((0 : usize) ==? (0 : usize) : RustM Bool) = RustM.ok true := rfl
+    conv at hres => lhs; unfold clever_005_intersperse.intersperse_at
+    simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+               rust_primitives.cmp.ge, pure_bind, RustM_ok_bind,
+               h_cond_ge, Bool.false_eq_true, ↓reduceIte,
+               h_idx, h_eq_zero] at hres
+    simp only [rust_primitives.unsize, alloc.vec.Impl_2.extend_from_slice,
+               pure_bind] at hres
+    have h_size_arr : ¬ (acc.val.size + (#[numbers.val[0]'hn_pos] : Array i64).size
+                          < USize64.size) := by
+      show ¬ (acc.val.size + 1 < USize64.size)
+      have heq : USize64.size = 2 ^ 64 := by decide
+      rw [heq]; exact h_no
+    rw [dif_neg h_size_arr] at hres
+    simp only [bind, ExceptT.bind, ExceptT.mk, ExceptT.bindCont, Option.bind] at hres
+    cases hres
+
+/-- Reverse direction of `intersperse_at_step_pos`: from a successful
+    result at `i > 0`, extract the no-overflow witnesses. -/
+private theorem intersperse_at_step_pos_extract
+    (numbers : RustSlice i64) (delimiter : i64) (i : usize)
+    (acc v : alloc.vec.Vec i64 alloc.alloc.Global)
+    (hi_pos : 0 < i.toNat) (hi_lt : i.toNat < numbers.val.size)
+    (hres : clever_005_intersperse.intersperse_at numbers delimiter i acc
+              = RustM.ok v) :
+    ∃ (h_i1 : i.toNat + 1 < 2 ^ 64) (h_no : acc.val.size + 2 < 2 ^ 64),
+      clever_005_intersperse.intersperse_at numbers delimiter (i + 1)
+        (acc_push_two acc delimiter (numbers.val[i.toNat]'hi_lt) h_no) = RustM.ok v := by
+  have h_size_lt : numbers.val.size < 2 ^ 64 := numbers.size_lt_usizeSize
+  have h_i1 : i.toNat + 1 < 2 ^ 64 := by omega
+  refine ⟨h_i1, ?_⟩
+  by_cases h_no : acc.val.size + 2 < 2 ^ 64
+  · refine ⟨h_no, ?_⟩
+    rw [intersperse_at_step_pos numbers delimiter i acc hi_pos hi_lt h_i1 h_no] at hres
+    exact hres
+  · exfalso
+    have h_ofNat : (USize64.ofNat numbers.val.size).toNat = numbers.val.size :=
+      USize64.toNat_ofNat_of_lt' numbers.size_lt_usizeSize
+    have h_cond_ge : decide (USize64.ofNat numbers.val.size ≤ i) = false := by
+      rw [decide_eq_false_iff_not]
+      intro hle
+      rw [USize64.le_iff_toNat_le, h_ofNat] at hle
+      omega
+    have h_idx :
+        (numbers[i]_? : RustM i64) = RustM.ok (numbers.val[i.toNat]'hi_lt) := by
+      show (if h : i.toNat < numbers.val.size
+              then pure (numbers.val[i])
+              else .fail .arrayOutOfBounds)
+          = RustM.ok (numbers.val[i.toNat]'hi_lt)
+      rw [dif_pos hi_lt]; rfl
+    have h_neq_zero : ((i ==? (0 : usize)) : RustM Bool) = RustM.ok false := by
+      show (rust_primitives.cmp.eq i (0 : usize) : RustM Bool) = RustM.ok false
+      show (pure (i == (0 : usize)) : RustM Bool) = RustM.ok false
+      have h_ne : i ≠ (0 : usize) := by
+        intro heq
+        have h0 : i.toNat = 0 := by rw [heq]; rfl
+        omega
+      have h_decide : (i == (0 : usize)) = false := by
+        rw [beq_eq_false_iff_ne]; exact h_ne
+      rw [h_decide]; rfl
+    conv at hres => lhs; unfold clever_005_intersperse.intersperse_at
+    simp only [core_models.slice.Impl.len, rust_primitives.slice.slice_length,
+               rust_primitives.cmp.ge, pure_bind, RustM_ok_bind,
+               h_cond_ge, Bool.false_eq_true, ↓reduceIte,
+               h_idx, h_neq_zero] at hres
+    simp only [rust_primitives.unsize, alloc.vec.Impl_2.extend_from_slice,
+               pure_bind] at hres
+    have h_size_arr :
+        ¬ (acc.val.size + (#[delimiter, numbers.val[i.toNat]'hi_lt] : Array i64).size
+            < USize64.size) := by
+      show ¬ (acc.val.size + 2 < USize64.size)
+      have heq : USize64.size = 2 ^ 64 := by decide
+      rw [heq]; exact h_no
+    rw [dif_neg h_size_arr] at hres
+    simp only [bind, ExceptT.bind, ExceptT.mk, ExceptT.bindCont, Option.bind] at hres
+    cases hres
+
+/-! ## Array-indexing helpers for the pushed accumulator
+
+After `acc_push_one acc x` or `acc_push_two acc x y`, indexing into the new
+accumulator at `k < acc.val.size` recovers the old `acc.val[k]`, and at
+`acc.val.size` / `acc.val.size + 1` recovers `x` and `y`. We package these
+as four standalone lemmas because the strong induction uses them at each
+"extend" step. -/
+
+/-- Indexing the push-one append at any `k < acc.val.size` returns the
+    old element. -/
+private theorem acc_push_one_getElem_lt
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global) (x : i64)
+    (h : acc.val.size + 1 < 2 ^ 64) (k : Nat) (hk : k < acc.val.size)
+    (hk' : k < (acc_push_one acc x h).val.size) :
+    (acc_push_one acc x h).val[k]'hk' = acc.val[k]'hk := by
+  show (acc.val ++ #[x])[k]'_ = acc.val[k]'hk
+  rw [Array.getElem_append_left hk]
+
+/-- Indexing the push-one append at `k = acc.val.size` returns `x`. -/
+private theorem acc_push_one_getElem_last
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global) (x : i64)
+    (h : acc.val.size + 1 < 2 ^ 64)
+    (hk : acc.val.size < (acc_push_one acc x h).val.size) :
+    (acc_push_one acc x h).val[acc.val.size]'hk = x := by
+  show (acc.val ++ #[x])[acc.val.size]'_ = x
+  have h_ge : acc.val.size ≥ acc.val.size := Nat.le_refl _
+  rw [Array.getElem_append_right h_ge]
+  simp
+
+/-- Indexing the push-two append at any `k < acc.val.size` returns the
+    old element. -/
+private theorem acc_push_two_getElem_lt
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global) (x y : i64)
+    (h : acc.val.size + 2 < 2 ^ 64) (k : Nat) (hk : k < acc.val.size)
+    (hk' : k < (acc_push_two acc x y h).val.size) :
+    (acc_push_two acc x y h).val[k]'hk' = acc.val[k]'hk := by
+  show (acc.val ++ #[x, y])[k]'_ = acc.val[k]'hk
+  rw [Array.getElem_append_left hk]
+
+/-- Indexing the push-two append at `acc.val.size` returns `x`. -/
+private theorem acc_push_two_getElem_first
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global) (x y : i64)
+    (h : acc.val.size + 2 < 2 ^ 64)
+    (hk : acc.val.size < (acc_push_two acc x y h).val.size) :
+    (acc_push_two acc x y h).val[acc.val.size]'hk = x := by
+  show (acc.val ++ #[x, y])[acc.val.size]'_ = x
+  have h_ge : acc.val.size ≥ acc.val.size := Nat.le_refl _
+  rw [Array.getElem_append_right h_ge]
+  simp
+
+/-- Indexing the push-two append at `acc.val.size + 1` returns `y`. -/
+private theorem acc_push_two_getElem_second
+    (acc : alloc.vec.Vec i64 alloc.alloc.Global) (x y : i64)
+    (h : acc.val.size + 2 < 2 ^ 64)
+    (hk : acc.val.size + 1 < (acc_push_two acc x y h).val.size) :
+    (acc_push_two acc x y h).val[acc.val.size + 1]'hk = y := by
+  show (acc.val ++ #[x, y])[acc.val.size + 1]'_ = y
+  have h_ge : acc.val.size ≥ acc.val.size := Nat.le_refl _
+  have h_ge' : acc.val.size + 1 ≥ acc.val.size := by omega
+  rw [Array.getElem_append_right h_ge']
+  simp
+
+/-! ## Strong-induction helper for the non-empty obligations
+
+The three remaining obligations (length-nonempty, even-indices, odd-indices)
+all reduce to a single invariant on the recursion of `intersperse_at`. We
+state that invariant here as `intersperse_at_full_invariant` and prove it
+by strong induction on `numbers.val.size - i.toNat`, using
+`intersperse_at_step_zero_extract` / `intersperse_at_step_pos_extract` to
+peel one iteration of the body at each step. -/
+>>> REPLACE

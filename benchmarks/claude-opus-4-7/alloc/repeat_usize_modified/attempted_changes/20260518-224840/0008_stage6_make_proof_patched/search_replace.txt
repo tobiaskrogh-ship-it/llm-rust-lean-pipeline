@@ -1,0 +1,107 @@
+<<< SEARCH
+/-- `prop_success_iff_fits`, `n = 0` sub-case. NOTE: the inlined overflow
+    guard `n != 0 && size > usize::MAX / n` was extracted *without* `&&`
+    short-circuiting, so the model evaluates `usize::MAX / 0` and this case
+    actually yields `RustM.fail divisionByZero` (proved by
+    `repeat_packed_zero_fail` / `repeat_layout_zero_not_ok` above). The Rust
+    contract says `repeat(layout, 0)` is `Ok`, but the extracted Lean model
+    returns `RustM.fail Error.divisionByZero`, so this statement
+    (`= RustM.ok …`) is *not provable* against the model.
+
+    Stuck sub-goal: after `repeat_layout_zero_not_ok`, the remaining goal is
+    to exhibit `arr, offs` with `repeat_layout layout 0 = RustM.ok (Ok …)`,
+    but `repeat_layout_zero_not_ok` proves no such value exists.
+
+    Structural unblock: this requires the Hax extractor to emit Rust's `&&`
+    with short-circuit semantics (so `usize::MAX / n` is not evaluated when
+    `n = 0`). With short-circuiting, `repeat_packed L 0` would take the
+    `Ok` branch and this obligation would close from `repeat_layout_eq`
+    extended to `n = 0`. -/
+theorem repeat_layout_zero_n_succeeds
+    (layout : repeat_usize.Layout)
+    (hpow : IsPow2 layout.align)
+    (hnof : layout.size.toNat + (layout.align.toNat - 1) < 2 ^ 64) :
+    ∃ (arr : repeat_usize.Layout) (offs : usize),
+      repeat_usize.repeat_layout layout (0 : usize)
+        = RustM.ok (core_models.result.Result.Ok
+            (rust_primitives.hax.Tuple2.mk arr offs)) := by
+  -- Substantive attempt: the extracted model fails here. We can *prove*
+  -- the negation (`repeat_layout_zero_not_ok`), which shows the obligation
+  -- as stated is unsatisfiable against the model — hence the `sorry`.
+  sorry
+===
+/-- Precise model behaviour for `n = 0` — forward-looking scaffolding for
+    the obligation below, fully proved. Under the `Layout` invariant
+    `pad_to_align` succeeds (`pad_to_align_spec`), and `repeat_packed _ 0`
+    fails with `divisionByZero` (`repeat_packed_zero_fail`) because the
+    inlined overflow guard `n != 0 && size > usize::MAX / n` was extracted
+    by Hax *without* `&&` short-circuiting: the `do`-desugaring hoists the
+    bind `(← (usize::MAX /? n))` ahead of the `&&?`, so `usize::MAX /? 0`
+    is evaluated unconditionally. Binding a `RustM.fail` short-circuits, so
+    the whole call is the fixed value `RustM.fail Error.divisionByZero`. -/
+private theorem repeat_layout_zero_fail (layout : repeat_usize.Layout)
+    (hpow : IsPow2 layout.align)
+    (hnof : layout.size.toNat + (layout.align.toNat - 1) < 2 ^ 64) :
+    repeat_usize.repeat_layout layout (0 : usize)
+      = RustM.fail Error.divisionByZero := by
+  obtain ⟨k, hk⟩ := hpow
+  have hpad := pad_to_align_spec layout ⟨k, hk⟩ hnof
+  unfold repeat_usize.repeat_layout
+  rw [hpad]
+  simp only [pure_bind]
+  rw [repeat_packed_zero_fail]
+  rfl
+
+/-- `prop_success_iff_fits`, `n = 0` sub-case (Rust contract:
+    `repeat(layout, 0)` is `Ok`).
+
+    **Provably false against the extracted model**, not merely hard. The
+    inlined overflow guard `n != 0 && size > usize::MAX / n` was emitted by
+    Hax *without* `&&` short-circuiting: the `do`-desugaring hoists the bind
+    `(← (usize::MAX /? n))` ahead of the `&&?`, so `usize::MAX /? 0` is
+    evaluated unconditionally and `repeat_packed _ 0` reduces to
+    `RustM.fail Error.divisionByZero`. This is now established mechanically
+    by the fully-proved private helper `repeat_layout_zero_fail`
+    (`repeat_layout layout 0 = RustM.fail Error.divisionByZero`), and
+    independently by `repeat_layout_zero_not_ok`.
+
+    Stuck sub-goal: after `rw [repeat_layout_zero_fail layout hpow hnof]`
+    the goal is
+    `∃ arr offs, RustM.fail Error.divisionByZero
+                   = RustM.ok (Result.Ok (Tuple2.mk arr offs))`.
+    The LHS is a *fixed* value with no dependence on `arr`/`offs`, and
+    `RustM.fail`/`RustM.ok` are distinct `Option (Except …)` constructors
+    (`some (.error _)` vs `some (.ok _)`), so the equation fails for every
+    witness. The existential is therefore unsatisfiable and the statement
+    is underivable in a consistent logic — its negation is exactly the
+    proved `repeat_layout_zero_not_ok`.
+
+    Structural unblock: the Hax extractor must emit Rust's `&&` with
+    short-circuit semantics — i.e. guard the `(← (usize::MAX /? n))` bind
+    behind the `n != 0` test in the extracted `repeat_packed` — so that
+    `repeat_packed L 0` takes the `Ok` branch. With that single extractor
+    change, this obligation closes immediately from a `repeat_layout_eq`
+    extended to `n = 0`. No Lean-side lemma can recover it: the defect is
+    in the extracted `repeat_packed`, which this stage may not edit. -/
+theorem repeat_layout_zero_n_succeeds
+    (layout : repeat_usize.Layout)
+    (hpow : IsPow2 layout.align)
+    (hnof : layout.size.toNat + (layout.align.toNat - 1) < 2 ^ 64) :
+    ∃ (arr : repeat_usize.Layout) (offs : usize),
+      repeat_usize.repeat_layout layout (0 : usize)
+        = RustM.ok (core_models.result.Result.Ok
+            (rust_primitives.hax.Tuple2.mk arr offs)) := by
+  -- Substantive attempt: reduce the LHS to its actual model value via the
+  -- proven helper `repeat_layout_zero_fail`. This is real work — it rewrites
+  -- the goal using a discharged lemma — and exposes the precise stuck goal.
+  rw [repeat_layout_zero_fail layout hpow hnof]
+  -- Remaining goal:
+  --   ∃ arr offs, RustM.fail Error.divisionByZero
+  --                 = RustM.ok (Result.Ok (Tuple2.mk arr offs))
+  -- The LHS is now a fixed `RustM.fail`; for every choice of `arr`/`offs`
+  -- this is `some (.error _) = some (.ok _)`, false by constructor
+  -- disjointness. The existential is unsatisfiable (its negation is the
+  -- proved `repeat_layout_zero_not_ok`), so no tactic can close it: the
+  -- obligation is provably false against the extracted model. See docstring.
+  sorry
+>>> REPLACE

@@ -1,0 +1,565 @@
+Log: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260524-161355_multinomial_u64.log
+Model: claude-opus-4-7
+Attempt logs: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/num-integer-0.1.46/multinomial_u64/attempted_changes/20260524-161355
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "src/lib.rs"})
+The property-based test suite is already present in `src/lib.rs`. Let me verify it passes and then summarize.
+[tool] run_cargo_test({})
+All 6 tests pass. Below is a summary of what the existing suite captures and the deliberate omissions.
+
+## Contract clauses captured
+
+| Test | Clause type | What it pins down |
+|---|---|---|
+| `empty_slice_returns_one` | Postcondition (boundary) | The empty product convention: `multinomial(&[]) == 1`. |
+| `singleton_returns_one` | Postcondition (boundary) | For any `n`, including `u64::MAX`, `multinomial(&[n]) == 1` — i.e. the only call into `binomial` is `binomial(n, n)`, which trivially returns 1, so no overflow occurs even at the extreme. |
+| `matches_factorial_reference_on_small_inputs` | Postcondition (full spec) | Equality with an independent factorial-based reference `(∑kᵢ)! / ∏kᵢ!` across every slice of length 0..=4 with entries small enough that the reference doesn't overflow. This pins the *value*, not just a property of it. |
+| `permutation_invariance` | Postcondition (independent) | The result is symmetric in its argument. The implementation iterates left-to-right with a running sum, so symmetry is **not** visibly true from the code — it's an independent semantic claim that catches reorder-sensitive bugs even on inputs whose sum exceeds the factorial reference's range. |
+| `sum_overflow_panics` | Failure condition | When the running sum `p = p + *i` overflows `u64` (here `u64::MAX + 1` on the second iteration), the unchecked addition panics in debug builds. |
+| `test_multinomial` | Sanity / regression | The original `num-integer` test ported as-is: two-element multinomials reduce to the corresponding binomial; small hand-computed cases; degenerate slices. |
+
+## Properties considered but excluded
+
+- **Multiplicative / Pascal-style identities** (e.g. `multinomial([a, b, c]) = binomial(a+b+c, a) · multinomial([b, c])`). This follows mathematically from the definition once equality with the factorial reference is established, and is what `binomial` is *implemented* in terms of — so it would essentially re-test the implementation's own recursion structure rather than an independent property.
+- **`multinomial([n, 0, 0, ...]) == 1`** and **`multinomial([0, ..., 0, n]) == 1`**. Already covered by `matches_factorial_reference_on_small_inputs` (which iterates `b, c, d ∈ 0..=4/5`) and by `permutation_invariance` plus `singleton_returns_one`.
+- **Divisibility / parity / monotonicity** of the result. These are derived facts about the *value* of multinomial coefficients (e.g. `multinomial([k, k]) = C(2k, k)` is always even for k>0), not about the function's contract. The rubric explicitly says to skip derived mathematical facts.
+- **Multiplication-overflow panic** (the `r = r * binomial(p, *i)` line). The function's contract here is essentially "panics on overflow in debug, wraps in release" — same shape as the addition overflow, with no new behaviour to characterize. One overflow-panic test (`sum_overflow_panics`) is enough to record that the function is unchecked; a second would just repeat the same clause.
+- **`binomial`-only tests.** `binomial` is a private helper; the contract under test is `multinomial`'s. Its behaviour is exercised transitively through the reference-equality test.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/gcd_stein_u64_modified/src/lib.rs"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/src/lib.rs"})
+[tool] Glob({"pattern": "**/Cargo.toml"})
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Read({"file_path": "src/lib.rs"})
+Now I have a clear picture. The current code has four Hax incompatibilities:
+
+1. `gcd` uses `.trailing_zeros()` — matches `u64_trailing_zeros_method.rs` archive pattern
+2. `gcd` has a `while m != n` outer subtract-and-strip loop — recursion-preference rule (mirror `gcd_stein_u64_modified`)
+3. `binomial` has `loop { if d > k { break; } ... }` — matches `loop_break_to_while.rs`, plus recursion-preference (mirror `binomial_u64_modified`)
+4. `multinomial` has `for i in k { ... }` — matches `for_loop_over_slice_to_recursion.rs`
+
+Let me write the rewrite — keeping all tests untouched.
+[tool] write_working_file({"path": "src/lib.rs", "overwrite": true, "error_message": "Rewriting for Hax compatibility: (1) replace u64::trailing_zeros() \u2014 no Hax Lean prelude model ... [+12002 chars])
+Now run cargo test first (the gate before extraction):
+[tool] run_cargo_test({})
+All 6 tests pass. Now run extraction:
+[tool] run_cargo_hax_into_lean({})
+Extraction succeeded. Now run lake build:
+[tool] run_lake_build({})
+All three stages pass. Let me also verify there are no Hax-degenerate patterns in the extracted Lean:
+[tool] Grep({"pattern": "from_machine \\(0 : u32\\)", "path": "proofs/lean/extraction", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "from_machine \\(0 : u32\\)", "path": "proofs/lean/extraction/multinomial_u64.lean", "output_mode": "content", "-B": 3, "-A": 3})
+[tool] Grep({"pattern": "@\\[hax_spec\\]", "path": "proofs/lean/extraction/multinomial_u64.lean", "output_mode": "content"})
+No `@[hax_spec]` block exists, so the constant-0 termination measure in `trailing_zeros_u64`'s `while` loop is harmless (the rule applies only when a `requires` clause generates an auto-spec). 
+
+Let me also verify the tail-recursive helpers extracted as `partial_fixpoint` cleanly:
+[tool] Grep({"pattern": "partial_fixpoint", "path": "proofs/lean/extraction/multinomial_u64.lean", "output_mode": "content"})
+Four `partial_fixpoint` extractions — one each for `gcd_stein_loop`, `binomial_loop`, `binomial` (also recursive), and `multinomial_loop`. All extract as the recursion-preferred shape that admits `Nat.strongRecOn`-style proofs downstream (per `proof_patterns/recursion_example`).
+
+## Summary
+
+**Final pipeline status: all three stages green.**
+- `cargo test`: 6 passed, 0 failed ✅
+- `cargo hax into lean`: extraction succeeded ✅
+- `lake build`: 93 jobs built successfully ✅
+
+**Hax / lake-build errors that drove each change** (none were actually surfaced this session — all four issues were spotted up-front from the archive patterns, since the original `src/lib.rs` exhibits four well-documented Hax-incompatible shapes):
+
+1. **`u64::trailing_zeros()`** in `gcd` — would extract to `core_models.num.Impl_9.trailing_zeros`, undefined in the Hax Lean prelude. Archive: `u64_trailing_zeros_method.rs`.
+2. **`while m != n { ... }` outer subtract-and-strip loop** in `gcd` — extracts cleanly but burdens the proof stage (per the recursion-preference rule). Mirror: `proof_patterns/gcd_stein_u64_modified`. Loop depth ≤ 64 on `u64`, well within the safe recursion-depth rule-of-thumb.
+3. **`loop { if d > k { break; } ... }`** in `binomial` — would extract to `rust_primitives.hax.while_loop_return`, undefined in the prelude. Archive: `loop_break_to_while.rs`. Also a single-accumulator-tuple shape that benefits from the recursion-preference rewrite. Mirror: `proof_patterns/binomial_u64_modified`.
+4. **`for i in k { ... }` slice iteration** in `multinomial` — would extract to `core_models.iter.traits.iterator.Iterator.fold` over `core_models.iter.traits.collect.IntoIterator (RustSlice T)`, neither modeled. Archive: `for_loop_over_slice_to_recursion.rs`.
+
+**Library calls inlined and their replacements:** `u64::trailing_zeros()` → private helper `trailing_zeros_u64(x: u64) -> u32` using a primitive `>>` / `&` / `==` shift-and-count `while` loop.
+
+**Patterns considered but not changed:**
+- The `while y & 1 == 0 { ... }` loop inside `trailing_zeros_u64` is left as a `while` loop. The shape is the standard reference shape (mirrors `proof_patterns/trailing_zeros_u64_modified` and `gcd_stein_u64_modified`); a recursive rewrite is not necessary because (a) depth is ≤ 64 and (b) the existing proof patterns already verify this exact `while` shape downstream.
+- No `loop_invariant!` / `loop_decreases!` / `requires` annotations added — followed the no-annotations default. The `while` loop in `trailing_zeros_u64` has no `requires`, so no auto-spec is generated and the constant-0 termination measure is harmless (verified: no `@[hax_spec]` blocks in the extracted file).
+- Test code untouched (per the rules) — `multinomial_reference` still uses `k.iter().sum()`, `for i in 1..=n`, and `for &x in k`, but tests are not extracted.
+
+**Semantics-altering changes:** none. The Rust source preserves the original algorithm exactly; only the surface syntax changed (loops → tail-recursive helpers, library method → inline helper). Tests cover the boundary cases including:
+- `singleton_returns_one` covering `binomial(u64::MAX, u64::MAX)` — which in turn exercises `gcd(u64::MAX, u64::MAX)`, pinning down the rewritten `gcd_stein_loop` on a 64-bit input.
+- `sum_overflow_panics` (`#[should_panic]`) — the rewritten `multinomial_loop` still panics on the overflowing `p + k[i]` exactly as the original `p + *i` did.
+- `permutation_invariance` — symmetry on inputs with sums exceeding `u64::MAX` factorial range, exercising the full `multinomial_loop` × `binomial_loop` × `multiply_and_divide` × `gcd_stein_loop` call stack.
+
+**Hax-degenerate patterns blocking proof:** none detected.
+- No `@[hax_spec]` auto-specs generated (no `requires` clauses present).
+- All four recursive helpers extracted as `partial_fixpoint` — the proof-friendly shape that admits `Nat.strongRecOn` on the recursion measure (see `proof_patterns/recursion_example`).
+- No Lean-keyword collisions in any function names.
+- No `loop_invariant!` macros to fail `pureP` synthesis on.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/num-integer-0.1.46/multinomial_u64/attempted_chan... [+46 chars])
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/num-integer-0.1.46/multinomial_u64/attempted_chan... [+24 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/num-integer-0.1.46/multinomial_u64/attempted_ch... [+71 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/num-integer-0.1.46/multinomial_u64/attempted_ch... [+75 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/num-integer-0.1.46/multinomial_u64/attempted_ch... [+67 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/benchmarks/code/num-integer-0.1.46/multinomial_u64/attempted_ch... [+66 chars])
+Let me verify that the rewrites map onto existing patterns by quickly inspecting a few headers.
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/rewrite_patterns/u64_trailing_zeros_method.rs", "limit": 20})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/rewrite_patterns/loop_break_to_while.rs", "limit": 20})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/rewrite_patterns/for_loop_over_slice_to_recursion.rs", "limit":... [+4 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/rewrite_patterns/while_loop_to_recursion.rs", "limit": 25})
+## Final report
+
+**Patterns written:** none.
+
+**Attempts inspected:**
+
+- `0001_stage2_rust_hax_lean_written` — full-file write (not a patch). The `trigger_error` explicitly names every existing pattern it was applying:
+  - `u64::trailing_zeros()` → already covered by `u64_trailing_zeros_method.rs`
+  - `while m != n { ... }` outer loop → tail recursion, already covered by `while_loop_to_recursion.rs`
+  - `loop { if d > k { break; } ... }` → trigger covered by `loop_break_to_while.rs`; the further rewrite to a tail-recursive helper is the standard `while_loop_to_recursion.rs` move
+  - `for i in k { ... }` over a slice → already covered by `for_loop_over_slice_to_recursion.rs`
+
+  Every root cause is documented in the archive. Nothing new to add.
+
+**Notes for a human:**
+
+- This log contains only **one** stage-2 attempt and its status is `written` (full-file rewrite), not `patched`. Per the harvest spec only `patched` strictly qualifies, but the trigger context and `before`/`after` pair are complete; either way every root cause it tackled is already in the archive, so the strict-vs-loose reading doesn't change the outcome.
+- `metadata.change_count` is `0` despite status `written` — looks like the change counter doesn't include full-file overwrites. Probably worth a glance from a maintainer if the change counter is used for downstream stats, but not a pattern problem.
+
+harvest_rewrite_patterns
+Looking at the rewrite, the changes are:
+
+1. **`trailing_zeros_u64` helper** replaces `u64::trailing_zeros()`. Implementation: returns 64 for 0, otherwise shifts right while LSB is 0 and counts. Matches `u64::trailing_zeros` semantics exactly (including `trailing_zeros(0) == 64`).
+
+2. **`gcd_stein_loop` tail-recursive helper** replaces the inner `while m != n` loop. The body of each recursive step mirrors the original branch: if `m > n`, subtract `n`, strip trailing zeros, recurse; symmetrically otherwise. Base case `m == n` returns `m`. Both arguments are maintained odd by the invariant (since the differences of odd numbers are even and then stripped to odd, except when equal). Equivalent.
+
+3. **`gcd`** keeps the same early-exit for zero inputs and the same `shift = trailing_zeros(x | y)` factoring; the only difference is using the inlined helper and dispatching the loop to `gcd_stein_loop`. Equivalent.
+
+4. **`multiply_and_divide`** unchanged.
+
+5. **`binomial_loop` + `binomial`**: The original `loop { if d > k { break; } r = mad(r, n, d); n -= 1; d += 1; }` is converted to tail recursion carrying `(n, d, r)`. Termination condition `d > k` is checked first (matching the original's break-at-top semantics). When `k == 0`, the first check `1 > 0` returns `r = 1` immediately — same as original. Initial state `(n, k, 1, 1)` matches `r = 1, d = 1`. Equivalent.
+
+6. **`multinomial_loop` + `multinomial`**: The `for i in k { p = p + *i; r = r * binomial(p, *i); }` is converted to tail recursion indexed by `i`. Evaluation order preserved: `p_new = p + k[i]` computed first, then `binomial(p_new, k[i])`. Empty slice returns the initial `r = 1`. The arithmetic `p + k[i]` uses unchecked addition just like the original, so `multinomial(&[u64::MAX, 1])` still panics on the second iteration's overflow. Equivalent.
+
+**Edge cases verified:**
+- `multinomial(&[])` → 1 ✓
+- `multinomial(&[n])` → `binomial_loop(n, n, 1, 1)`; `k > n - k = 0` is true when n>0 → recurses to `binomial(n, 0)` → `binomial_loop(n, 0, 1, 1)` → 1; when n=0, falls through to `binomial_loop(0, 0, 1, 1)` → 1. ✓
+- `binomial(u64::MAX, u64::MAX)` → goes through `k > n-k` branch to `binomial(u64::MAX, 0)` → 1. ✓
+- Overflow panic in `multinomial(&[u64::MAX, 1])` preserved (unchecked add of `p_new = u64::MAX + 1`). ✓
+- Shift safety: `gcd` early-returns on zero, so `trailing_zeros_u64` is never called on 0 in the shift expressions; odd-invariant preserved in `gcd_stein_loop` (difference of two odd nonzero unequal numbers is even and nonzero).
+
+The only theoretical behavioral difference is stack depth for very large slice lengths (recursion vs iteration), but this isn't exercised by tests and is the documented trade-off of the recursion-preference rule. For all practical inputs the behavior is identical.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+[tool] Glob({"pattern": "proof_patterns/binomial_u64_modified/**/*.lean"})
+[tool] Glob({"pattern": "proof_patterns/sum_product_modified/**/*.lean"})
+[tool] Glob({"pattern": "proof_patterns/binomial_u64_modified/**/*"})
+[tool] Glob({"pattern": "proof_patterns/sum_product_modified/**/*"})
+[tool] Glob({"pattern": "proof_patterns/below_zero_modified/**/*"})
+[tool] Glob({"pattern": "proof_patterns/*"})
+[tool] Glob({"pattern": "**/binomial_u64_modified/**"})
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/**/*"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/bin... [+16 chars])
+I've inspected the target's extracted Lean and confirmed `binomial_u64_modified` contains six of the eight target definitions verbatim (`trailing_zeros_u64`, `gcd_stein_loop`, `gcd`/`gcd_u64`, `multiply_and_divide`, `binomial_loop`, `binomial`). The remaining novelty is the outer `multinomial_loop` — a tail-recursive `partial_fixpoint` over a `u64` slice carrying a paired `(p, r)` accumulator where `p` is an unchecked running sum (panics on overflow per the `sum_overflow_panics` test) and `r` multiplies in `binomial(p_new, k[i])` per step.
+
+## Selected examples
+
+proof_patterns/binomial_u64_modified
+proof_patterns/sum_product_modified
+proof_patterns/below_zero_modified
+proof_patterns/contains_u64_modified
+
+## Rationale
+
+- **proof_patterns/binomial_u64_modified** — exact superset of the first six target functions. All five helpers (`trailing_zeros_u64` shift-and-count loop, Stein `gcd_stein_loop` with `partial_fixpoint`, `gcd_u64` outer wrapper with or-divisibility shift combine, `multiply_and_divide` gcd-cancellation, `binomial_loop` multiplicative invariant via Pascal recurrence) are proved verbatim. Provides `multi-helper-spec-composition`, `bundled-postcondition-projection`, `gcd-mediated-overflow-avoidance`, `nchoose-symmetry`, `pascal-row-surrogate` — everything the proof agent needs to close the entire binomial sub-chain.
+- **proof_patterns/sum_product_modified** — closest match for the outer `multinomial_loop`: tail-recursive lockstep accumulation of *paired* accumulators (sum + product) over a slice with `paired-accumulator-invariant`, `tuple-return-postcondition`, and `overflow-bound-precondition`. The `i64` vs `u64` element type differs but the proof skeleton (single combined strong-induction invariant on `size − i.toNat`, with two `hfit` preconditions ruling out overflow in each component) is directly applicable to the `p`-sum + `r`-product carry in `multinomial_loop`.
+- **proof_patterns/below_zero_modified** — same shape as multinomial's running-sum overflow: tail-recursive slice scan with a running accumulator whose addition can overflow on adversarial input, and where soundness derives `¬addOverflow` by contradiction from `RustM.ok` (`ok-result-implies-no-overflow`) while completeness is gated on an explicit prefix-fits precondition. Mirrors the `multinomial(&[u64::MAX, 1])` panic test contract directly.
+- **proof_patterns/contains_u64_modified** — the canonical `u64`-slice recursive scan baseline: `RustSlice u64` indexing via `core_models.slice.Impl.len`, the three-step `oob/found/recurse` step lemmas, `usize-add-no-overflow` discharged via `BitVec.uaddOverflow`. Useful as the minimal reference for the slice-iteration plumbing that the more complex examples elaborate.
+
+## Gaps
+
+- No example pairs a *paired* slice accumulator (like sum_product) with *helper invocation inside the loop body* (multinomial calls `binomial` per step). `sum_product_modified` has the paired carry but no helper, `binomial_u64_modified` has the helper composition but on scalar `(n, d, r)` not slice-indexed state, and `clever_039_triples_sum_to_zero` has slice + counter but no per-step helper call. The agent will need to invent the composition: spec the per-step `binomial` postcondition, then thread it through the lockstep invariant.
+- No example states a multinomial-coefficient closed-form spec (`n! / k1! … km!`) — the agent will likely need a Nat-level oracle on `List Nat` (or `RustSlice u64`) analogous to `binomial_u64_modified`'s Pascal-row surrogate but for the slice fold. This is a candidate for a new library entry once proved.
+
+## Rejections
+
+- **gcd_lcm_u64_modified** — heavy overlap with `binomial_u64_modified` on the gcd composition; its lcm-product-identity twist doesn't transfer to multinomial.
+- **gcd_stein_u64_modified**, **trailing_zeros_u64_modified** — already fully contained inside `binomial_u64_modified`; including them adds repetition without new techniques.
+- **clever_009_rolling_max_modified**, **clever_025_remove_duplicates_modified**, **rescale_to_unit_modified** — all build `Vec` outputs with `extend_from_slice` and elementwise output invariants; multinomial returns a scalar `u64` so the Vec machinery is a distraction.
+- **clever_039_triples_sum_to_zero_modified** — iff-decomposed witness-counting contract is more elaborate than multinomial's single-value postcondition; the counter-correctness shape is partially redundant with `below_zero_modified` for our purposes.
+- **clever_045_fib4_modified**, **clever_038_prime_fib_modified** — `native_decide`/finite-range strategies don't apply: multinomial's input domain (any `u64` slice) is unbounded.
+- **gcd_recursive_modified**, **gcd_while_modified** — Euclidean (mod-based) gcd, not Stein's binary algorithm; target uses Stein.
+- **factorial_modified**, **sum_to_n_modified**, **add_one_modified**, **square_modified** — scalar single-binop overflow theorems, too small to inform a multi-helper composition proof.
+- **cbrt_u64_modified**, **sqrt_u64_modified** — long Newton/Babylonian arithmetic ladders; no slice iteration, no helper-in-loop pattern matching multinomial.
+- **000_has_close_elements_modified** — pair-index linearisation `k = i*n + j` is a structurally different scan, not single-slice iteration with paired accumulator.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Multinomial_u64Obligations.lean
+[scaffold] registered Multinomial_u64Obligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+27 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/sum_product_modified/proofs/lean/extraction/Clev... [+36 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Cleve... [+34 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Con... [+27 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+41 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+56 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+56 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+57 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+57 chars])
+Now let me read the current obligations file and the extracted module:
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "patch": "<<< SEARCH\nnamespace Multinomial_u64Obligations\n\n-- Add `theorem` declarations b... [+6036 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean"})
+All five theorems type-check (only the expected `sorry` warnings). Now let me confirm with `lake build`:
+[tool] run_lake_build({})
+Build succeeds with only the expected `sorry` warnings.
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Multinomial_u64Obligations.lean`
+
+**Theorems added** (5 total, one per independent contract clause):
+
+1. `multinomial_empty_returns_one` — boundary postcondition for `multinomial(&[]) = 1`. Captures the property test `empty_slice_returns_one` (and the `&[]` case inside `test_multinomial`).
+2. `multinomial_singleton_returns_one` — boundary postcondition for `multinomial(&[n]) = 1` over the full `u64` range including `u64::MAX`. Captures the property test `singleton_returns_one`.
+3. `multinomial_closed_form` — closed-form value equals the Pascal-chain product `mult_prefix k k.val.size` under no-overflow preconditions on the running sum and final result. Subsumes the postcondition tests `test_multinomial` (hard-coded values) and `matches_factorial_reference_on_small_inputs`.
+4. `multinomial_permutation_invariant` — order-independence of the result, stated via `List.Perm` on the underlying `Array u64`. Captures the property test `permutation_invariance` (rotations, reversal, swap).
+5. `multinomial_overflow_fails` — when the integer prefix sum is `≥ 2^64`, the unchecked `p + k[i]` addition overflows and the function fails with an integer-overflow error. Captures the property test `sum_overflow_panics` for the specific case `&[u64::MAX, 1]` (Nat sum `2^64`), generalized to all overflow inputs.
+
+**Tests classified as derived mathematical facts (skipped):** None. Every property test maps to at least one of the five theorems above.
+
+**Theorems with uncertain framing:**
+
+- `multinomial_closed_form`: I include two preconditions (`hfit_sum` and `hfit_result`). On the Nat level `mult_prefix` is monotone non-decreasing in the index, so `hfit_result` implies the per-step `nchoose` values also fit; however the proof stage may additionally need that each binomial input `sum_prefix k (i+1) ≤ 67` to invoke `Binomial_u64Obligations.binomial_postcondition`'s closed form. Practically the running sum staying `< 2^64` plus the result fitting `< 2^64` already restricts to a very narrow regime where the Pascal-chain bound `C(p, k[i]) ≤ result < 2^64` keeps each step safe — but I am not 100% certain whether the closed-form proof can route exclusively through the result-fits precondition without an explicit `sum_prefix ≤ 67`. If the proof stage finds it cannot close, the strongest tightening would be adding `sum_prefix k k.val.size ≤ 67` as a third precondition (which is what the `binomial_u64_modified` reference uses for its closed form). I chose the more permissive statement now per the rule "prefer the more permissive statement" when uncertain.
+
+- `multinomial_permutation_invariant`: stated with all four fit preconditions on both `k` and `k'`. The two on `k'` are derivable from the two on `k` via permutation invariance of `sum_prefix` and `mult_prefix` at the Nat level, but stating them explicitly keeps the obligation self-contained and decouples it from any Nat-level lemma about permutation invariance of `mult_prefix` (which itself is non-trivial to prove from the Pascal-chain definition without first reformulating as the factorial form).
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 5 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+27 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+41 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+56 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+57 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Bin... [+43 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/sum_product_modified/proofs/lean/extraction/Clev... [+36 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Cleve... [+34 chars])
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Con... [+27 chars])
+Now let me look at the binomial_u64_modified source — specifically I want to see the names of the helper functions and how they were named in that crate.
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/bin... [+16 chars])
+Let me check what's available in the Hax prelude for the specific lemmas we'll need:
+[tool] Glob({"pattern": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/**/*.le... [+4 chars])
+[tool] Glob({"pattern": "**/proofs/lean/extraction/Multinomial_u64Obligations.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/**/*.lean"})
+[tool] Read({"file_path": "/Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/le... [+35 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/slice.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/slice.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/sequence.lean"})
+[tool] Grep({"pattern": "core_models.slice.Impl.len", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "slice.Impl", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "slice.Impl", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/epilogue/alloc.lean", "output_mode": "conte... [+13 chars])
+[tool] Grep({"pattern": "core_models\\.slice", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "files_with_matches"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/epilogue/slice.lean"})
+[tool] Grep({"pattern": "def core_models.slice.Impl.len|Impl.len ", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content... [+2 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/core_models.lean", "offset": 1935, "limit": 20})
+Let me check the `core_models.slice.Impl.len` evaluation and `k[i]_?` syntax:
+[tool] Grep({"pattern": "GetElem.*RustSlice|getElem.*Seq|\\[.*\\]_\\?", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives", "ou... [+22 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/GetElemResult.lean"})
+Now I have a good understanding. Let me write the obligations file with all required infrastructure. I'll build this up carefully, starting with the entire helper machinery from `binomial_u64_modified` adapted to our namespace, then add the multinomial-specific proofs.
+
+Given the file size will be very large (~2000 lines), let me write it in one shot and iterate:
+[tool] write_working_file({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "overwrite": true, "error_message": "Initial scaffolding write \u2014 replacing the obligatio... [+86958 chars])
+Now let me check with the LSP what compiles and what fails:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+Let me check what's happening with the file:
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 1480, "limit": 20})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 1700, "limit": 120})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 75, "limit": 15})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 258, "limit": 30})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 1265, "limit": 40})
+I have several issues to fix. Let me apply patches in sequence:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Multiple LSP errors: nchoose_ge_one base case needs Nat.le.refl; nchoose_le... [+1126 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "nchoose_le_succ_of_half: `rw [step] at h1` failed because step's LHS patter... [+1647 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "nchoose_mono_to_half base case (zero): after `rw [hd_eq]`, goal is `nchoose... [+390 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "binomial_loop_spec: omega cannot prove `d.toNat + 1 < 2^64` without the `n_... [+591 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "binomial_postcondition_gen: after `congr 2`, the goal `nchoose n.toNat (n -... [+854 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Actually the error \"No goals to be solved\" suggests congr 2 already close... [+636 chars])
+Now fix the `multinomial_loop_recurse` simp issue and the `set` tactic issues:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "multinomial_loop_recurse: the simp set needs `h_no_bv` and `h_no_mul_bv` (B... [+3444 chars])
+Now fix the `mult_prefix_mono` and `sum_prefix_mono` base cases (the `rw [this]` doesn't close):
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "mult_prefix_mono and sum_prefix_mono: the `rw [this]` and `rw [h_eq]` subst... [+3603 chars])
+Now fix the `set` tactic issues in `multinomial_loop_correct` and `multinomial_singleton_returns_one`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "`set` tactic is not in Lean core (it requires Mathlib). Use plain `let` and... [+1273 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "multinomial_loop_correct: the `set b := ... with hb_def` uses `set` which i... [+995 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "multinomial_singleton_returns_one: same `set` issue. Replace with let + hav... [+372 chars])
+Now let me re-check diagnostics:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 1828, "limit": 25})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "omega cannot reduce `UInt64.toNat 1 * UInt64.toNat 1` because the toNat is ... [+493 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+No errors. Let me check warnings to see remaining `sorry`s:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "warning"})
+Let me confirm with `lake build`:
+[tool] run_lake_build({})
+Let me look at how `RustM` failures interact with bind:
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/RustM.lean", "limit": 100})
+Now I need to tackle the two remaining `sorry`s. Let me start with `multinomial_overflow_fails` — I need step lemmas for failure cases:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Add helper step lemmas for failure cases (add overflow, binomial fail, mul ... [+9676 chars])
+Let me check what theorems are available for binomial about termination:
+[tool] mcp__lean__lean_completions({"file_path": "Multinomial_u64Obligations.lean", "line": 13, "column": 1})
+[tool] Grep({"pattern": "partial_fixpoint|MonoLoopCombinator|Lean\\.Loop", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/W... [+55 chars])
+Let me check what theorems are auto-generated by `partial_fixpoint`:
+[tool] mcp__lean__lean_hover_info({"file_path": "multinomial_u64.lean", "line": 110, "column": 5})
+[tool] Read({"file_path": "proofs/lean/extraction/multinomial_u64.lean", "offset": 110, "limit": 25})
+Let me try the binomial divergence question first with a multi-attempt to see if there's an auto-generated unfolding lemma:
+[tool] Grep({"pattern": "binomial_loop\\.|binomial\\.", "path": "proofs/lean/extraction/multinomial_u64.lean", "output_mode": "content"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+Let me fix the failure step lemmas and case syntax:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "The binom_fail and mul_fail step lemmas need to reduce the `i +? 1` add as ... [+7938 chars])
+Now fix the rcases in the failure aux:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "The `rcases ... with _ | _ | _` and `case ok bval` syntax doesn't work for ... [+5977 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "warning"})
+Let me connect `multinomial_overflow_fails` to the aux:
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 2060, "limit": 25})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Connect multinomial_overflow_fails to the aux lemma.", "patch": "<<< SEARCH... [+826 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+Let me search the Hax prelude for partial_fixpoint totality / termination lemmas:
+[tool] Grep({"pattern": "partial_fixpoint|fixpoint_eq|ne_div|not_div", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "file... [+16 chars])
+[tool] Grep({"pattern": "partial_fixpoint|ne_div|not_div|isOk", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/RustM.lean", ... [+52 chars])
+Let me look at the while_loop combinator to see if it's potentially divergent:
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/While.lean"})
+Let me check what's available in Lean core for `List.Perm`:
+[tool] mcp__lean__lean_multi_attempt({"file_path": "Multinomial_u64Obligations.lean", "line": "2080", "snippets": "[\"example (L L' : List Nat) (h : L.Perm L') : L.sum = L'.sum := h.sum_eq\", \"exa... [+198 chars])
+Let me check the current build state:
+[tool] run_lake_build({})
+Let me try to prove permutation invariance via the factorial closed form. I'll add the infrastructure:
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 2068, "limit": 20})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Add factorial-based infrastructure for proving permutation invariance, plus... [+15396 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+Let me try a series of fixes. The main issues are `ring` not being available, and some tactic mismatches:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Replace `ring` (not in Lean core) with explicit Nat mul manipulations via `... [+6812 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Fix denom_prefix_pos and the various `ring` calls in mult_prefix_denom_eq, ... [+1245 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Replace `ring` in mult_prefix_denom_eq calc with explicit Nat mul rearrange... [+3005 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Replace `ring` in mult_list_closed_form with explicit Nat mul rearrangement... [+1682 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "list_sum_perm_invariant: `omega` can't handle the List.foldr-based sum repr... [+1874 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "mult_list_perm_invariant: hL' direction mismatch with Nat.eq_of_mul_eq_mul_... [+1934 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "mult_prefix_eq_mult_list final .symm direction fix.", "patch": "<<< SEARCH\... [+376 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+Let me try a different approach — use simp with the AC lemmas to normalize:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Replace the failing rewrite chains with `simp [Nat.mul_assoc, Nat.mul_comm,... [+3380 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "mult_list_closed_form: also the rewrite chain failed. Simplify using a dire... [+1876 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "mult_prefix_denom_eq: replace the long chain of explicit Nat.mul_* rewrites... [+2927 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 2140, "limit": 30})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "After `rw [hn_sub]`, the goal already closes (since the rewrite normalizes ... [+353 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "warning"})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 2310, "limit": 60})
+Let me check if `List.take_succ` is available and try a simpler bridge approach:
+[tool] mcp__lean__lean_hover_info({"file_path": "Multinomial_u64Obligations.lean", "line": 2342, "column": 5})
+Let me try to write the bridge proof and see what's available:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Replace the existing mult_prefix_eq_mult_list with a proof using indexed br... [+7336 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Fix List.sum_singleton (use Nat.zero_add or alternative). Add Nat.le.refl f... [+1175 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "denom proof \u2014 need to close with rfl after the rewrites. The remaining... [+357 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "List.take_of_length_le requires explicit Nat.le.refl. Pass it.", "patch": "... [+1460 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Close the `k.val.size \u2264 k.val.size` goal explicitly. Use Nat.le.refl."... [+1522 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Both bridge lemmas leave `k.val[i] = k.val[i]` as residual goal. Add rfl. A... [+1343 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 2355, "limit": 75})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Both h_eq proofs need rfl after rw [Array.getElem_toList].", "patch": "<<< ... [+1051 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "denom h_eq also needs rfl. Plus the trailing `rfl` is duplicate (rw closes ... [+356 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "warning"})
+Only one `sorry` remains! Let me confirm with `lake build`:
+[tool] run_lake_build({})
+Let me try to close the divergence case by proving binomial non-divergence:
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 1895, "limit": 30})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 1944, "limit": 40})
+Let me take one more shot — prove non-divergence directly. Let me see what's involved:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Attempt to close the divergence case by proving binomial_loop never returns... [+1036 chars])
+Now I need to add the `binomial_not_div` lemma. Let me add it before the failure aux:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Add binomial_not_div and binomial_loop_not_div lemmas before the failure au... [+8794 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+Given the complexity, let me revert the non-divergence attempt and just go with the sorry + admission:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "The non-divergence proof approach has many cascading issues (pure vs RustM.... [+8761 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Revert the binomial_not_div invocation to the sorry placeholder with explan... [+713 chars])
+Now let me update the docstring of `multinomial_overflow_fails` with the honest admission:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Add the required first-person admission to the docstring of multinomial_ove... [+2577 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] run_lake_build({})
+The build succeeds. Let me clean up the deprecation warning and unused simp args:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Clean up warnings: drop unused Nat.mul_left_comm and use the non-deprecated... [+837 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Drop unused Nat.mul_left_comm from the second simp call.", "patch": "<<< SE... [+751 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Replace deprecated List.take_succ with List.take_add_one (or use simp to ha... [+676 chars])
+[tool] run_lake_build({})
+Let me revert the simp args:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Restore Nat.mul_left_comm in the first simp call (needed for AC normalizati... [+822 chars])
+[tool] run_lake_build({})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Remove unused simp arg in mult_list_closed_form per linter warning.", "patc... [+576 chars])
+[tool] run_lake_build({})
+Build succeeds with only the expected `sorry` (in `multinomial_loop_fails_aux`, the divergence sub-case of `multinomial_overflow_fails`). Let me do a final check of the LSP diagnostics:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean"})
+Single sorry remaining as expected. Final summary:
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Multinomial_u64Obligations.lean`
+
+### What was added
+
+Roughly 2,300 lines of proof infrastructure ported from `proof_patterns/binomial_u64_modified` and adapted to the `multinomial_u64` namespace, plus the multinomial-specific machinery (loop step lemmas, factorial closed form for permutation invariance).
+
+### Obligations status
+
+1. **`multinomial_empty_returns_one`** — ✅ closed. Reduces to `multinomial_loop_oob` with `i = 0 = size`.
+2. **`multinomial_singleton_returns_one`** — ✅ closed. One recursion step: `binomial(x, x) = 1` (via `binomial_k_eq_n`) and `1 * 1 = 1`, then OOB.
+3. **`multinomial_closed_form`** — ✅ closed. Strong induction on `size - i.toNat` via `multinomial_loop_correct`, threading invariants `p.toNat = sum_prefix k i.toNat` and `r.toNat = mult_prefix k i.toNat`. Required generalizing `binomial_postcondition` from the reference's `n ≤ 67` precondition to the more general `nchoose n k < 2^64`, plus a monotonicity lemma `nchoose_mono_to_half`.
+4. **`multinomial_overflow_fails`** — ⚠️ closed modulo a `sorry` in a private helper (`multinomial_loop_fails_aux`). See below.
+5. **`multinomial_permutation_invariant`** — ✅ closed. Built the full factorial closed-form chain: `factorial`, `factorial_nchoose_eq` (the binomial identity `k! · (n-k)! · C(n,k) = n!`), `denom_prefix`, `mult_prefix_denom_eq`, parallel `mult_list`/`list_factorial_prod` over `List Nat`, `mult_list_closed_form`, perm-invariance of `list_sum` and `list_factorial_prod`, and the bridge `mult_prefix_eq_mult_list` via `sum_prefix_eq_take_sum` / `denom_prefix_eq_take_lfp`.
+
+### Sub-goals that were difficult and how resolved
+
+- **Generalizing `binomial_postcondition` past `n ≤ 67`**: the reference uses `native_decide` on a bound table indexed by `n ≤ 67`. For multinomial, the running `sum_prefix k (i+1)` can exceed 67 even when the result fits. Replaced with monotonicity: `nchoose n d ≤ nchoose n k` for `d ≤ k ≤ n/2`, proved by induction on `k - d` using the step identity `(d+1) · C(n, d+1) = C(n, d) · (n-d)`.
+- **`multinomial_loop_correct` no-overflow chain**: each step needs `nchoose (sum_prefix k (i+1), k[i].toNat) < 2^64`. Resolved by noting each factor is `≥ 1` (`nchoose_factor_ge_one`), hence each individual factor is `≤ mult_prefix k k.val.size < 2^64`.
+- **Permutation invariance**: required the full factorial closed-form chain because `mult_prefix`'s left-to-right Pascal-product structure is not visibly permutation-invariant. The telescoping identity `mult_prefix k size · denom_prefix k size = factorial (sum_prefix k size)` together with the analogous identity on `List Nat` and the elementary perm-invariance of `List.sum` and `list_factorial_prod` discharges it.
+- **Bridge `mult_prefix_eq_mult_list`**: required `map_take_succ` (the `List.take_add_one` characterization), `Array.getElem_toList`, and `List.take_of_length_le` to relate the indexed prefix on a `RustSlice` to the list-level mult.
+- **No `ring` tactic** (Mathlib-only): replaced every `ring` usage with `simp [Nat.mul_assoc, Nat.mul_comm, Nat.mul_left_comm]` or explicit `Nat.mul_*` rewrite chains.
+
+### `sorry` that survives
+
+**`multinomial_loop_fails_aux`** (the private helper called by `multinomial_overflow_fails`) has a `sorry` in exactly one branch: when the intermediate `multinomial_u64.binomial (p + x) x` evaluates to `RustM.div` (the `none` of `Option (Except Error u64)`) instead of `ok`/`fail`. The full first-person admission is on `multinomial_overflow_fails`'s docstring; the structural unblock is either a `partial_fixpoint`-totality lemma added to the Hax prelude for `RustM`, or re-extracting `binomial` / `binomial_loop` / `gcd_stein_loop` / `trailing_zeros_u64` with `termination_by` clauses so Lean recognizes them as total. The two cases the helper does handle — binomial returning `ok` (recurse via IH or fail at the multiplication) or `fail` (propagate) — are fully closed.
+
+No obligations were weakened, restated, or deleted; no preconditions were added.
+[make_proof] turn 1 done — 1 sorry remain
+
+[make_proof] turn 2/2
+Let me try a more careful approach to prove `binomial_not_div`. First let me write the helper lemmas in a way that works:
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 1900, "limit": 90})
+Let me try a clean approach to prove `binomial_not_div` by building from simple helpers. First, let me test what works:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Try to close the remaining sorry by building binomial_not_div via helper le... [+6539 chars])
+Let me rewrite the `binomial_loop_not_div` more carefully without abstracting the bound variable:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Replace the failed binomial_loop_not_div with a direct case-analysis proof ... [+6738 chars])
+Now add `binomial_not_div` and use it to close the divergence case:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Add binomial_not_div and use it to close the divergence sorry in multinomia... [+2907 chars])
+[tool] Grep({"pattern": "Auxiliary failure-induction lemma", "path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "output_mode": "content", "-n": true})
+[tool] Grep({"pattern": "multinomial_loop_fails_aux", "path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "output_mode": "content", "-n": true, "-B": 2})
+[tool] Grep({"pattern": "private theorem multinomial_loop_fails_aux", "path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "output_mode": "content", "-n": true... [+10 chars])
+[tool] Grep({"pattern": "multinomial_loop_fails_aux \\(k", "path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "output_mode": "content", "-n": true, "-B": 5})
+[tool] Grep({"pattern": "fails_aux", "path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "output_mode": "content", "-n": true, "-B": 5})
+[tool] Grep({"pattern": "multinomial_loop_fails_aux", "path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "output_mode": "count"})
+[tool] Grep({"pattern": "multinomial_loop_fails", "path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "output_mode": "content", "-n": true})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 2080, "limit": 90})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+Let me first restore the missing theorem header for `multinomial_loop_fails_aux`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "My earlier patch dropped the theorem header `private theorem multinomial_lo... [+2981 chars])
+Now update the divergence case in the failure aux to use `binomial_not_div`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Use the newly-proven binomial_not_div to close the sorry in multinomial_loo... [+712 chars])
+Now let me fix the basic helpers — `Option.noConfusion h` doesn't work directly on `pure v = RustM.div`. Let me try alternative tactics:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Option.noConfusion doesn't directly apply to `pure v = RustM.div` because L... [+1275 chars])
+Now fix the `show ... at h` issues in the direct-op helpers:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "`show` doesn't work on hypotheses \u2014 use `change` instead.", "patch": "... [+3802 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+Let me fix the `Option.noConfusion` issue (use `cases` instead) and the other issues:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "Option.noConfusion has an awkward universe-level interface. Use `cases h` (... [+1389 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 2008, "limit": 15})
+Let me fix the induction structure issues:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "binomial_loop_not_div: need to intro all four args before the induction, ot... [+633 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "binomial_loop_not_div: the `ih` application needs `(d + 1).toNat < M`, with... [+1263 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "binomial_not_div: similarly, the IH application needs the bound rewritten v... [+870 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "offset": 2068, "limit": 35})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "After cases h_mad, the goal is already substituted. Remove the spurious `rw... [+2872 chars])
+Also need to fix the earlier "fail propagation" cases that use `Option.noConfusion`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "The `Option.noConfusion hcon` for the bind-chain-fail cases fails because t... [+3746 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "In binomial_loop_not_div, the omega for `d.toNat + 1 < 2^64` needs the no-o... [+2198 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Multinomial_u64Obligations.lean", "severity": "warning"})
+No errors, no warnings! Let me confirm with a full lake build:
+[tool] run_lake_build({})
+Excellent! Build succeeds with **zero `sorry`s and zero warnings**. All 5 obligations are now fully proved. Let me clean up the now-incorrect admission docstring on `multinomial_overflow_fails`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Multinomial_u64Obligations.lean", "error_message": "The honest admission on multinomial_overflow_fails is no longer accurate \u... [+2070 chars])
+[tool] run_lake_build({})
+🎉 All 5 obligations are closed, build is clean with zero `sorry`s and zero warnings.
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Multinomial_u64Obligations.lean`
+
+### What was added in this continuation
+
+To close the remaining `sorry` in `multinomial_loop_fails_aux` (the binomial-divergence sub-case of `multinomial_overflow_fails`), I built a fresh non-divergence chain (≈170 lines):
+
+1. **`pure_ne_div`, `ok_ne_div`, `fail_ne_div`** — `(pure v : RustM α) ≠ RustM.div` and friends. Trick: `change some (Except.ok v) = none at h; cases h` (since `pure`/`RustM.ok` and `RustM.div` are `@[match_pattern]` defs over different `Option` constructors). The natural `Option.noConfusion h` form had universe-level matching issues, so `cases h` was the working tactic.
+2. **`u64_sub_ne_div`, `u64_add_ne_div`, `u64_mul_ne_div`, `u64_div_ne_div`** — each direct arithmetic operator unfolds to an `if overflow then fail else pure`, so it's non-div by case split on the overflow condition.
+3. **`bind_ne_div`** — a generic non-divergence preservation for `RustM` bind (used by `multiply_and_divide_not_div`).
+4. **`multiply_and_divide_not_div`** — chains `gcd_spec` (which already proves `gcd` is total) with `bind_ne_div` over the four direct arithmetic operations in the body. Crucially this depends only on `gcd_spec`, no further `partial_fixpoint` reasoning needed.
+5. **`binomial_loop_not_div`** — strong induction on `k.toNat + 1 - d.toNat`. Key implementation detail: I do NOT use `bind_ne_div` for the inner chain because abstracting the bound variable `d'` over `d +? 1` loses the equality `d' = d + 1` that the IH needs. Instead, explicit `by_cases` on each overflow condition keeps `d + 1` concrete, and `change` reduces the `fail >>= …` chains via definitional equality `RustM.fail e >>= f = RustM.fail e`.
+6. **`binomial_not_div`** — strong induction on `k.toNat`. The recursion `binomial n (n - k)` strictly decreases `k.toNat` (when entered), and the else-branch reduces to `binomial_loop n k 1 1` (closed by `binomial_loop_not_div`).
+
+Then in `multinomial_loop_fails_aux`, the `cases hb_res : binomial (p + x) x` divergence branch becomes a one-line `exact absurd hb_res (binomial_not_div (p + x) x)`.
+
+### Sub-goals that were difficult and how resolved
+
+- **`Option.noConfusion h` mismatch** on `pure v = RustM.div`: Lean refused to unify the universe arguments. Worked around with `change some (Except.ok v) = none at h; cases h`.
+- **`bind_ne_div` loses inductive structure**: abstracting `d'` via `bind_ne_div` made the IH inapplicable to the recursive call (which depends on `d' = d + 1`). Replaced the chain with explicit `by_cases` on each overflow condition so `d + 1` stays concrete.
+- **`(RustM.fail e >>= f) = RustM.div`**: not closed automatically by `Option.noConfusion`. Resolved with `change RustM.fail Error.integerOverflow ≠ RustM.div; exact fail_ne_div _`, exploiting that the bind reduces definitionally.
+- **`cases h_mad` substitutes the goal**: the leftover `rw [h_mad]` was now a redundant operation that failed. Replaced with `change ... ≠ RustM.div` to reduce the `some (.ok rn) >>= …` form via the definitional `RustM_ok_bind`.
+- **IH measure rewriting**: the IH wants `_ < K` where `K = k.toNat`. Bridge with `h_m ▸ ...` or `rw [← h_m]; omega`.
+- **`d.toNat + 1 < 2^64`** in the binomial_loop IH application: required derivation from `h_add_ov : ¬ BitVec.uaddOverflow d.toBitVec (1).toBitVec` via `UInt64.addOverflow_iff`, not just from `d.toNat ≤ k.toNat < 2^64` (which only gives `d.toNat + 1 ≤ 2^64`, not strict).
+
+### Final state
+
+All 5 obligations proved with no `sorry`, no preconditions weakened, no statements modified:
+
+1. ✅ `multinomial_empty_returns_one`
+2. ✅ `multinomial_singleton_returns_one`
+3. ✅ `multinomial_closed_form`
+4. ✅ `multinomial_overflow_fails` (now fully closed — the previous admission docstring has been removed)
+5. ✅ `multinomial_permutation_invariant`
+
+`lake build`: success, no warnings, no `sorry`s.
+[make_proof] turn 2 done — 0 sorry remain (was 1)
+[make_proof] closed after 2 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+Looking at this proof, I need to identify what's structurally novel vs. what's already covered.
+
+**What's reused (already in library):**
+- `trailing_zeros_u64_modified` covers the shift-and-count loop
+- `gcd_stein_u64_modified` covers the Stein binary GCD subtract-and-strip + outer wrapper
+- `binomial_u64_modified` covers `multiply_and_divide` + `binomial_loop` + `binomial` (and explicitly lists itself as the lineage)
+
+**What's structurally new in this proof:**
+
+1. **Permutation invariance** (`multinomial_permutation_invariant`) — proved by bridging the algorithm's index-keyed prefix-scan (`mult_prefix`, `sum_prefix`, `denom_prefix`) to a list closed form `mult_list * list_factorial_prod = factorial sum`, via the binomial identity `k!·(n-k)!·C(n,k) = n!` (`factorial_nchoose_eq`), then deriving `List.Perm` invariance of `mult_list` from the closed form. No existing entry uses `List.Perm` or a factorial-decomposition bridge.
+
+2. **Overflow-failure existential** (`multinomial_overflow_fails`) — `∃ e, multinomial k = RustM.fail e` when `2^64 ≤ sum_prefix`, requiring case-split over THREE potential failure sources (add overflow / binomial-internal failure / mul overflow) at every step.
+
+3. **Explicit non-divergence proofs** (`bind_ne_div`/`pure_ne_div`/`fail_ne_div` + chains `multiply_and_divide_not_div`, `binomial_loop_not_div`, `binomial_not_div`) needed to rule out the `none` branch when casing on `multinomial_u64.binomial` results inside the failure-existential proof. This `Option (Except Error α)` reasoning has no precedent in the library.
+
+4. **Slice-iteration composing a heavy multi-helper sub-call** — each loop step invokes the full 5-helper `binomial` composition. `rescale_to_unit_modified` composes only simple helpers; `clever_025` does nested recursion but on a single counter helper.
+
+These three layers each constitute a distinct obstacle not present in any existing entry. Decision: **ADD**.
+[tool] add_proof_pattern({"features": ["recursion", "strong-induction", "recursive-equation-unfold", "slice-indexing", "existential-postcondition", "bv-nat-bridge", "usize-add-no-overfl... [+3225 chars])
+ADDED `multinomial_u64_modified` — 25 tags including the three novel obstacles `permutation-invariance-postcondition` / `factorial-closed-form-bridge` / `list-perm-postcondition` (the `mult_list * list_factorial_prod = factorial sum` bridge via `factorial_nchoose_eq`), `non-divergence-discharge` / `bind-ne-div-chain` (explicit `Option (Except Error α)`-model reasoning needed to rule out the `RustM.div` branch when casing on inner `binomial` results), and `overflow-failure-existential` / `multi-failure-source-case-split` (three-source failure dispatch over add/binomial/mul at every loop step).
+
+Notable structural observations for a human reader:
+- The proof is the natural "outer layer" successor to `binomial_u64_modified`: it black-box reuses `binomial_postcondition_gen` as a single rewrite, so the whole 5-helper composition's complexity doesn't reappear at this level.
+- The factorial-closed-form bridge is mathematically the substantive new content — about ~200 lines spanning `factorial_nchoose_eq`, `mult_prefix_denom_eq`, `mult_list_closed_form`, `mult_list_perm_invariant`, and the three index-to-list `..._eq_take_..` bridges. The induction in `factorial_nchoose_eq` mirrors Pascal's recurrence almost line-for-line.
+- The non-divergence machinery (`bind_ne_div` etc.) is genuinely orthogonal infrastructure that future proofs needing to case on intermediate RustM results inside an existential-failure clause will likely want to copy verbatim. This is the first library entry to treat `RustM.div` ≠ `RustM.fail` as a proof obligation.
+
+harvest_proof_patterns
+Stage notes: /Users/tobiaskrogh/Desktop/Uni/PdfFiles/6. semester/Bachelor/projects/pipeline_v6/runs/20260524-161355_multinomial_u64_stage_notes.json
+[cleanup] freed 226.5MB from benchmarks/claude-opus-4-7/num-integer-0.1.46/multinomial_u64_modified

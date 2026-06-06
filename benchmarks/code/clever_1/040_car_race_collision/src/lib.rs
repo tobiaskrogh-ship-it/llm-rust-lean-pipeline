@@ -1,0 +1,45 @@
+/// n cars going each direction; every left-to-right car eventually crosses
+/// every right-to-left car ⇒ n × n total "collisions".
+pub fn car_race_collision(x: u64) -> u64 {
+    x * x
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Largest input for which `x * x` fits in `u64`.
+    /// floor(sqrt(u64::MAX)) == u32::MAX == 2^32 - 1.
+    const MAX_SAFE: u64 = u32::MAX as u64;
+
+    proptest! {
+        /// Postcondition: for `x` in `[1, MAX_SAFE]`, the returned value `y`
+        /// is exactly `x²`, characterized as the unique non-negative integer
+        /// satisfying `y / x == x` and `y % x == 0`. This pins down the
+        /// contract without restating the implementation as `x * x`, and
+        /// rejects any buggy implementation that returns a different value
+        /// (e.g. `x * (x + 1)`, `x + x`, `2 * x * x`, etc.).
+        #[test]
+        fn postcondition_is_square(x in 1u64..=MAX_SAFE) {
+            let y = car_race_collision(x);
+            prop_assert_eq!(y / x, x);
+            prop_assert_eq!(y % x, 0);
+        }
+    }
+
+    /// Postcondition at the boundary `x = 0`, where the division
+    /// characterization above is vacuous.
+    #[test]
+    fn postcondition_at_zero() {
+        assert_eq!(car_race_collision(0), 0);
+    }
+
+    /// Failure condition: `x * x` overflows `u64` whenever `x > u32::MAX`,
+    /// which panics in debug builds (the default for `cargo test`).
+    #[test]
+    #[should_panic]
+    fn overflow_panics_above_u32_max() {
+        let _ = car_race_collision(MAX_SAFE + 1);
+    }
+}

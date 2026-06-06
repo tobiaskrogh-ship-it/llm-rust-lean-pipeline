@@ -1,0 +1,161 @@
+<<< SEARCH
+        for x in inputs {
+            let ours = cbrt(x);
+            let theirs = (&x).cbrt();
+            assert_eq!(
+                ours, theirs,
+                "cbrt({x}) disagrees: extracted = {ours}, num-integer = {theirs}"
+            );
+        }
+    }
+}
+===
+        for x in inputs {
+            let ours = cbrt(x);
+            let theirs = (&x).cbrt();
+            assert_eq!(
+                ours, theirs,
+                "cbrt({x}) disagrees: extracted = {ours}, num-integer = {theirs}"
+            );
+        }
+    }
+
+    // -----------------------------------------------------------------
+    // Property-based contract tests.
+    //
+    // Contract of `cbrt`:
+    //   * Precondition:  none --- accepts every `u64`.
+    //   * Postcondition: writing `r = cbrt(x)`,
+    //       (P1) `r^3 <= x`              --- "r is a cube-root candidate",
+    //       (P2) `x < (r+1)^3` whenever `(r+1)^3` fits in `u64`
+    //                                    --- "r is the *greatest* such".
+    //     When `(r+1)^3` overflows `u64`, (P2) is vacuous since
+    //     `x < 2^64 <= (r+1)^3`.
+    //   * Failure:       the function is total --- it never panics and
+    //                    has no error-return channel.
+    //
+    // (P1) and (P2) are independent contract clauses, so each gets its
+    // own test:
+    //   * a buggy implementation that always returned `0` would satisfy
+    //     (P1) but break (P2) for every `x >= 1`;
+    //   * a buggy implementation that returned the *ceiling* cube root
+    //     would satisfy (P2) but break (P1) on every non-cube `x`.
+    //
+    // Totality is implicit in the (P1)/(P2) sweeps: a panic on any
+    // input in `prop_inputs()` would fail those tests too. We do not
+    // duplicate the input sweep just to assert it again.
+    //
+    // We deliberately do *not* test derived consequences:
+    //   * `cbrt(k*k*k) = k` for `k <= cbrt(u64::MAX)` --- follows from
+    //     (P1) ∧ (P2) at `x = k^3`.
+    //   * Monotonicity `x <= y => cbrt(x) <= cbrt(y)` --- follows from
+    //     `cbrt(x) = floor(x^(1/3))`; not an independent claim.
+    //   * `cbrt((r+1)^3 - 1) = r` --- same content as the roundtrip.
+    //   * `(cbrt(x))^2 <= x` for `x >= 1` --- algebraic consequence of
+    //     (P1).
+    // Each derived test would translate to a redundant proof obligation
+    // downstream.
+    // -----------------------------------------------------------------
+
+    /// Deterministic input set for the property tests, chosen so that
+    /// each branch of `cbrt` is exercised:
+    ///   * `x < 8`               --- the short-circuit branch.
+    ///   * `8 <= x <= u32::MAX`  --- the Hacker's-Delight `icbrt2` u32 path.
+    ///   * `x > u32::MAX`        --- the `f64`-guess + Newton fixpoint path.
+    /// Plus values known to stress cube-root implementations: the
+    /// u32/u64 path-selector boundary, the f64-mantissa boundary near
+    /// `u64::MAX` (where the initial `f64` guess is no longer ulp-tight
+    /// and the fixpoint loop has to do real work), perfect cubes and
+    /// their immediate neighbours, and bit-pattern sweeps via shifts
+    /// (a stand-in for `proptest`-style bit generators, which are not
+    /// available in this crate's dev-dependencies).
+    fn prop_inputs() -> Vec<u64> {
+        let mut v: Vec<u64> = Vec::new();
+
+        // Small values: covers `< 8` and the start of the u32 path.
+        for x in 0u64..=300 {
+            v.push(x);
+        }
+
+        // Perfect cubes `k^3` and their immediate neighbours up to
+        // `k = 65_536` (so `k^3 < 2^48`), straddling the u32 path
+        // and the fixpoint path.
+        for k in 0u64..=65_536 {
+            let c = k.saturating_mul(k).saturating_mul(k);
+            v.push(c.saturating_sub(1));
+            v.push(c);
+            v.push(c.saturating_add(1));
+        }
+
+        // u32/u64 path-selector boundary.
+        for delta in 0u64..=64 {
+            v.push((u32::MAX as u64).saturating_sub(delta));
+            v.push((u32::MAX as u64).saturating_add(delta));
+        }
+
+        // f64-mantissa boundary near `u64::MAX`.
+        let rounding_bit: u64 = 1u64 << (64 - 53 - 1);
+        for delta in 0u64..=64 {
+            v.push((u64::MAX - rounding_bit).saturating_sub(delta));
+            v.push((u64::MAX - rounding_bit).saturating_add(delta));
+        }
+        v.push(u64::MAX);
+
+        // Single-bit values, ones-suffix masks, and ones-prefix masks
+        // --- a poor-man's bit-pattern sweep.
+        for k in 0u32..64 {
+            v.push(1u64 << k);
+            v.push((1u64 << k).wrapping_sub(1));
+            v.push(u64::MAX << k);
+            v.push(u64::MAX >> k);
+        }
+
+        v
+    }
+
+    /// Property (P1): `cbrt(x)^3 <= x` for every `x: u64`.
+    ///
+    /// This is the "is a cube root" half of the postcondition. The
+    /// computation `r * r * r` cannot overflow `u64` --- the largest
+    /// possible result is `r = floor(cbrt(u64::MAX)) = 2_642_245`,
+    /// whose cube fits in `u64` --- but we use `checked_pow(3)` to
+    /// turn the no-overflow side condition into an explicit assertion.
+    #[test]
+    fn prop_cube_le_x() {
+        for x in prop_inputs() {
+            let r = cbrt(x);
+            let r3 = r
+                .checked_pow(3)
+                .unwrap_or_else(|| panic!("cbrt({x}) = {r}, but {r}^3 overflows u64"));
+            assert!(
+                r3 <= x,
+                "(P1) violated: cbrt({x}) = {r}, but {r}^3 = {r3} > {x}",
+            );
+        }
+    }
+
+    /// Property (P2): for every `x: u64`, either `(cbrt(x)+1)^3`
+    /// overflows `u64` (vacuous --- then `x < 2^64 <= (r+1)^3`), or
+    /// `x < (cbrt(x)+1)^3`.
+    ///
+    /// This is the "is the *greatest* cube root" half of the
+    /// postcondition. Without it, `cbrt` could legally return any
+    /// value `r` with `r^3 <= x` --- e.g. always `0` --- and still
+    /// satisfy (P1).
+    #[test]
+    fn prop_x_lt_next_cube() {
+        for x in prop_inputs() {
+            let r = cbrt(x);
+            // `r <= cbrt(u64::MAX) = 2_642_245`, so `r + 1` cannot
+            // overflow; only the cubing step might.
+            if let Some(b) = (r + 1).checked_pow(3) {
+                assert!(
+                    x < b,
+                    "(P2) violated: cbrt({x}) = {r}, but {x} >= ({r}+1)^3 = {b}",
+                );
+            }
+            // else: (r+1)^3 overflows u64, so the bound is vacuous.
+        }
+    }
+}
+>>> REPLACE

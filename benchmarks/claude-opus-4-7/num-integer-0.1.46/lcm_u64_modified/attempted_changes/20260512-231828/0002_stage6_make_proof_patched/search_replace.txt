@@ -1,0 +1,97 @@
+<<< SEARCH
+/-- `RustM.fail e = RustM.ok v` is impossible: `Option.some (.error e) ≠ Option.some (.ok v)`.
+    Proved by two-step `injection`. -/
+private theorem rustM_fail_ne_ok {α : Type} (e : Error) (v : α) :
+    (RustM.fail e : RustM α) ≠ RustM.ok v := by
+  intro h
+  injection h with h1
+  injection h1
+===
+/-- `RustM.fail e = RustM.ok v` is impossible: `Option.some (.error e) ≠ Option.some (.ok v)`.
+    Proved by two-step `injection`. -/
+private theorem rustM_fail_ne_ok {α : Type} (e : Error) (v : α) :
+    (RustM.fail e : RustM α) ≠ RustM.ok v := by
+  intro h
+  injection h with h1
+  injection h1
+
+/-- **Closed-form reduction of `lcm` in the both-non-zero branch.**
+
+    Under `x ≠ 0 ∧ y ≠ 0`, the early-return guard `(x == 0) && (y == 0)`
+    fires false, so `lcm x y` enters the gcd path. Applying
+    `gcd_u64_postcondition`, the inner gcd resolves to
+    `g := UInt64.ofNat (Nat.gcd x.toNat y.toNat)`. Since `g ≠ 0` (because
+    not both inputs are zero), `y /? g` reduces to `pure (y / g)`.
+    What remains is `x *? (y / g)`. -/
+private theorem lcm_nonzero_form (x y : u64) (hx : x ≠ 0) (hy : y ≠ 0) :
+    lcm_u64.lcm x y =
+      (rust_primitives.ops.arith.Mul.mul x
+        (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)) : RustM u64) := by
+  unfold lcm_u64.lcm
+  have h_eq_x : (x == (0 : u64)) = false := by
+    simp [BEq.beq, hx]
+  simp only [rust_primitives.cmp.eq, rust_primitives.hax.logical_op.and,
+             pure_bind, h_eq_x, Bool.false_and, ↓reduceIte]
+  -- Goal: gcd_u64 x y >>= fun g => y /? g >>= fun q => x *? q = ...
+  rw [gcd_u64_postcondition]
+  simp only [rustM_ok_bind]
+  -- Goal: y /? (UInt64.ofNat (gcd ...)) >>= fun q => x *? q = ...
+  have hg_pos : 0 < (UInt64.ofNat (Nat.gcd x.toNat y.toNat)).toNat :=
+    gcd_u64_pos x y (Or.inl hx)
+  have hg_ne : UInt64.ofNat (Nat.gcd x.toNat y.toNat) ≠ 0 := by
+    intro hh
+    rw [hh] at hg_pos
+    simp at hg_pos
+  show ((rust_primitives.ops.arith.Div.div y
+            (UInt64.ofNat (Nat.gcd x.toNat y.toNat)) : RustM u64) >>=
+          fun q => x *? q) =
+      (rust_primitives.ops.arith.Mul.mul x
+        (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)) : RustM u64)
+  simp only [rust_primitives.ops.arith.Div.div, if_neg hg_ne, pure_bind]
+  rfl
+
+/-- Consequence of `lcm_nonzero_form`: if `lcm x y = RustM.ok r` (with both
+    `x, y` nonzero), then `r = x * (y / g)` at the `u64` level, *and*
+    `x.toNat * (y / g).toNat < 2 ^ 64` (the multiplication did not overflow).
+
+    Extracts the key arithmetic facts the four `lcm_*` theorems need. -/
+private theorem lcm_value_extract (x y r : u64) (hx : x ≠ 0) (hy : y ≠ 0)
+    (h : lcm_u64.lcm x y = RustM.ok r) :
+    r = x * (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)) ∧
+    x.toNat * (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)).toNat < 2 ^ 64 := by
+  rw [lcm_nonzero_form x y hx hy] at h
+  -- Now h : (rust_primitives.ops.arith.Mul.mul x (y / g) : RustM u64) = RustM.ok r
+  -- where g = UInt64.ofNat (Nat.gcd x.toNat y.toNat).
+  simp only [rust_primitives.ops.arith.Mul.mul] at h
+  -- h : (if umulOverflow then fail else pure (x * (y/g))) = RustM.ok r
+  by_cases hovf :
+      BitVec.umulOverflow x.toBitVec
+        (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)).toBitVec = true
+  · -- Overflow: contradiction.
+    rw [if_pos hovf] at h
+    exact absurd h (rustM_fail_ne_ok _ _)
+  · rw [if_neg hovf] at h
+    -- h : pure (x * (y/g)) = RustM.ok r
+    have hr : x * (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)) = r := by
+      injection h with h1
+      injection h1
+    have h_no_ovf_nat :
+        x.toNat * (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)).toNat < 2 ^ 64 := by
+      have h_bv_false :
+          BitVec.umulOverflow x.toBitVec
+            (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)).toBitVec = false := by
+        cases hb : BitVec.umulOverflow x.toBitVec
+              (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)).toBitVec
+        · rfl
+        · exact absurd hb hovf
+      -- Translate to Nat-level bound.
+      have h_no_uint_ovf :
+          ¬ UInt64.mulOverflow x
+              (y / UInt64.ofNat (Nat.gcd x.toNat y.toNat)) := by
+        show ¬ (BitVec.umulOverflow x.toBitVec _ = true)
+        rw [h_bv_false]
+        decide
+      rw [UInt64.mulOverflow_iff] at h_no_uint_ovf
+      omega
+    exact ⟨hr.symm, h_no_ovf_nat⟩
+>>> REPLACE

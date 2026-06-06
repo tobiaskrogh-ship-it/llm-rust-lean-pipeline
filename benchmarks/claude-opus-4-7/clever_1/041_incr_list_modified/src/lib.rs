@@ -1,0 +1,53 @@
+/// Return a new list where each element of `numbers` is incremented by 1.
+fn incr_at(numbers: &[i64], i: usize, acc: Vec<i64>) -> Vec<i64> {
+    if i >= numbers.len() {
+        acc
+    } else {
+        let mut acc = acc;
+        // Typed let — Hax emits the size in the type annotation
+        // `RustArray i64 1`, so `unsize` can elaborate the size.
+        // `Vec::push` is unmodeled in the Hax Lean prelude; using
+        // `extend_from_slice` with a typed chunk works (per
+        // rewrite_patterns/vec_push_to_extend_from_slice_typed_chunk.rs).
+        let chunk: [i64; 1] = [numbers[i] + 1];
+        acc.extend_from_slice(&chunk);
+        incr_at(numbers, i + 1, acc)
+    }
+}
+
+pub fn incr_list(numbers: &[i64]) -> Vec<i64> {
+    incr_at(numbers, 0, Vec::new())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    proptest! {
+        // Postcondition: for any input vector whose elements are all strictly
+        // less than i64::MAX, `incr_list` returns a Vec of the same length
+        // whose i-th element is exactly `numbers[i] + 1`. Comparing against
+        // the reference `map(+1)` captures both length preservation and the
+        // per-index value claim in a single assertion: a buggy implementation
+        // that produced a shorter/longer vector, dropped elements, reordered
+        // them, or used a wrong offset would fail this test.
+        #[test]
+        fn incr_list_matches_elementwise_increment(
+            numbers in proptest::collection::vec(i64::MIN..i64::MAX, 0..32)
+        ) {
+            let expected: Vec<i64> = numbers.iter().map(|x| x + 1).collect();
+            prop_assert_eq!(incr_list(&numbers), expected);
+        }
+    }
+
+    // Failure condition: the contract's precondition is violated when any
+    // element equals i64::MAX, because `numbers[i] + 1` overflows. In debug
+    // builds (the default for `cargo test`) this panics. This pins down the
+    // failure mode rather than leaving it implicit.
+    #[test]
+    #[should_panic]
+    fn incr_list_panics_on_i64_max_element() {
+        let _ = incr_list(&[0, 1, i64::MAX, 2]);
+    }
+}

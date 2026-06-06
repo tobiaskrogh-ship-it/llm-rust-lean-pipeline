@@ -1,0 +1,140 @@
+<<< SEARCH
+#[cfg(test)]
+mod tests {
+    use super::write_u64_into;
+
+    // Transferred from the doc-test of `ByteOrder::write_u64_into`
+    // (src/lib.rs around line 1365 in the source crate). The original used
+    // `LittleEndian::read_u64_into` to round-trip the data; here we
+    // decode each 8-byte chunk inline via `u64::from_le_bytes`.
+    #[test]
+    fn doc_round_trip_little_endian() {
+        let mut bytes = [0u8; 32];
+        let numbers_given: [u64; 4] = [1, 2, 0xf00f, 0xffee];
+        write_u64_into(&numbers_given, &mut bytes);
+
+        let mut numbers_got = [0u64; 4];
+        for (i, chunk) in bytes.chunks_exact(8).enumerate() {
+            numbers_got[i] = u64::from_le_bytes(chunk.try_into().unwrap());
+        }
+        assert_eq!(numbers_given, numbers_got);
+    }
+
+    // Transferred from the `slice_lengths!` macro invocation
+    // `slice_len_too_small_u64` (write_little_endian arm) in
+    // src/lib.rs around line 3195 of the source crate.
+    #[test]
+    #[should_panic]
+    fn slice_len_too_small_u64_write_little_endian() {
+        let mut bytes = [0u8; 15];
+        let numbers: [u64; 2] = [0, 0];
+        write_u64_into(&numbers, &mut bytes);
+    }
+
+    // Transferred from the `slice_lengths!` macro invocation
+    // `slice_len_too_big_u64` (write_little_endian arm) in
+    // src/lib.rs around line 3202 of the source crate.
+    #[test]
+    #[should_panic]
+    fn slice_len_too_big_u64_write_little_endian() {
+        let mut bytes = [0u8; 17];
+        let numbers: [u64; 2] = [0, 0];
+        write_u64_into(&numbers, &mut bytes);
+    }
+}
+===
+#[cfg(test)]
+mod tests {
+    use super::write_u64_into;
+
+    /// Deterministic xorshift64 PRNG so the "property" inputs are
+    /// reproducible without pulling in an external proptest/quickcheck
+    /// dependency (which would also be noise for the downstream
+    /// extraction pipeline).
+    fn next_u64(state: &mut u64) -> u64 {
+        let mut x = *state;
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        *state = x;
+        x
+    }
+
+    /// POSTCONDITION (the full functional contract).
+    ///
+    /// For any `src` and a correctly sized `dst`, after the call every
+    /// destination byte is exactly the little-endian serialization of the
+    /// corresponding source element:
+    ///
+    ///   dst[8*i + j] == (src[i] >> (8*j)) as u8     for all i, j
+    ///
+    /// The index set `{ 8*i + j : i < src.len(), j < 8 }` is exactly
+    /// `0 .. dst.len()`, so this single check also asserts that *every*
+    /// byte of `dst` is written (we pre-fill `dst` with a sentinel that
+    /// must be completely overwritten) and pins the encoding to
+    /// little-endian. It also necessarily covers that a validly sized
+    /// call does not panic, including the empty edge case (`len == 0`,
+    /// where the loop body never runs).
+    #[test]
+    fn postcondition_little_endian_layout_covers_all_bytes() {
+        let mut rng: u64 = 0x9E37_79B9_7F4A_7C15;
+        for len in 0usize..=64 {
+            let src: Vec<u64> = (0..len).map(|_| next_u64(&mut rng)).collect();
+            // Sentinel pattern: every byte must be overwritten.
+            let mut dst = vec![0xAAu8; len * 8];
+
+            write_u64_into(&src, &mut dst);
+
+            assert_eq!(dst.len(), src.len() * 8);
+            for i in 0..len {
+                for j in 0..8 {
+                    let expected = (src[i] >> (8 * j)) as u8;
+                    assert_eq!(
+                        dst[i * 8 + j],
+                        expected,
+                        "byte {} (element {}, offset {}) wrong for len {}",
+                        i * 8 + j,
+                        i,
+                        j,
+                        len,
+                    );
+                }
+            }
+        }
+    }
+
+    /// FAILURE CONDITION / PRECONDITION.
+    ///
+    /// The function panics for every length pair that violates
+    /// `dst.len() == 8 * src.len()`, and only for those. We sweep a grid
+    /// of `(src_len, dst_len)` pairs and assert: mismatch => panic,
+    /// match => no panic.
+    #[test]
+    fn panics_exactly_when_length_relation_violated() {
+        // Silence the default panic output for the deliberate panics.
+        let prev = std::panic::take_hook();
+        std::panic::set_hook(Box::new(|_| {}));
+
+        for src_len in 0usize..=10 {
+            for dst_len in 0usize..=88 {
+                let src = vec![0u64; src_len];
+                let result = std::panic::catch_unwind(move || {
+                    let mut dst = vec![0u8; dst_len];
+                    write_u64_into(&src, &mut dst);
+                });
+                let satisfies_precondition = dst_len == src_len * 8;
+                assert_eq!(
+                    result.is_ok(),
+                    satisfies_precondition,
+                    "src_len = {}, dst_len = {}: expected panic == {}",
+                    src_len,
+                    dst_len,
+                    !satisfies_precondition,
+                );
+            }
+        }
+
+        std::panic::set_hook(prev);
+    }
+}
+>>> REPLACE

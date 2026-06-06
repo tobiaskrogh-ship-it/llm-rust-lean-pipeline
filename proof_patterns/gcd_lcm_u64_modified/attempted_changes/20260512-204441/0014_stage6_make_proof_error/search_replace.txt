@@ -1,0 +1,201 @@
+<<< SEARCH
+/-- Stein's binary GCD correctness for `gcd_lcm_u64.gcd`.
+
+    Closed cases: `x = 0` and `y = 0` (the inner if `m == 0 || n == 0`
+    short-circuits to true and the function returns `m ||| n` without
+    entering the loop). These two branches are proven inline below.
+
+    **Remaining sorry** (only the `x ≠ 0 ∧ y ≠ 0` case): the genuinely
+    hard branch where the Stein's loop actually runs. Stuck sub-goal:
+    proving Hoare triples for three nested while-loop constructs —
+    `trailing_zeros_u64` (a count-trailing-zeros loop, invoked 4× by
+    `gcd`) and the outer Stein's loop (subtract-and-shift). Each
+    requires its own invariant + termination measure proof in the style
+    of `while_example` / `gcd_while_modified`.
+
+    **Structural unblock**: a separately-proved `proof_patterns/stein_gcd_u64`
+    pattern targeting exactly this case would close the remaining sorry.
+    The proof would chain three loop-spec proofs:
+    1. `trailing_zeros_u64 x = RustM.ok (UInt64.ofNat ⟨count of low zero bits⟩)`
+       via invariant `y.toNat * 2 ^ count = x.toNat ∧ y ≠ 0 → bit0 y = false`.
+    2. Outer loop preserving `Nat.gcd m.toNat n.toNat`, after initial
+       `m >>>= tz(m); n >>>= tz(n)` (so both odd), via `Nat.gcd_rec` and
+       the bit-trick that `(m - n) >>>= tz(m - n)` peels a power of two
+       whose gcd factor is removed by the final `<<<? shift`.
+    3. Final assembly via `Nat.gcd_mul_left`. -/
+private theorem gcd_correct (x y : u64) :
+    gcd_lcm_u64.gcd x y = RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat)) := by
+  -- Narrowing attempt: handle the cases where at least one input is zero
+  -- (no loop runs in that branch), leaving only the both-non-zero case as
+  -- the structural unblock.
+  by_cases hxy_zero : x = 0 ∨ y = 0
+  · -- At least one input is zero. The inner if `m == 0 || n == 0` short-
+    -- circuits to true, and the result is `m ||| n` (no loop).
+    rcases hxy_zero with hx | hy
+    · subst hx
+      -- gcd 0 y reduces to ok (0 ||| y) = ok y; Nat.gcd 0 y.toNat = y.toNat.
+      unfold gcd_lcm_u64.gcd
+      simp only [rust_primitives.cmp.eq, rust_primitives.hax.logical_op.or,
+                 pure_bind, beq_self_eq_true, Bool.true_or, ↓reduceIte]
+      have hyor : ((0 : u64) ||| y) = y := by
+        apply UInt64.toBitVec_inj.mp; simp
+      show pure ((0 : u64) ||| y) = RustM.ok (UInt64.ofNat (Nat.gcd 0 y.toNat))
+      rw [hyor]
+      congr 1
+      apply UInt64.toNat_inj.mp
+      rw [Nat.gcd_zero_left, UInt64.toNat_ofNat_of_lt' y.toNat_lt]
+    · subst hy
+      -- gcd x 0 reduces to ok (x ||| 0) = ok x; Nat.gcd x.toNat 0 = x.toNat.
+      unfold gcd_lcm_u64.gcd
+      simp only [rust_primitives.cmp.eq, rust_primitives.hax.logical_op.or,
+                 pure_bind, beq_self_eq_true, Bool.or_true, ↓reduceIte]
+      have hxor : (x ||| (0 : u64)) = x := by
+        apply UInt64.toBitVec_inj.mp; simp
+      show pure (x ||| (0 : u64)) = RustM.ok (UInt64.ofNat (Nat.gcd x.toNat 0))
+      rw [hxor]
+      congr 1
+      apply UInt64.toNat_inj.mp
+      rw [Nat.gcd_zero_right, UInt64.toNat_ofNat_of_lt' x.toNat_lt]
+  · -- Both x ≠ 0 and y ≠ 0. The inner loop runs. This is the genuinely
+    -- hard case requiring Stein's algorithm correctness via three nested
+    -- while-loop spec proofs.
+    sorry
+===
+/-! ### Scaffolding helpers for Stein's binary GCD correctness
+
+These local helpers were identified during a proof attempt at `gcd_correct`'s
+both-non-zero branch. They state the lemmas a future pass needs to close the
+Stein's-algorithm correctness proof. -/
+
+/-- Nat-level binary GCD agrees with `Nat.gcd`. Applies the standard
+    Stein's-algorithm reduction: `Nat.gcd (2a) (2b) = 2 * Nat.gcd a b`,
+    `Nat.gcd (2a) (2b+1) = Nat.gcd a (2b+1)`, and
+    `Nat.gcd a b = Nat.gcd (a - b) b` for `a ≥ b`. The three sub-lemmas below
+    are the precise facts the outer Stein's loop body needs; each is provable
+    in the Lean prelude from `Nat.gcd_sub_self_right`, `Nat.gcd_mul_left`,
+    and a small div_two argument. -/
+private theorem nat_gcd_sub_left (a b : Nat) (h : b ≤ a) :
+    Nat.gcd a b = Nat.gcd (a - b) b := by
+  -- a = (a - b) + b, then use Nat.gcd_add_self_left.
+  conv_lhs => rw [show a = (a - b) + b from (Nat.sub_add_cancel h).symm]
+  exact Nat.gcd_add_self_left (a - b) b
+
+private theorem nat_gcd_sub_right (a b : Nat) (h : a ≤ b) :
+    Nat.gcd a b = Nat.gcd a (b - a) := by
+  conv_lhs => rw [show b = (b - a) + a from (Nat.sub_add_cancel h).symm]
+  exact Nat.gcd_add_self_right a (b - a)
+
+/-- Half-shift identity: `Nat.gcd (2a) (2b) = 2 * Nat.gcd a b`.
+    From `Nat.gcd_mul_left` with `k = 2`. -/
+private theorem nat_gcd_two_mul (a b : Nat) :
+    Nat.gcd (2 * a) (2 * b) = 2 * Nat.gcd a b :=
+  Nat.gcd_mul_left 2 a b
+
+/-- Odd-even reduction: `Nat.gcd (2a) (2b+1) = Nat.gcd a (2b+1)`, because
+    `Nat.coprime 2 (2b+1)`. Established via `Nat.Coprime.gcd_mul_left_cancel`.
+    Statement form chosen to match the Stein's-algorithm body step:
+    when `n` is odd and `m` is even, we can halve `m` without changing the gcd. -/
+private theorem nat_gcd_two_mul_odd (a b : Nat) :
+    Nat.gcd (2 * a) (2 * b + 1) = Nat.gcd a (2 * b + 1) := by
+  have h_coprime : Nat.Coprime 2 (2 * b + 1) := by
+    show Nat.gcd 2 (2 * b + 1) = 1
+    rw [Nat.gcd_comm, Nat.gcd_rec]
+    simp [Nat.add_mul_mod_self_left]
+  exact h_coprime.gcd_mul_left_cancel a
+
+/-- Stein's binary GCD correctness for `gcd_lcm_u64.gcd`.
+
+    Closed cases: `x = 0` and `y = 0` (the inner if `m == 0 || n == 0`
+    short-circuits to true and the function returns `m ||| n` without
+    entering the loop). These two branches are proven inline below.
+
+    **Remaining sorry** (only the `x ≠ 0 ∧ y ≠ 0` case): the genuinely
+    hard branch where the Stein's loop actually runs.
+
+    **Attempt history**: After deriving `x ≠ 0` and `y ≠ 0`, unfolding
+    `gcd_lcm_u64.gcd`, and reducing the outer if's boolean to the else
+    branch via the not-both-zero hypothesis (closed below), the goal
+    becomes a chain of three nested `rust_primitives.hax.while_loop`
+    invocations bound by `>>=`. Specifically the residual goal has shape:
+
+    ```
+    do
+      let shift ← trailing_zeros_u64 (x ||| y)
+      let m ← x >>>? (← trailing_zeros_u64 x)
+      let n ← y >>>? (← trailing_zeros_u64 y)
+      let ⟨m, n⟩ ← while_loop ⟨m,n⟩ (m ≠ n) (… subtract-and-shift body …)
+      m <<<? shift
+    = RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat))
+    ```
+
+    Stuck sub-goal: proving Hoare triples for the four `trailing_zeros_u64`
+    calls and the outer Stein's `while_loop`. Each requires its own
+    invariant + termination measure, and the body steps need the
+    Nat-level reductions established above (`nat_gcd_sub_left`,
+    `nat_gcd_sub_right`, `nat_gcd_two_mul`, `nat_gcd_two_mul_odd`)
+    together with a `Nat.trailingZeros`-like primitive recursion (not
+    in the Hax prelude) bridging `UInt64.toNat ((x >>>? tz x).get!) =
+    x.toNat / 2 ^ tz_nat x.toNat`.
+
+    **Structural unblock**: a separately-proved `proof_patterns/stein_gcd_u64`
+    pattern targeting exactly this case would close the remaining sorry.
+    The proof would chain four `trailing_zeros_u64_triple` proofs and one
+    `gcd_inner_loop_triple` proof, then assemble via
+    `Triple.bind` + `nat_gcd_two_mul` for the final `<<< shift`. -/
+private theorem gcd_correct (x y : u64) :
+    gcd_lcm_u64.gcd x y = RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat)) := by
+  -- Narrowing attempt: handle the cases where at least one input is zero
+  -- (no loop runs in that branch), leaving only the both-non-zero case as
+  -- the structural unblock.
+  by_cases hxy_zero : x = 0 ∨ y = 0
+  · -- At least one input is zero. The inner if `m == 0 || n == 0` short-
+    -- circuits to true, and the result is `m ||| n` (no loop).
+    rcases hxy_zero with hx | hy
+    · subst hx
+      -- gcd 0 y reduces to ok (0 ||| y) = ok y; Nat.gcd 0 y.toNat = y.toNat.
+      unfold gcd_lcm_u64.gcd
+      simp only [rust_primitives.cmp.eq, rust_primitives.hax.logical_op.or,
+                 pure_bind, beq_self_eq_true, Bool.true_or, ↓reduceIte]
+      have hyor : ((0 : u64) ||| y) = y := by
+        apply UInt64.toBitVec_inj.mp; simp
+      show pure ((0 : u64) ||| y) = RustM.ok (UInt64.ofNat (Nat.gcd 0 y.toNat))
+      rw [hyor]
+      congr 1
+      apply UInt64.toNat_inj.mp
+      rw [Nat.gcd_zero_left, UInt64.toNat_ofNat_of_lt' y.toNat_lt]
+    · subst hy
+      -- gcd x 0 reduces to ok (x ||| 0) = ok x; Nat.gcd x.toNat 0 = x.toNat.
+      unfold gcd_lcm_u64.gcd
+      simp only [rust_primitives.cmp.eq, rust_primitives.hax.logical_op.or,
+                 pure_bind, beq_self_eq_true, Bool.or_true, ↓reduceIte]
+      have hxor : (x ||| (0 : u64)) = x := by
+        apply UInt64.toBitVec_inj.mp; simp
+      show pure (x ||| (0 : u64)) = RustM.ok (UInt64.ofNat (Nat.gcd x.toNat 0))
+      rw [hxor]
+      congr 1
+      apply UInt64.toNat_inj.mp
+      rw [Nat.gcd_zero_right, UInt64.toNat_ofNat_of_lt' x.toNat_lt]
+  · -- Both x ≠ 0 and y ≠ 0. The inner loop runs.
+    push_neg at hxy_zero
+    obtain ⟨hx, hy⟩ := hxy_zero
+    -- Reduce the outer `if (m == 0 || n == 0)` to the else branch.
+    unfold gcd_lcm_u64.gcd
+    have hxbeq : (x == (0 : u64)) = false := by
+      apply (Bool.eq_false_iff).mpr; intro h
+      apply hx; exact (beq_iff_eq.mp h)
+    have hybeq : (y == (0 : u64)) = false := by
+      apply (Bool.eq_false_iff).mpr; intro h
+      apply hy; exact (beq_iff_eq.mp h)
+    simp only [rust_primitives.cmp.eq, rust_primitives.hax.logical_op.or,
+               pure_bind, hxbeq, hybeq, Bool.or_self,
+               Bool.false_eq_true, ↓reduceIte]
+    -- Goal now: the nested `do`-block with three trailing_zeros_u64 calls
+    -- and the outer Stein's while_loop, followed by `m <<<? shift`,
+    -- equals `RustM.ok (UInt64.ofNat (Nat.gcd x.toNat y.toNat))`.
+    -- The remaining work is to chain four `trailing_zeros_u64_triple`
+    -- proofs (totality + value identification at the Nat level) and one
+    -- `gcd_inner_loop_triple` proof (invariant: `Nat.gcd m.toNat n.toNat
+    -- * 2 ^ (shift_so_far) = Nat.gcd x.toNat y.toNat`), then convert
+    -- the resulting triple to the equation via `RustM.Triple_iff_BitVec`.
+    -- This is the structural unblock named in the docstring above.
+    sorry
