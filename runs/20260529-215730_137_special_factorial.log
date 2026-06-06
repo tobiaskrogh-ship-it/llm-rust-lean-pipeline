@@ -1,0 +1,300 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260529-215730_137_special_factorial.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/137_special_factorial/attempted_changes/20260529-215730
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Read({"file_path": "src/lib.rs"})
+I've reviewed the function. Let me analyze the contract:
+
+**Contract:**
+- `special_factorial(0) = 1` (explicit convention from the docstring)
+- For `n ≥ 1`: `special_factorial(n) = 1! · 2! · … · n!` (the Brazilian factorial)
+- Failure mode: silent `u64` overflow. `sf(8) ≈ 5·10¹⁵` fits, `sf(9) ≈ 1.83·10²¹` overflows.
+
+**Independent claims worth testing:**
+1. Base case at `n=0` (convention, separate from the recurrence).
+2. Postcondition for `1 ≤ n ≤ 8`: matches the closed-form product of factorials.
+
+**Properties I'll deliberately omit:**
+- Recursive relation `sf(n) = sf(n-1) · n!` — equivalent to the closed-form spec given the base case; testing both is redundant.
+- Divisibility (`sf(n-1) | sf(n)`), monotonicity, parity (`sf(n)` even for `n ≥ 2`) — all derived from the closed form.
+- Behavior for `n ≥ 9` — overflow is undefined by the spec; testing wraparound would pin down `u64`-specific behavior that isn't part of the contract.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn known() {\n        assert_eq!(special_factorial(0... [+2209 chars])
+[tool] run_cargo_test({})
+All three tests pass.
+
+## Summary
+
+**Tests added:**
+
+| Test | Contract clause |
+|---|---|
+| `base_case_zero` | Convention: `special_factorial(0) = 1`. Defining base case stated explicitly in the docstring. |
+| `matches_product_of_factorials` (range `0..=8`) | Postcondition: result equals `1! · 2! · … · n!`, compared against an independent reference built from `std`'s `product`/`map`. Range capped at 8 because `sf(9)` overflows `u64`. |
+
+**Properties considered but omitted:**
+
+- **Recursive relation `sf(n) = sf(n-1) · n!`** — mathematically equivalent to the closed-form postcondition given the base case; testing both is redundant and would add a second proof obligation downstream for the same fact.
+- **Monotonicity / divisibility (`sf(n-1) | sf(n)`) / parity (`sf(n)` even for `n ≥ 2`)** — all derived consequences of the product spec; a correct implementation must satisfy them automatically, and a buggy one that misses them is already caught by the product comparison.
+- **Behavior at `n ≥ 9`** — overflow is outside the contract. Testing wraparound would pin down a `u64`-specific artifact the spec does not promise.
+- **Algebraic identities of the underlying multiplications** — derived facts about `*`, not about `special_factorial`.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Bash({"command": "pwd && ls", "description": "Check working directory and contents"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/137_special_factorial_modified/src/lib.rs"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/137_special_factorial_modified/proofs/lean/extraction/clever_137_special_factori... [+9 chars])
+All three pipeline stages pass cleanly, and the extracted Lean file has no degenerate shapes. Let me confirm via the documented detection checks.
+[tool] Bash({"command": "grep -nE '&&[^&]*[ (]([a-zA-Z_][a-zA-Z0-9_]*\\s*[-/%]|[0-9]+\\s*<<)' src/lib.rs; grep -nE '\\|\\|[^|]*[ (]([a-zA-Z_][a-zA-Z0-9_]*\\s*[-/%]|[0-9]+\\... [+217 chars])
+All four heuristic checks come back clean (no matches → no problematic patterns).
+
+## Final output
+
+**Pipeline status: all three stages pass on the original source — no rewrites needed.**
+
+- `cargo test` ✓ — 3 tests pass (`known`, `base_case_zero`, `matches_product_of_factorials`).
+- `cargo hax into lean` ✓ — extraction succeeded with no errors or warnings.
+- `lake build` ✓ — extracted Lean compiles cleanly.
+
+### Why no changes were required
+
+The crate ships in an already Hax-friendly shape:
+
+1. **No `while` loops.** Both the inner factorial computation (`factorial_at`) and the outer Brazilian-factorial accumulator (`build_at`) are written as **tail-recursive helpers** with single-accumulator state and a decreasing measure (`k - cur` and `n - k` respectively). This is the preferred shape per the recursion-preference rule — extraction produces `partial_fixpoint` definitions that downstream proofs can discharge via `Nat.strongRecOn`. See the extracted file (lines 21–37): each function is followed by `partial_fixpoint`.
+2. **No `&&` / `||` short-circuits over partial ops.** Every guarded subtraction-or-division is gated by explicit `if`/`else` (e.g. `if n == 0 { 1 } else { build_at(n, 1, 1) }`), so Hax's eager `do`-block extraction cannot trigger spurious `RustM.fail` divergence on the `n = 0` boundary.
+3. **No iterator chains, no library calls needing inlining, no float arithmetic, no `unsafe`, no `loop_invariant!`.** Iterator usage (`(1..=k).product()`) appears only inside `#[cfg(test)] mod tests`, which Hax does not extract.
+4. **No identifier collisions with Lean keywords.** `factorial_at`, `build_at`, `special_factorial` all extract to valid Lean identifiers.
+
+### Patterns considered but not applied
+
+- `while_loop_to_recursion.rs` — not applicable, code is already in the recursion form this pattern recommends.
+- `int_pow_to_recursion.rs` — would apply if the body used `.pow()`, but it uses explicit recursion already.
+- `loop_invariant_partial_op.rs` — not applicable, no `loop_invariant!` annotations are used.
+
+### Hax-degenerate patterns flagged for the proof stage
+
+**None.** The extracted Lean has no `sorry` bodies, no `from_machine (0 : u32)` constant-zero measures, no missing identifiers. Both recursive definitions are `partial_fixpoint`-extracted with clean inductive structure (`if (cur >? k) then pure acc else recurse ...`), which the proof stage can discharge with the standard `Nat.strongRecOn` template from `proof_patterns/recursion_example`.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/137_special_factorial/attempted_changes/20260529-215730/", "description": "List attempt di... [+11 chars])
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/137_special_factorial/attempted_changes/20260529-215730/0001_stage1_make_pbt_patched/", "d... [+50 chars])
+The attempt log contains only one entry, and it's a `stage1_make_pbt` attempt, not a `stage2_rust_hax_lean` attempt. Per the workflow rules, only `stage2_rust_hax_lean` attempts qualify for harvesting rewrite patterns.
+
+## Final report
+
+**Patterns written:** none
+
+**Attempts inspected but skipped:**
+- `0001_stage1_make_pbt_patched/` — wrong stage (stage1_make_pbt, not stage2_rust_hax_lean); per workflow rules, only stage2 patches yield rewrite patterns.
+
+**Notes for humans:** This run's rewrite stage produced zero attempts in the log directory. Either the rewrite stage did not run, did not need to patch anything, or terminated before producing any `stage2_rust_hax_lean_*` subdirectories. Nothing actionable for the `rewrite_patterns/` archive from this log.
+
+harvest_rewrite_patterns
+The two files are byte-identical. The rewrite stage made no changes to the source — same `factorial_at`, `build_at`, `special_factorial` functions, same test module, same proptest cases. There are no inlinings, no structural rewrites, no annotation changes to evaluate.
+
+Since the rewritten source is identical to the original, runtime behavior is trivially preserved on every input.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target: it's a Brazilian factorial `n! * (n-1)! * ... * 1!` on u64 with TWO partial_fixpoint helpers where `build_at` invokes `factorial_at` per iteration — multiplicative accumulators, u64 overflow on `*?`/`+?`, ascending counters from 1, base case n=0 → 1.
+
+Let me verify the strongest match by peeking at clever_105's `factorial_at`.
+[tool] Bash({"command": "grep -A 8 \"def factorial_at\\|factorial_at_correct\\|factorial_nat\" /home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean... [+105 chars])
+That's a **byte-for-byte match** for the target's `factorial_at`. Done.
+
+---
+
+**Selected examples:**
+
+```
+proof_patterns/clever_105_f_modified
+proof_patterns/factorial_modified
+proof_patterns/binomial_u64_modified
+proof_patterns/multinomial_u64_modified
+proof_patterns/clever_048_modp_modified
+```
+
+**Per-pick rationale:**
+
+- **clever_105_f_modified** — Defines the *exact same* `factorial_at k cur acc` helper (verified above), with `factorial_nat` Nat oracle, multiplicative-product invariant `acc.toNat = factorial_nat (cur.toNat - 1)`, ascending counter from cur=1, `factorial_nat_lt_2_64` overflow bound for k ≤ 20, plus the `reaches-state-lemma` / `factorial-overflow-propagation-through-vec-loop` machinery the target will need once n large enough to overflow inside `build_at`. Closest possible match.
+
+- **factorial_modified** — Canonical minimal u64 factorial with `integerOverflow` at n ≥ 21. Establishes the baseline shape of partial-`*?` overflow discharge that `factorial_at` (and transitively `build_at`) inherits.
+
+- **binomial_u64_modified** — Two-tier `partial_fixpoint` composition where an outer helper (`binomial_loop`) repeatedly invokes a multiplicative inner helper (`multiply_and_divide`) per step, with a per-iteration multiplicative loop invariant and a global Nat-bound (n ≤ 67) for overflow discharge. The structural analog of `build_at` calling `factorial_at` per k.
+
+- **multinomial_u64_modified** — `multinomial_loop` carries `(p, r)` and invokes the full binomial composition per slice element — *outer loop invokes inner multiplicative helper per iteration*, with bundled success-and-failure existentials and `bind_ne_div` non-divergence reasoning. Same architectural shape as `build_at n k acc` calling `factorial_at k 1 1` and folding into `acc`.
+
+- **clever_048_modp_modified** — Tail-recursive u64 with ascending counter from k=0 to k=n, multiplicative-running invariant carried through strong induction on `n − k`, `*?` overflow discharged from a single fit precondition, four contract clauses (boundary + closed form + native_decide unit pins). The cleanest reference for the ascending-counter-with-multiplicative-invariant pattern both helpers here share.
+
+**Gaps:** No existing example covers the precise "Brazilian factorial = product of factorials" closed form (the `build_at` invariant will need `acc.toNat = ∏_{j<k} factorial_nat j` and the per-step identity `acc * factorial_nat k = ∏_{j<k+1} factorial_nat j`). The library has multiplicative-invariant helpers (clever_105, clever_048, binomial), but none compose factorials-of-factorials. Also, the overflow point for special_factorial (around n=8–9 since 4! * 3! * 2! * 1! ≈ 288 and 5! pushes hard, 9 overflows per the test) differs from clever_105's k=22 boundary, so the `reaches-state-lemma` and `_fails_for_n_ge_N` pattern from clever_105 will need re-derivation at a different threshold.
+
+**Rejections:**
+
+- clever_047_sum_to_n_modified — *additive* Gauss accumulator on i64, not multiplicative on u64.
+- sum_to_n_modified — too simple; just one recursion, no helper composition.
+- clever_038_prime_fib_modified — partial_fixpoint on a different termination story (open conjecture, finite-range native_decide).
+- clever_106_even_odd_palindrome_modified — paired-parity counter scan, not factorial.
+- sum_product_modified — slice-based paired sum+product, wrong input shape.
+- tri_129_modified — accumulator back-reference indexing, structurally different even though it's parity-conditioned.
+- clever_045_fib4_modified — i64 linear recurrence with native_decide bundle, no multiplicative accumulator.
+- gcd_recursive_modified / largest_divisor_modified — descending measures, no multiplicative accumulator.
+- factorize_modified — list output with two-variable combined measure, not scalar factorial accumulation.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Clever_137_special_factorialObligations.lean
+[scaffold] registered Clever_137_special_factorialObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean/extraction/Clever_105_fObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/factorial_modified/proofs/lean/extraction/FactorialObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Binomial_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean/extraction/Clever_105_fObligations.lean", "limit": 200})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_048_modp_modified/proofs/lean/extraction/Clever_048_modpObligations.lean", "limit": 100})
+[tool] Grep({"pattern": "^theorem |^private theorem clever_105_f|^private theorem.*sum_at|^private theorem.*factorial_at|^private theorem.*f_correct|^private theorem.*reach... [+171 chars])
+[tool] Grep({"pattern": "^theorem ", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_048_modp_modified/proofs/lean/extraction/Clever_048_modpObligations.lean", ... [+37 chars])
+[tool] Grep({"pattern": "^theorem ", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Binomial_u64Obligations.lean", "outpu... [+31 chars])
+[tool] Grep({"pattern": "^theorem ", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/multinomial_u64_modified/proofs/lean/extraction/Multinomial_u64Obligations.lean", ... [+37 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean/extraction/Clever_105_fObligations.lean", "offset": 700, "limit": 2... [+3 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean/extraction/Clever_105_fObligations.lean", "offset": 1080, "limit": ... [+4 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/binomial_u64_modified/proofs/lean/extraction/Binomial_u64Obligations.lean", "offset": 1475, "limit": ... [+4 chars])
+Now I have a solid grasp of the shape. Let me make a quick plan and design the obligations.
+[tool] TodoWrite({"todos": [{"content": "Identify contract clauses from Rust proptests + docs", "activeForm": "Identifying contract clauses from Rust proptests + docs", "status"... [+528 chars])
+[tool] Bash({"command": "python3 -c \"\ndef fact(n):\n    p = 1\n    for i in range(1, n+1):\n        p *= i\n    return p\ndef sf(n):\n    p = 1\n    for k in range(1, n+1... [+245 chars])
+Confirmed: sf(0)..sf(8) fit in u64, sf(9) overflows. Now I'll patch the obligations file.
+[tool] TodoWrite({"todos": [{"content": "Identify contract clauses from Rust proptests + docs", "activeForm": "Identifying contract clauses from Rust proptests + docs", "status"... [+530 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_137_special_factorialObligations.lean", "error_message": "Initial population: obligations file is currently empty (just ... [+3751 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_137_special_factorialObligations.lean"})
+Only `sorry` warnings — all three theorem statements are well-typed. Let me confirm with the ground-truth `lake build`.
+[tool] TodoWrite({"todos": [{"content": "Identify contract clauses from Rust proptests + docs", "activeForm": "Identifying contract clauses from Rust proptests + docs", "status"... [+534 chars])
+[tool] run_lake_build({})
+[tool] TodoWrite({"todos": [{"content": "Identify contract clauses from Rust proptests + docs", "activeForm": "Identifying contract clauses from Rust proptests + docs", "status"... [+532 chars])
+Build clean. Three `sorry` warnings only — exactly the placeholder proofs.
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Clever_137_special_factorialObligations.lean`
+
+**Helpers added (private defs, used in the statements):**
+- `factorial_nat : Nat → Nat` — standard factorial oracle (no Mathlib in build).
+- `special_factorial_nat : Nat → Nat` — running product `1! * 2! * … * n!` with `sf_nat 0 = 1`; mirrors the Rust test oracle `special_factorial_ref`.
+
+**Theorems added (one line each, contract clause they capture):**
+- `special_factorial_zero` — defining convention `special_factorial(0) = ok 1` (captures proptest `base_case_zero`). Equational form because no precondition.
+- `special_factorial_matches_product (n) (hn : n.toNat ≤ 8)` — main postcondition `special_factorial(n) = ok (sf_nat n)` on the overflow-free range (captures proptest `matches_product_of_factorials`). Equational form; precondition `n ≤ 8` matches both the proptest bound and the model's overflow boundary exactly (verified: sf(8) ≈ 5.06·10¹⁵ < 2⁶⁴, sf(9) ≈ 1.83·10²¹ > 2⁶⁴).
+- `special_factorial_overflow (n) (h : 9 ≤ n.toNat)` — failure boundary `special_factorial(n) = fail .integerOverflow`. Not asserted by a proptest, but the docstring announces it and the reference set (`factorial_overflow`, `f_fails_above_21`) states the analogous theorem; it pins the contract boundary opposite the postcondition.
+
+**Property tests classified as derived facts:** none. The non-property `known` unit test is fully subsumed by `special_factorial_matches_product` (which covers `n ∈ {0,…,8}` ⊃ `{0,…,4}`); not skipped on grounds of derivation, just on grounds of redundancy.
+
+**Uncertainties:** none. The precondition `n.toNat ≤ 8` on the postcondition is the strongest honest one — it coincides with the model's overflow boundary, so there's no tension between proptest scope and Lean truth domain. The overflow theorem's hypothesis `9 ≤ n.toNat` is the matching boundary.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 3 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean/extraction/Clever_105_fObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/factorial_modified/proofs/lean/extraction/FactorialObligations.lean"})
+[tool] Bash({"command": "wc -l /home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean/extraction/Clever_105_fObligations.lean", "description": "Get l... [+35 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean/extraction/Clever_105_fObligations.lean", "offset": 1, "limit": 300... [+1 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean/extraction/Clever_105_fObligations.lean", "offset": 300, "limit": 4... [+3 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_105_f_modified/proofs/lean/extraction/Clever_105_fObligations.lean", "offset": 700, "limit": 4... [+3 chars])
+Now I have a strong reference. Let me check a couple of prelude utilities and the extracted file structure, then begin writing.
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/proof_patterns/clever_137_special_factorial_modified 2>/dev/null || echo \"no existing pattern\"; pwd", "descriptio... [+48 chars])
+[tool] Bash({"command": "find /home/tobias/uni/pipeline_v6/proof_patterns -maxdepth 1 -type d | head -20", "description": "List proof patterns"})
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/137_special_factorial_modified", "description": "Working dir layout"})
+[tool] TodoWrite({"todos": [{"content": "Write helpers (mul_pure, add_pure, succ_toNat, mul_toNat, etc.)", "status": "in_progress", "activeForm": "Writing helpers"}, {"content":... [+1071 chars])
+Now I'll write the proof. I'll base it heavily on clever_105_f, adapting for our function structure.
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_137_special_factorialObligations.lean", "overwrite": true, "error_message": "Starting from the obligations skeleton with... [+27570 chars])
+Now let me check diagnostics:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_137_special_factorialObligations.lean"})
+I have several errors to fix. Let me examine the diagnostics more carefully and fix them:
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/137_special_factorial_modified/proofs/lean/extraction/Clever_137_special_factori... [+48 chars])
+Let me restructure `sf_nat_mono` with a cleaner positivity helper, and fix the other errors:
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/137_special_factorial_modified/proofs/lean/extraction/Clever_137_special_factori... [+48 chars])
+Let me rewrite the file fixing all errors. The major changes:
+1. Replace `sf_nat_mono` with direct `decide`-based bounds (since finite range)
+2. Add `UInt64.size = 2^64` helper for omega bridges  
+3. Fix `h_acc_succ_eq` mul_fits typing
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_137_special_factorialObligations.lean", "overwrite": true, "error_message": "Replacing the monotonicity-based bounds wit... [+25737 chars])
+[tool] TodoWrite({"todos": [{"content": "Write helpers (mul_pure, add_pure, succ_toNat, mul_toNat, etc.)", "status": "completed", "activeForm": "Writing helpers"}, {"content": "... [+1111 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_137_special_factorialObligations.lean"})
+Down to one error. Let me check line 501:
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/137_special_factorial_modified/proofs/lean/extraction/Clever_137_special_factori... [+48 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_137_special_factorialObligations.lean", "error_message": "Line 501 error: 'No goals to be solved' after congr 1; the res... [+266 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_137_special_factorialObligations.lean", "error_message": "Line 501 error: 'No goals to be solved' after congr 1; the res... [+262 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_137_special_factorialObligations.lean"})
+LSP shows zero errors. Let me confirm with `lake build`:
+[tool] run_lake_build({})
+Build successful, no `sorry` warnings.
+[tool] TodoWrite({"todos": [{"content": "Write helpers (mul_pure, add_pure, succ_toNat, mul_toNat, etc.)", "status": "completed", "activeForm": "Writing helpers"}, {"content": "... [+1113 chars])
+## Final output
+
+**File edited:** `proofs/lean/extraction/Clever_137_special_factorialObligations.lean`
+
+All three obligations closed; `lake build` succeeds with no errors and no `sorry` warnings.
+
+**Proof shape (ported from `clever_105_f`'s `factorial_at` pattern):**
+
+1. **Numeric helpers** — `RustM_ok_bind`, `mul_pure`/`add_pure`, `mul_fail`, `succ_toNat`, `mul_toNat`, `usize_eq_2_64`. Direct port.
+2. **Nat-level bounds** — `factorial_nat_lt_2_64 : ∀ k ≤ 20, factorial_nat k < 2^64` and `sf_nat_lt_2_64 : ∀ n ≤ 8, special_factorial_nat n < 2^64`, both by `decide` (finite range).
+3. **Inner loop `factorial_at`** — branch lemmas `factorial_at_base` / `factorial_at_recurse`, then strong induction `factorial_at_correct` on measure `K + 1 - cur.toNat` carrying invariant `acc.toNat = factorial_nat (cur.toNat - 1)`; wrapper `factorial_at_one_one : ∀ k ≤ 20, factorial_at k 1 1 = ok k!`.
+4. **Outer loop `build_at`** — branch lemmas `build_at_base` / `build_at_recurse` (which absorbs the inner `factorial_at` call via `factorial_at_one_one`), then strong induction `build_at_correct` on the same measure carrying invariant `acc.toNat = sf_nat (k.toNat - 1)`.
+5. **Obligation 1** `special_factorial_zero` — unfold + `rfl`.
+6. **Obligation 2** `special_factorial_matches_product` — case-split on `n.toNat = 0`; non-zero case delegates to `build_at_correct`.
+7. **Failure infrastructure** — `build_at_reaches` (Nat-induction reaches state `(k=K+1, acc=ofNat(sf_nat K))` for `K ≤ 8`), `build_at_9_fails` (at `k=9`, the outer `acc *? factorial_at 9 1 1 = sf_nat 8 *? 9! = sf_nat 9 ≈ 1.83·10²¹ > 2^64` overflows), `build_at_one_one_fails`.
+8. **Obligation 3** `special_factorial_overflow` — reduce `special_factorial n` to `build_at n 1 1` via the `n ≠ 0` branch, then close with `build_at_one_one_fails`.
+
+**Difficulties resolved during the iteration:**
+
+- `sf_nat_mono` with an inner induction inside `have : 0 < factorial_nat b` had its inner `ih` shadowed-but-not-rebound, picking up the outer `sf_nat_mono`'s recursive call (type mismatch). Replaced the whole monotonicity infrastructure with `decide`-based bounds (range was already small enough).
+- `omega` could not bridge `UInt64.size` ↔ `2^64`. Added `private theorem usize_eq_2_64 : UInt64.size = 2^64 := by decide` and `have h_size := usize_eq_2_64` in scope where omega needed it.
+- `h_acc_succ_eq` typing mismatch: `UInt64.toNat_mul_of_lt h_mul_fits` expected `(UInt64.ofNat ...).toNat` for the second factor but `h_mul_fits` had a raw `factorial_nat ...`. Fixed by first rewriting `(UInt64.ofNat (K+1)).toNat = K + 1` in the goal post-`build_at_recurse`, then producing a freshly-typed `h_mul_fits_u` over `(UInt64.ofNat (factorial_nat (K+1))).toNat`.
+- `congr 1` over-reduced in `h_factorial` (closed the goal completely, leaving the residual `rw [h_k_toNat]` with no goals). Collapsed the two-step `rw [this]; congr 1; rw [h_k_toNat]` into a single `rw [hfa, h_k_toNat]`.
+
+**Obligations left as `sorry`:** none.
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+Looking at the working crate's structure and proof obstacles:
+
+**Algorithm shape**: Special factorial `1! * 2! * ... * n!` computed by two tail-recursive helpers — `factorial_at(k, cur, acc)` (inner k! via ascending counter) called from `build_at(n, k, acc)` (outer product accumulator) per iteration; scalar u64 output (not Vec); overflow at n=9.
+
+**Proof obstacles**:
+- factorial_at correctness via ascending-counter strong induction with `acc = factorial_nat (cur-1)` invariant
+- build_at correctness via ascending-counter strong induction with `acc = special_factorial_nat (k-1)` invariant
+- Deterministic overflow at n=9: `build_at_reaches` (constructive forward state characterization) → `build_at_9_fails` (explicit `mul_fail` discharge at boundary state) → `build_at_one_one_fails` → top-level fail theorem
+- Standard u64 partial-operator toolkit: `mul_pure`/`mul_fail`/`add_pure`/`succ_toNat`/`mul_toNat`
+
+**Comparison with clever_105_f_modified** (HumanEval/106 `f(n)`):
+- 105 has the SAME `factorial_at` helper with the same `acc = factorial_nat (cur-1)` invariant and identical ascending-counter strong induction
+- 105 has `factorial_at_reaches` — the canonical **reaches-state-lemma** pattern, structurally identical to 137's `build_at_reaches`
+- 105 has `factorial_at_21_fails` using `mul_fail` at a fixed overshoot state — structurally identical to 137's `build_at_9_fails`
+- 105 has `factorial-overflow-propagation-through-vec-loop` (more demanding than the scalar version here)
+- 105's mul_pure/mul_fail/add_pure toolkit is the EXACT same partial-operator library
+- The file's own comments acknowledge "ported from `clever_105_f`"
+
+**Differences are subtractive, not additive**:
+- Scalar accumulator instead of Vec output (simpler — no `elementwise-output-invariant` machinery)
+- Homogeneous body instead of parity dispatch (simpler — no `parity-conditioned-helper-dispatch`)
+- Nested call instead of dispatch (composition shape already in 105 via outer build_at calling factorial_at on even arms)
+
+Every distinctive tag (factorial-product-accumulator, reaches-state-lemma, deterministic-overflow-at-index-bound, ascending-counter-induction-measure, multiplicative-loop-invariant, two-helper-mirror-structure, step-fail-branch-lemma) already lives in clever_105_f_modified with a richer instantiation. The proof here is essentially a scalar specialization of 105's machinery.
+
+SKIPPED — covered by `clever_105_f_modified`.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260529-215730_137_special_factorial_stage_notes.json
+[cleanup] freed 523.4MB from benchmarks/claude-opus-4-7/clever_3/137_special_factorial_modified

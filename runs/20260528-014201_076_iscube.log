@@ -1,0 +1,411 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260528-014201_076_iscube.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/076_iscube/attempted_changes/20260528-014201
+Stages: all 8 (1-8), in order
+[setup] Crate not yet set up — running setup_crate.bash on /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/076_iscube
+[setup] Done.
+
+Looking at the existing `src/lib.rs`, the tests module already contains:
+1. `small_cases` — concrete known cubes/non-cubes
+2. `matches_brute_force` — oracle-based postcondition
+3. `soundness` — if `iscube(n)` then a witness `k` with `k³ = |n|` exists
+
+Let me examine what contract clauses are captured and what's missing.
+[tool] Read({"file_path": "src/lib.rs"})
+I see one meaningful gap: **completeness**. With random `n` drawn from `[-2³⁰, 2³⁰]` (~2·10⁹ values), only about 2048 are cubes — probability ~10⁻⁶ of hitting one. So `matches_brute_force` effectively tests only the "is *not* a cube" direction in practice. A buggy implementation that always returns `false` on positives would pass `soundness` and almost all draws of `matches_brute_force`.
+
+Let me add an explicit completeness test that draws `k` and asserts `iscube(k³)`:
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "error_message": "Contract gap: completeness direction (\u2203k. k\u00b3 = n \u21d2 iscube(n)) is not exercised by the existing property ... [+1889 chars])
+[tool] run_cargo_test({})
+All four tests pass.
+
+## Summary
+
+### Contract clauses captured
+
+| Test | Clause |
+|------|--------|
+| `small_cases` | Concrete sanity points on both sides (cubes ↦ `true`, near-misses ↦ `false`, negative cubes handled). |
+| `matches_brute_force` | **Full postcondition** via an `i128` oracle — `iscube(n) ⇔ n` is a perfect cube. In practice (uniform draws over ~2·10⁹ values), this primarily exercises the "*not* a cube ⇒ `false`" direction. |
+| `soundness` | **Soundness direction**: `iscube(n) ⇒ ∃k. k³ = \|n\|`. Independent of the oracle. |
+| `completeness` *(added)* | **Completeness direction**: `∃k. k³ = n ⇒ iscube(n)`. Draws `k ∈ [-1024, 1024]` and asserts `iscube(k³)`. Catches a "always-returns-false" implementation that would slip past the oracle test on random non-cube draws. |
+
+The cube range `|k| ≤ 1024` keeps `k³` inside the `[-2³⁰, 2³⁰]` window used by the other property tests, well clear of `i64::MIN` (which the implementation explicitly notes could overflow under `-n`).
+
+### Properties considered but excluded
+
+- **Sign symmetry** (`iscube(n) == iscube(-n)`): a derived fact about perfect cubes — already implied by the oracle test, doesn't independently constrain the implementation beyond what `matches_brute_force` does.
+- **`iscube(k³)` for the algebraic identity `iscube((-k)³) == iscube(k³)`**: subsumed by `completeness` (which already draws negative `k`).
+- **`iscube(0)`, `iscube(1)` as separate properties**: covered by `small_cases`; no need to elevate to property tests.
+- **Stronger uniqueness claim** (the witness `k` is unique): a property of integer cubes, not of `iscube` — would add proof burden downstream without distinguishing implementations.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Bash({"command": "pwd && ls", "description": "Show working directory and contents"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/src/lib.rs"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+All three stages pass. Let me verify the extracted Lean isn't degenerate (Hax-degenerate patterns check).
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/clever_076_iscube.lean"})
+The crate is already Hax-compatible — no changes needed. All three pipeline stages pass cleanly, and the extracted Lean is non-degenerate.
+
+## Verification results
+
+- **`cargo test`**: ✓ 4 tests pass (`small_cases`, `completeness`, `soundness`, `matches_brute_force`)
+- **`cargo hax into lean`**: ✓ extracted to `proofs/lean/extraction/clever_076_iscube.lean`
+- **`lake build`**: ✓ 93 jobs completed, no errors, no warnings
+
+## Hax-degenerate pattern audit
+
+The extracted Lean (39 lines) was inspected directly. None of the known failure modes are present:
+
+| Check | Status |
+|---|---|
+| `sorry` in extracted body | None |
+| `(pure sorry)` degenerate body | None |
+| `from_machine (0 : u32)` constant termination | N/A (no `while`, no `loop_decreases!`) |
+| `pureP`/`grind` synthesis failure | N/A (no `loop_invariant!`) |
+| Short-circuit `&&`/`||` over partial op | None — only `==`/`>`/`<` comparisons and `-?`/`+?`/`*?` whose Hoare obligations are guarded by the existing `if`/`else` |
+| Lean keyword collisions | None (`cube_walks_to`, `iscube` are safe) |
+| Unmodeled identifiers in extracted Lean | None |
+
+## Why the source is already good
+
+The author wrote `iscube` in the canonical tail-recursive shape recommended by `proof_patterns/recursion_example` and `while_loop_to_recursion.rs`:
+
+- `cube_walks_to` is a tail-recursive worker with a single decreasing measure (`n - k*k*k` shrinks each step, terminating when `cube >= n`) — Hax extracts it as `partial_fixpoint`, which admits clean `Nat.strongRecOn` proofs.
+- `iscube` is a thin dispatcher that handles the sign of `n` via `if/else` (no short-circuit `&&`/`||`).
+- No `loop_invariant!`, no `requires`, no `loop_decreases!` — no auto-spec is generated, so there's nothing for `bv_decide` to fail on.
+- No string handling, no `f64`, no iterator chains, no `Vec::push`, no `.abs()`/`.pow()`/`.trailing_zeros()` method calls, no unsafe casts.
+
+The `-n` on line 19 is the only partial op (negation can overflow at `i64::MIN`), but it sits in an `if/else` arm gated by `n < 0`, not a short-circuit `&&` RHS, so Hax preserves the guard.
+
+## Library calls inlined
+None.
+
+## Patterns considered but not changed
+None applicable — the source already follows recommended shapes.
+
+## Suspected semantic changes
+None — no edits were made.
+
+## Hax-degenerate patterns
+None present in the extracted Lean.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/076_iscube/attempted_changes/20260528-014201/", "description": "List attempt log directory... [+11 chars])
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/076_iscube/attempted_changes/20260528-014201/0001_stage1_make_pbt_patched/", "description"... [+38 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/076_iscube/attempted_changes/20260528-014201/0001_stage1_make_pbt_patched/metadata.json"})
+This run's attempt log contains only a single attempt, and it's from `stage1_make_pbt` — not `stage2_rust_hax_lean`. The skill specifies that only `stage2_rust_hax_lean` attempts are relevant for harvesting Hax/lake build incompatibility patterns.
+
+## Final report
+
+**Patterns written:** None.
+
+**Attempts inspected but skipped:**
+- `0001_stage1_make_pbt_patched/` — skipped: stage is `make_pbt`, not `stage2_rust_hax_lean`. The trigger was a property-test coverage gap (completeness direction not exercised), not a Hax/lake build incompatibility. Out of scope for `rewrite_patterns/`.
+
+**Anything confusing or worth a human's attention:** Nothing. The log simply contains no rewrite-stage attempts for this run — the rewrite stage either didn't fire or completed with no patches needed.
+
+harvest_rewrite_patterns
+The two source files are byte-identical. There are no changes between the original and the Hax-rewritten version — no inlinings, no structural rewrites, no annotations added or removed. Behavior is trivially preserved.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target — `cube_walks_to(n, k)` is an ascending recursive walk that computes `k*k*k`, terminates on equality, returns `false` on overshoot, recurses on `k+1`. Wrapper handles negative input via `-n`. Key obstacles:
+
+1. `partial_fixpoint` recursion with three-way branch (terminate / overshoot / step)
+2. Signed i64 mul-overflow at `k*?k` and `(k*k)*?k` (genuine failure mode)
+3. i64 add-overflow at `k+?1`
+4. i64 unary-neg overflow at `-?n` (wrapper's negative branch)
+5. Existential recognition postcondition (`∃k, k³ = n`)
+6. Concrete unit pins from `small_cases` test
+
+Let me confirm the closest match by reading is_simple_power's surface.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_simple_power_modified/src/lib.rs"})
+The structural template match with `is_simple_power_modified` is essentially direct (same three-way branch terminate/overshoot/step, same `small_cases` test layout, same ∃-witness postcondition). The key axis where it differs is u64 → i64, which pulls in signed-mul-overflow and unary-neg machinery.
+
+## Selected
+
+```
+proof_patterns/is_simple_power_modified
+proof_patterns/clever_044_triangle_area_modified
+proof_patterns/clever_047_sum_to_n_modified
+proof_patterns/clever_004_mean_absolute_deviation_modified
+proof_patterns/clever_045_fib4_modified
+```
+
+### Per-pick rationale
+
+- **`is_simple_power_modified`** — Direct template. Same `walks_to`-style ascending recursion with three-way branch (terminate on `==`, overshoot on `>`, recurse otherwise), same `power-walk-multiplicative-iteration` + `exponent-witness-from-trace` + `dual-induction-measures` (descending-difference for soundness, ascending-toward-target for completeness), same `case-split-input-edge-values` for the wrapper, same `native-decide-unit-pin` for `small_cases`. The closest existing entry by far.
+
+- **`clever_044_triangle_area_modified`** — Minimal canonical `signed-mul-overflow` + `paired-success-panic-theorems` on i64. Directly applicable to discharging `k *? k` and `(k*k) *? k` overflow flags via `BitVec.smulOverflow` / `Int64.mulOverflow_iff` — the unsigned `UInt64.mulOverflow_iff` from `is_simple_power_modified` doesn't transfer.
+
+- **`clever_047_sum_to_n_modified`** — `i64` tail-recursive ascending counter with `ascending-counter-induction-measure`, `success-or-fail-disjunctive-postcondition`, `if-branch-on-overflow`, `paired-success-panic-theorems`, `boundary-case-projection`. The i64 analog of `is_simple_power_modified`'s u64 walk; same shape for how step-fail vs step-ok branches are bundled into one master theorem.
+
+- **`clever_004_mean_absolute_deviation_modified`** — Carries the `unary-neg-overflow-discharge` + `int64-not-minValue-discharge` idiom (`Int64.toInt_neg_of_ne_intMin` to lift `(-d).toInt = -d.toInt` once `d ≠ Int64.minValue` is established by contradiction). Needed for the wrapper's `-? n` partial in the `n < 0` branch — no other entry carries this discharge.
+
+- **`clever_045_fib4_modified`** — Cleanest source for `partial-fixpoint` + `native-decide-unit-pin` + `int64-ofInt-lifting` on signed i64. Useful for the 13 hardcoded `small_cases` assertions (`iscube(0)`, `iscube(1)`, `iscube(8)`, …, `iscube(-27)`, …, `!iscube(2)`, …); these close cleanly by `native_decide` rather than equational unfolding.
+
+### Gaps
+
+- **No exact precedent for `iscube`'s additive-counter + multiplicative-cube structure.** `is_simple_power_modified` advances `cur := cur * n` multiplicatively; here `k := k + 1` advances additively while `cube := k*k*k` is recomputed each step. The descending measure `(some bound) - k.toNat` is what's needed, not `x.toNat - cur.toNat`. The completeness direction (`k³ = n ⟹ ok true`) will need an ascending-toward-witness-k measure that none of the picks demonstrate directly for an additively-incrementing counter with a non-linear function of it.
+- **Negation-as-postcondition-bridge for cube-of-(-k) ↔ cube-of-k.** The wrapper's symmetry `n < 0 ⟹ |n| is cube ⟺ n is cube` needs an Int-level identity `(-k)^3 = -(k^3)` — no existing entry includes this specific algebraic bridge.
+
+### Rejections
+
+- **`clever_038_prime_fib_modified`** — `partial-fixpoint` + native_decide unit pins look similar, but its `open-conjecture-termination` and `finite-range-spec` (proofs only on small `n.toNat ≤ 6`) don't match: `iscube` has a totally-defined contract over all (bounded) i64.
+- **`factorize_modified` / `largest_prime_factor_modified`** — Trial-division descending recursions, opposite direction.
+- **`sqrt_u64_modified` / `cbrt_u64_modified` / `nth_root_u64_modified`** — Compute `⌊x^(1/n)⌋` via Newton/Babylonian descending iteration, not recognize-cubes-by-ascending-walk. Different mathematical core.
+- **`is_prime_modified`** — Ascending trial-division but with `bit-width-bounded-completeness` (gated on `n < 2^32`) and a different `factor-pair min(k,q)` witness construction; `iscube` doesn't admit a factor-pair argument.
+- **`clever_047_sum_to_n_modified`** could have been rejected as it's about quadratic Gauss closed form — kept it because the i64-overflow + ascending-counter + success-or-fail bundling pattern is reusable even when the closed form differs.
+- **`sum_to_n_modified` / `factorial_modified` / `square_modified`** — Minimal overflow-failure examples; superseded by the more developed `clever_047` and `clever_044`.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Clever_076_iscubeObligations.lean
+[scaffold] registered Clever_076_iscubeObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_simple_power_modified/proofs/lean/extraction/Clever_075_is_simple_powerObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/Clever_044_triangle_areaObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_004_mean_absolute_deviation_modified/proofs/lean/extraction/Clever_004_mean_absolute_deviation... [+18 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_045_fib4_modified/proofs/lean/extraction/Clever_045_fib4Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_047_sum_to_n_modified/proofs/lean/extraction/Clever_047_sum_to_nObligations.lean"})
+Now I have a clear picture. Let me check the current state of the obligations file and the extracted module:
+[tool] Bash({"command": "ls -la proofs/lean/extraction/ 2>/dev/null && echo \"---\" && pwd", "description": "List extraction directory and show cwd"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean"})
+Good, the file is clean. Now let me write the obligations file with all the theorem statements. I'll start by writing it and then iterate based on LSP feedback.
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "content": "-- Companion obligations file for the `clever_076_iscube` extraction.\n-- Each ... [+6532 chars])
+[tool] TodoWrite({"todos": [{"content": "Verify file type-checks via LSP diagnostics", "status": "in_progress", "activeForm": "Verifying file type-checks via LSP diagnostics"}, ... [+404 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean"})
+All errors are just expected `sorry` warnings. Let me confirm with a lake build to be sure:
+[tool] TodoWrite({"todos": [{"content": "Verify file type-checks via LSP diagnostics", "status": "completed", "activeForm": "Verifying file type-checks via LSP diagnostics"}, {"... [+408 chars])
+[tool] run_lake_build({})
+[tool] TodoWrite({"todos": [{"content": "Verify file type-checks via LSP diagnostics", "status": "completed", "activeForm": "Verifying file type-checks via LSP diagnostics"}, {"... [+410 chars])
+Build succeeds with only the expected `sorry` warnings on the three universal theorems. All theorem statements are well-typed.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Clever_076_iscubeObligations.lean`
+
+### Theorems added (16 total)
+
+**Unit pins from `small_cases` (13 theorems, all closed by `native_decide`):**
+- `iscube_0_true` — `iscube(0) = true` (0³ = 0)
+- `iscube_1_true` — `iscube(1) = true` (1³ = 1)
+- `iscube_8_true` — `iscube(8) = true` (2³ = 8)
+- `iscube_27_true` — `iscube(27) = true` (3³ = 27)
+- `iscube_64_true` — `iscube(64) = true` (4³ = 64)
+- `iscube_125_true` — `iscube(125) = true` (5³ = 125)
+- `iscube_neg_1_true` — `iscube(-1) = true` ((-1)³ = -1)
+- `iscube_neg_8_true` — `iscube(-8) = true` ((-2)³ = -8)
+- `iscube_neg_27_true` — `iscube(-27) = true` ((-3)³ = -27)
+- `iscube_2_false`, `iscube_9_false`, `iscube_26_false`, `iscube_28_false` — non-cubes return false
+
+**Universal contract clauses (3 theorems, `sorry`-placeholdered):**
+- `iscube_sound` — soundness proptest: `iscube n = ok true → ∃ k : Int, k³ = n.toInt`. No precondition; the witness exists because the inner walk's trace exposes it.
+- `iscube_actual_cubes_recognized` — completeness proptest: `|k| ≤ 1024 → iscube(Int64.ofInt (k³)) = ok true`. The bound matches the proptest and keeps every intermediate cube ≪ 2⁶³.
+- `iscube_non_cubes_rejected` — negative direction of `matches_brute_force`: `n.toInt ∈ [-2³⁰, 2³⁰] ∧ no integer cube root → iscube n = ok false`. The bound matches the proptest's `matches_brute_force` range, keeps the walk inside i64, and excludes `i64::MIN` so the wrapper's `-? n` cannot panic.
+
+### Property tests classified
+
+No property tests were skipped as "derived mathematical facts". All four proptests (`small_cases`, `matches_brute_force`, `soundness`, `completeness`) are captured: `matches_brute_force` decomposes into the conjunction of `iscube_sound` + `iscube_actual_cubes_recognized` + `iscube_non_cubes_rejected`.
+
+### Uncertainties
+
+- The bound `|n.toInt| ≤ 2³⁰` in `iscube_non_cubes_rejected` mirrors the proptest's range exactly. The *true* safe range extends much further (essentially `n.toInt < (2²¹ - 1)³ ≈ 2⁶³`), but the proptest bound is sufficient for the contract, simpler to reason about, and aligns with the reference patterns. The proof stage may need to widen this if a stronger guarantee is required downstream.
+- The soundness statement `∃ k : Int, k * k * k = n.toInt` uses `k * k * k` rather than `k^3`. Both are equivalent under the Int monoid; using the explicit triple product keeps the statement closest to the Rust expression and makes the proof's existential witness easier to phrase.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 16 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_simple_power_modified/proofs/lean/extraction/Clever_075_is_simple_powerObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/Clever_044_triangle_areaObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_047_sum_to_n_modified/proofs/lean/extraction/Clever_047_sum_to_nObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_004_mean_absolute_deviation_modified/proofs/lean/extraction/Clever_004_mean_absolute_deviation... [+18 chars])
+Let me look at the Hax prelude for i64 operations and lemmas before writing the proof.
+[tool] Bash({"command": "find /home/tobias/uni/pipeline_v6 -path '*/.lake/packages/Hax/proof-libs/lean/*' -name '*.lean' 2>/dev/null | head -50", "description": "List Hax p... [+19 chars])
+[tool] Bash({"command": "find /home/tobias/uni/pipeline_v6 -path '*Hax*' -name '*.lean' 2>/dev/null | head -50", "description": "Find Hax Lean files"})
+[tool] Bash({"command": "pwd && ls proofs/lean/extraction/", "description": "Verify working crate path"})
+[tool] Grep({"pattern": "Int64.mulOverflow", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/.lake/pack... [+54 chars])
+[tool] Grep({"pattern": "mulOverflow", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/.lake/packages/H... [+48 chars])
+[tool] TodoWrite({"todos": [{"content": "Survey Hax prelude for Int64 helpers (mulOverflow, addOverflow, negOverflow, toInt lemmas)", "status": "in_progress", "activeForm": "Sur... [+1379 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs... [+49 chars])
+[tool] Grep({"pattern": "toInt_neg|negOverflow|Neg.neg|minValue", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/... [+75 chars])
+[tool] Bash({"command": "grep -n \"Int64\\.\" /home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/.lake/packages/Hax... [+121 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs... [+50 chars])
+[tool] Bash({"command": "grep -rn \"Int64.toInt_ofInt\\|Int64.ofInt_toInt\\|ofInt.*Int64\" /home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modif... [+113 chars])
+[tool] mcp__lean__lean_local_search({"query": "Int64.toInt_ofInt", "file_path": "Clever_076_iscubeObligations.lean"})
+[tool] mcp__lean__lean_completions({"file_path": "Clever_076_iscubeObligations.lean", "line": 17, "column": 1})
+[tool] Bash({"command": "grep -rn \"theorem Int64.toInt\\|theorem.*Int64.ofInt_toInt\\|theorem Int64.le_toInt\\|theorem Int64.toInt_lt\\|theorem Int64.lt_iff_toInt\\|theore... [+272 chars])
+[tool] Bash({"command": "grep -rn \"theorem Int64.toInt_lt\\|theorem Int64.le_toInt\\|theorem Int64.lt_iff_toInt\\|theorem Int64.le_iff_toInt\\|Int64.toInt_lt\\|Int64.le_to... [+208 chars])
+[tool] Bash({"command": "grep -rn \"Int64.lt_iff\\|Int64.le_iff\" /home/tobias/uni/pipeline_v6/ 2>/dev/null | head -10", "description": "Find Int64 comparison lemmas in rep... [+3 chars])
+Let me check the current state of the obligations file and start building proofs.
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean"})
+[tool] TodoWrite({"todos": [{"content": "Survey Hax prelude for Int64 helpers", "status": "completed", "activeForm": "Surveying Hax prelude for Int64 helpers"}, {"content": "Wri... [+1287 chars])
+Let me build the proof incrementally. First, I'll add helper lemmas and branch lemmas, then iterate with the LSP.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Add helper lemmas and branch lemmas for cube_walks_to before tackling the... [+944 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Add helper lemmas and branch lemmas for cube_walks_to before tackling the... [+959 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_hover_info({"file_path": "clever_076_iscube.lean", "line": 18, "column": 5})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/clever_076_iscube.lean"})
+[tool] Bash({"command": "find /home/tobias/uni/pipeline_v6/proof_patterns/recursion_example -name \"*.lean\" | head -5", "description": "Find recursion_example proof files"... [+1 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/proofs/lean/extraction/Recursion_exampleObligations.lean"})
+Now I'll add the branch lemmas for cube_walks_to. Let me append them after the small_cases pins.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Insert cube_walks_to branch lemmas before the soundness sorry.", "patch":... [+9568 chars])
+[tool] TodoWrite({"todos": [{"content": "Survey Hax prelude for Int64 helpers", "status": "completed", "activeForm": "Surveying Hax prelude for Int64 helpers"}, {"content": "Wri... [+1289 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+I need to redo the branch lemmas — the binds are flattened, not nested. Let me rewrite the helper to handle both binds separately.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Tactic `rewrite` failed: Did not find an occurrence of the pattern `do le... [+4270 chars])
+Now update the branch lemmas to use these step-by-step:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Rewrite branch lemmas to use i64_mul_pure on each multiplication separate... [+13228 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/Clever_076_iscubeObligations.lean", "... [+26 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "\"No goals to be solved\" at line 195 \u2014 `rw [if_neg h_ne]` already c... [+847 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+Now let me add the three workhorse aux lemmas. First, soundness aux:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Add the soundness auxiliary lemma for cube_walks_to.", "patch": "\n<<< SE... [+6856 chars])
+[tool] TodoWrite({"todos": [{"content": "Survey Hax prelude for Int64 helpers", "status": "completed", "activeForm": "Surveying Hax prelude for Int64 helpers"}, {"content": "Wri... [+1291 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/Clever_076_iscubeObligations.lean", "... [+26 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "`push_neg` is not available (Mathlib not imported). Use `Int.toNat_eq_zer... [+935 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+Mathlib's `linarith` isn't available. Let me add a helper lemma and replace `linarith` with explicit manipulation.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "`linarith` is not available (no Mathlib). Add explicit cube-bound helper ... [+3170 chars])
+Now replace the linarith-using sections with the helpers:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Use cube_ge_self in place of inline linarith.", "patch": "\n<<< SEARCH\n ... [+2436 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_completions({"file_path": "Clever_076_iscubeObligations.lean", "line": 217, "column": 22})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Unknown identifiers `le_trans`, `lt_trans`, `lt_of_le_of_lt`, `le_of_lt`,... [+3405 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] Bash({"command": "grep -rn \"lt_of_le_of_ne\\|Int.lt_trichotomy\\|lt_trichotomy\" /home/tobias/uni/pipeline_v6/proof_patterns/*/proofs/lean/extraction/*.lean | head ... [+75 chars])
+[tool] mcp__lean__lean_completions({"file_path": "Clever_076_iscubeObligations.lean", "line": 236, "column": 28})
+[tool] mcp__lean__lean_multi_attempt({"file_path": "Clever_076_iscubeObligations.lean", "line": "236", "snippets": "[\"exact Int.lt_of_le_and_ne ha (Ne.symm ha0)\", \"have ha_pos : 0 < a := by omeg... [+40 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Replace `Int.lt_of_le_of_ne` (unknown) and `lt_trichotomy` (unknown) with... [+176 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/Clever_076_iscubeObligations.lean", "... [+26 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Replace lt_trichotomy with manual by_cases; replace `Int.lt_of_not_ge` (m... [+3618 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "`by_contra` unknown \u2014 restructure using by_cases on k=0 to avoid the... [+1138 chars])
+The todo list is current. Let me check diagnostics.
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/Clever_076_iscubeObligations.lean", "... [+26 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Replace `ring` and `linarith` with `omega` which handles Int + toNat.", "... [+1417 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] Bash({"command": "grep -rn \"Int64.toInt.inj\\|Int64.toInt_inj\\|Int64.eq_of_toInt_eq\" /home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_m... [+147 chars])
+[tool] Bash({"command": "grep -rn \"Int64.toInt.inj\\|Int64.toInt_inj\" /home/tobias/uni/pipeline_v6/ 2>/dev/null | head -10", "description": "Search whole repo"})
+Now let me add the completeness and rejection auxes. First, helpers for the bounded cube case:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Add bounded-cube no-overflow helper, completeness aux, rejection aux, all... [+8497 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+Excellent! All three aux lemmas compile.
+[tool] TodoWrite({"todos": [{"content": "Survey Hax prelude for Int64 helpers", "status": "completed", "activeForm": "Surveying Hax prelude for Int64 helpers"}, {"content": "Wri... [+1166 chars])
+Now let me close `iscube_sound`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Close iscube_sound by unfolding the wrapper and applying the soundness au... [+3230 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Complete the trivial `0 \u2264 0` and `(... - 0).toNat \u2264 (...).toNat... [+1636 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/Clever_076_iscubeObligations.lean", "... [+26 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "\"No goals to be solved\" at line 684 \u2014 `rw [if_pos rfl]` already fi... [+900 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+iscube_sound closes. Now let me handle `iscube_actual_cubes_recognized` and `iscube_non_cubes_rejected`:
+[tool] TodoWrite({"todos": [{"content": "Survey Hax prelude for Int64 helpers", "status": "completed", "activeForm": "Surveying Hax prelude for Int64 helpers"}, {"content": "Wri... [+1168 chars])
+[tool] Bash({"command": "grep -rn \"Int64.toInt_ofInt\\|Int64.ofInt_toInt\\|ofIntLE_toInt\\|toInt_ofIntLE\\|Int64.toInt.*ofInt\" /home/tobias/uni/pipeline_v6/benchmarks/cla... [+170 chars])
+[tool] Bash({"command": "grep -n \"Int64.toInt_ofInt\\|Int64.ofInt_toInt\\|@.simp..theorem Int64.toInt\" /home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/07... [+212 chars])
+[tool] Bash({"command": "grep -rn \"Int64.toInt_ofInt\\b\\|theorem.*Int64.toInt.*ofInt\\b\\|Int64.ofInt_toInt\\b\" /home/tobias/uni/pipeline_v6/ 2>/dev/null | head -20", "d... [+50 chars])
+[tool] Bash({"command": "grep -rn \"Int64\\.toInt_ofInt\\b\" /home/tobias/uni/pipeline_v6/ 2>/dev/null | head -10", "description": "Find Int64.toInt_ofInt"})
+[tool] Bash({"command": "grep -rn \"Int64.toInt_ofInt_of_le\\|Int64.ofInt_toInt\\b\" /home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/pr... [+148 chars])
+[tool] Bash({"command": "grep -rn \"Int64.toInt_ofInt_of_le\\|Int64\\.toInt_ofInt\" /home/tobias/uni/pipeline_v6/ 2>/dev/null | grep -v \"\\.log:\" | grep -v \"\\.json:\" |... [+111 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_045_fib4_modified/proofs/lean/extraction/Clever_045_fib4Obligations.lean", "offset": 155, "lim... [+8 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_045_fib4_modified/proofs/lean/extraction/Clever_045_fib4Obligations.lean", "offset": 125, "lim... [+8 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_045_fib4_modified/proofs/lean/extraction/Clever_045_fib4Obligations.lean", "offset": 100, "lim... [+8 chars])
+Now let me close `iscube_actual_cubes_recognized` and `iscube_non_cubes_rejected`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Add cube-range bound helpers and close iscube_actual_cubes_recognized + i... [+1120 chars])
+Todo list is current. Continuing with the proofs.
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Close iscube_actual_cubes_recognized by case-splitting on the sign of k a... [+6465 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Replace `by_contra` (unknown tactic) with by_cases + omega.", "patch": "\... [+1792 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+iscube_actual_cubes_recognized closes. Now the final one:
+[tool] TodoWrite({"todos": [{"content": "Survey Hax prelude for Int64 helpers", "status": "completed", "activeForm": "Surveying Hax prelude for Int64 helpers"}, {"content": "Wri... [+1170 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Close iscube_non_cubes_rejected by unfolding iscube and applying cube_wal... [+3360 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_076_iscubeObligations.lean", "severity": "error"})
+All errors gone. Let me confirm with `lake build`:
+[tool] run_lake_build({})
+[tool] TodoWrite({"todos": [{"content": "Survey Hax prelude for Int64 helpers", "status": "completed", "activeForm": "Surveying Hax prelude for Int64 helpers"}, {"content": "Wri... [+1170 chars])
+Let me clean up the warning about the unused `Int.zero_mul`:
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/076_iscube_modified/proofs/lean/extraction/Clever_076_iscubeObligations.lean", "... [+26 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_076_iscubeObligations.lean", "error_message": "Clean up unused `Int.zero_mul` simp arg flagged by linter.", "patch": "\n... [+106 chars])
+[tool] run_lake_build({})
+Clean build, no warnings, no sorries. All three universal theorems closed.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Clever_076_iscubeObligations.lean`
+
+### Theorems closed (3 universal + 13 unit pins already proved)
+
+- **`iscube_sound`** — case-split on the sign of `n`. For `n ≥ 0`, soundness aux gives a non-negative witness directly. For `n < 0`, `-? n` succeeds (the `n.toInt ≥ -2^30 > -2^63` excludes `Int64.minValue`), and the aux on `-n` yields `k0 ≥ 0` with `k0³ = (-n).toInt`; then `-k0` is the integer witness via `(-k0)³ = -(k0³) = n.toInt`.
+- **`iscube_actual_cubes_recognized`** — bound `|k³| ≤ 1024³ = 2^30 < 2^63` to lift the round-trip `(Int64.ofInt (k³)).toInt = k³` via `Int64.toInt_ofInt_of_le`, then case-split on sign of `k`. Use `cube_walks_to_complete` with `target = k` (resp. `-k`) on the appropriate branch.
+- **`iscube_non_cubes_rejected`** — case-split on sign of `n`; for `n < 0` use `-? n` (excluded from `MinValue` by the `n.toInt ≥ -2^30` bound) and transport the "no integer cube root" hypothesis through `(-k)³ = -k³`. Apply `cube_walks_to_reject` with the bound `1025` (since `1025³ > 2^30`).
+
+### Scaffolding lemmas introduced (all closed, all `private`)
+
+- **i64 bridge helpers:** `i64_zero_toInt`, `i64_one_toInt`, `i64_toInt_lt`, `i64_toInt_ge`, `h63_eq`, `RustM_ok_bind`, `i64_mul_pure`, `i64_mul_fail`, `i64_add_pure`, `i64_add_fail`, `i64_neg_pure`.
+- **Integer cube arithmetic** (no `linarith`/`ring`): `cube_ge_self` (x ≤ x³ for x ≥ 1), `cube_nneg`, `int_sq_nneg`, `cube_neg` (negation distributes through cubing), `cube_le_cube`, `cube_lt_cube`.
+- **Branch lemmas for `cube_walks_to`:** `cube_walks_to_terminate`, `cube_walks_to_overshoot`, `cube_walks_to_step`, `cube_walks_to_fail_mul1`, `cube_walks_to_fail_mul2`, `cube_walks_to_step_fail` — each isolates one case of the recursive body, threading the explicit `BitVec.smulOverflow` / `BitVec.saddOverflow` reductions.
+- **Bounded no-overflow:** `cube_no_overflow` (for `k.toInt ∈ [0, 1025]`, all of `k * k`, `(k * k) * k` fit and their `.toInt` round-trip cleanly) and `add_one_no_overflow`.
+- **Three workhorse auxes** (all by strong induction on a `Nat` measure):
+  - `cube_walks_to_sound_aux` — measure `(n.toInt + 1 - k.toInt).toNat`. In the recurse branch, `k ≤ n` follows from `k³ < n` (case-split on `k = 0` to handle the cube vacuously).
+  - `cube_walks_to_complete` — measure `(target - k.toInt).toNat`. At `k = target`, the cube fits (bounded by `1024^3`) and equals `n` by `Int64.toInt_inj`.
+  - `cube_walks_to_reject` — measure `(1025 - k.toInt).toNat`. At `k = 1025`, the cube `1025³ > 2^30 ≥ n` triggers overshoot. A successful equality in the inductive step contradicts `h_not_cube`.
+
+### Difficult sub-goals and resolutions
+
+- **No Mathlib import.** `linarith`, `ring`, `push_neg`, `by_contra` (in some positions), `le_trans`, `lt_trans`, `lt_trichotomy`, `lt_of_le_of_ne` all unavailable. Resolved by: explicit `Int.le_trans` / `Int.lt_trans`, `omega` for linear goals (it does handle `Int.toNat`), `Int.toNat_eq_zero` for the measure-zero bridge, manual case-splits with `by_cases` in place of `by_contra`, and small `cube_*` helpers for non-linear monotonicity.
+- **The Hax-generated body uses flattened `__do_lift` binds, not nested `do`.** Initial attempt to package `(k *? k) >>= fun a => a *? k` as one rewrite failed pattern-matching. Resolved by reducing each `*?` / `+?` operation separately with the `i64_mul_pure` / `i64_add_pure` helpers.
+- **The `Int64.minValue` exclusion for the wrapper's negation.** Both the soundness and rejection proofs need `n ≠ Int64.minValue` on the negative branch; available from `n.toInt ≥ -2^30 > -2^63 = Int64.minValue.toInt`. Used `Int64.toInt_neg_of_ne_intMin` to get `(-n).toInt = -n.toInt`.
+
+### Obligations left as `sorry`: **none.**
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+Looking at this target, the proof structure has these key obstacles:
+
+1. **Cube walk recognition** — `cube_walks_to n k` computes `k*k*k`, three-way tests against n (equal/over/under), recurses with `k+1`
+2. **Sign-stripping wrapper** with negative-input branch via `(-? n)` requiring i64::MIN discharge
+3. **Witness translation through cube negation** — `(-k)^3 = -(k^3)` lets soundness convert a positive walk's witness back to a signed cube root
+4. **Int-level cube algebra ladder** (`cube_neg`, `cube_ge_self`, `cube_le_cube`, `cube_lt_cube`, `int_sq_nneg`, `cube_nneg`) — substituting for unavailable `ring`/`linarith`
+5. **Three measures for three direction-asymmetric theorems**: soundness (descending `n+1−k`), completeness on actual cubes (ascending `target−k`), rejection (fixed `1025−k`)
+
+The closest existing entry is **`is_simple_power_modified`** — it has the multiplicative-walk-with-witness, exponent-witness-from-trace, dual-induction-measures, step-fail-branch-lemma, case-split-input-edge-values, and three-branch (equal/overshoot/under) structure. But it's UNSIGNED (u64), so it lacks the sign-stripping wrapper, the negation-overflow discharge, the Int-level cube algebra, and the witness translation through odd-power negation.
+
+The contribution here is extending the multiplicative-walk-recognition pattern from `is_simple_power_modified` to **signed input with sign-stripping**, which requires Int-level monotonicity ladders and witness translation through `(-k)^n = -(k^n)` (odd-power-negation-preservation). This is genuinely structural and would help any future signed `iscube`-like target (odd-power root recognition on signed types, signed Fibonacci recognition with sign-stripping, etc.).
+[tool] add_proof_pattern({"name": "076_iscube_modified", "features": ["recursion", "strong-induction", "recursive-equation-unfold", "signed-int-toInt-bridge", "signed-overflow", "signed... [+7300 chars])
+The name validation requires it start with a letter. Let me use an appropriate prefix.
+[tool] add_proof_pattern({"name": "iscube_076_modified", "features": ["recursion", "strong-induction", "recursive-equation-unfold", "signed-int-toInt-bridge", "signed-overflow", "signed... [+7300 chars])
+ADDED `iscube_076_modified` with 38 tags.
+
+**Features**: recursion, strong-induction, recursive-equation-unfold, signed-int-toInt-bridge, signed-overflow, signed-mul-overflow, bv-nat-bridge, partial-operator-discharge, if-branch-on-overflow, integer-overflow-failure, existential-postcondition, multi-clause-contract, shared-aux-lemma, step-fail-branch-lemma, native-decide-unit-pin, boundary-case-projection, dual-induction-measures, descending-difference-measure, ascending-counter-induction-measure, fixed-bound-measure, direction-asymmetric-precondition, ok-result-implies-no-overflow, unary-neg-overflow-discharge, int64-not-minValue-discharge, monadic-bind-reduction-chain, case-split-input-edge-values, power-walk-multiplicative-iteration, power-recognition-postcondition, exponent-witness-from-trace, **cube-walk-iteration**, **cube-recognition-postcondition**, **cube-root-witness-from-trace**, **three-way-branch-terminate-overshoot-recurse**, **signed-wrapper-sign-stripping**, **odd-power-negation-identity**, **int-cube-monotonicity-ladder**, **witness-translation-through-negation**, nat-polynomial-identity-manual.
+
+**Summary**: Cube-recognition `iscube(n) := ∃k:Int, k³ = n.toInt` on signed i64 via ascending cube walk wrapped in a sign-stripping dispatcher. Extends `is_simple_power_modified`'s multiplicative-walk-recognition pattern to **signed inputs with sign-stripping**, contributing: (1) the negation-overflow discharge at `Int64.minValue`, (2) an Int-level cube-monotonicity ladder (`cube_neg`/`cube_ge_self`/`cube_le_cube`/`cube_lt_cube`/`int_sq_nneg`/`cube_nneg`) substituting for unavailable `ring`/`linarith`, (3) witness translation through the odd-power-negation identity `(-k)³ = -(k³)` letting a non-negative inner walk's witness flow back through the wrapper, and (4) a `cube_no_overflow` joint bounded-no-overflow helper handling the two multiplications per step.
+
+**Observation worth flagging**: The proof's three measures (descending `n+1−k`, ascending `target−k`, fixed `1025−k`) demonstrate that the same ascending-walk structure supports three direction-asymmetric contracts (universal soundness, bounded completeness, bounded rejection) — a transferable template for any recognition contract where the search direction is fixed but the termination evidence varies by clause.
+
+ADDED iscube_076_modified.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260528-014201_076_iscube_stage_notes.json
+[cleanup] freed 524.5MB from benchmarks/claude-opus-4-7/clever_3/076_iscube_modified

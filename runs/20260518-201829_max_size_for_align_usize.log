@@ -1,0 +1,350 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260518-201829_max_size_for_align_usize.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/alloc/max_size_for_align_usize/attempted_changes/20260518-201829
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Read({"file_path": "src/lib.rs"})
+No property-testing library is present; the existing exhaustive loop over powers of two is the right idiom for this tiny domain. Let me analyze the contract and replace the test module with a focused suite.
+
+**Contract of `max_size_for_align(align)`:**
+- **Precondition:** `align` is a power of two with `align ≤ isize::MAX as usize + 1` (the numeric requirement that keeps the subtraction from underflowing).
+- **Postcondition:** returns `(isize::MAX as usize + 1) - align`.
+- **Failure condition:** if `align > isize::MAX as usize + 1`, the subtraction underflows → panic (debug).
+
+The two existing tests both pin the *same* clause (postcondition = formula): `powers_of_two` already covers `align=1` (shift 0), `align=2` (shift 1), and the max-alignment boundary `1<<63 == isize::MAX+1 → 0` (shift 63), so `matches_formula` is fully subsumed. The missing clause is the **failure condition**.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "error_message": "Suite restatement: two existing tests both pin only the postcondition (formula); the failure/precondition-boundary clau... [+2256 chars])
+[tool] run_cargo_test({})
+Both tests pass.
+
+## Summary
+
+The suite is 2 tests, covering every independent clause of `max_size_for_align`'s contract:
+
+| Test | Contract clause |
+|---|---|
+| `postcondition_formula_over_valid_alignments` | **Precondition + postcondition.** Over the entire valid input domain (all 64 powers of two, `1<<0`..`1<<63`), the result equals `(isize::MAX as usize + 1) - align`. The `shift == 63` iteration (`align == isize::MAX + 1`) also pins the contractual boundary case "maximum alignment ⇒ result is 0 (no positive size fits)". |
+| `panics_when_align_exceeds_max` | **Failure condition / precondition boundary.** `MAX_ALIGN + 1` is the first value outside the valid domain; the internal subtraction underflows, so the function must panic. This pins that the contract only holds for `align ≤ isize::MAX + 1`. |
+
+**Changes from the original tests:** `matches_formula` was removed because it is fully subsumed by the power-of-two sweep — that loop already exercises `align=1` (shift 0), `align=2` (shift 1), and the `isize::MAX+1 → 0` boundary (shift 63). A buggy implementation returning a different value, or one that didn't fail past the boundary, would now be caught.
+
+**Properties considered but deliberately excluded (derived facts, not independent contract claims):**
+
+- **`max_size_for_align(align) + align == isize::MAX + 1`** — just an algebraic rearrangement of the postcondition formula; adds no new information.
+- **Monotonicity** (larger `align` ⇒ smaller result) — a derived consequence of subtraction, not a separate semantic claim; testing it would add a redundant proof obligation downstream.
+- **Specific concrete values** (`align=1 → isize::MAX`, etc.) — already covered as individual points of the exhaustive postcondition sweep.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] Glob({"pattern": "**/Cargo.toml"})
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] Read({"file_path": "proofs/lean/extraction/max_size_for_align_usize.lean"})
+[tool] run_lake_build({})
+The failure exactly matches the archive pattern `primitive_int_assoc_const.rs`:
+
+```
+error: ...Unknown identifier `core_models.num.Impl_5.MAX`
+```
+
+`isize::MAX` (a primitive-integer associated constant) extracts to the undefined `core_models.num.Impl_5.MAX`. The fix is to inline the literal value. On the 64-bit target the crate/tests assume, `isize::MAX = 2^63 - 1 = 9_223_372_036_854_775_807`. I'll replace only the function-body reference (the `#[cfg(test)]` module is not extracted by Hax and must not be modified), keeping the `+ 1` structure so semantics are unchanged.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n    // The maximum possible alignment is `isize::MAX + 1`, so the subtraction\n    // cannot overflow.\n    (isize:... [+817 chars])
+Now re-test, then re-extract and rebuild:
+[tool] run_cargo_test({})
+Tests still pass (contract preserved). Now extraction:
+[tool] run_cargo_hax_into_lean({})
+[tool] Read({"file_path": "proofs/lean/extraction/max_size_for_align_usize.lean"})
+[tool] run_lake_build({})
+All three pipeline stages pass. Let me verify there are no Hax-degenerate patterns in the extracted Lean:
+[tool] Grep({"pattern": "from_machine \\(0 : u32\\)|partial_fixpoint|while_loop|hax_spec", "path": "proofs/lean/extraction/max_size_for_align_usize.lean", "output_mode": "c... [+8 chars])
+All three pipeline stages pass and the extracted Lean is degeneracy-free.
+
+## Summary
+
+### The Hax / `lake build` error that drove the change
+
+`run_cargo_hax_into_lean` succeeded on the original source, but `run_lake_build` failed:
+
+```
+error: max_size_for_align_usize.lean:22:8: Unknown identifier `core_models.num.Impl_5.MAX`
+warning: max_size_for_align_usize.lean:19:2: declaration uses `sorry`
+```
+
+The expression `isize::MAX as usize` extracted to `core_models.num.Impl_5.MAX`, an associated constant on a primitive integer type that the Hax Lean prelude does not define. This is exactly the archive pattern **`primitive_int_assoc_const.rs`**.
+
+### Library call inlined and its replacement
+
+| Original | Replacement |
+|---|---|
+| `isize::MAX as usize` (in the function body only) | `9_223_372_036_854_775_807usize` (= `2^63 - 1`, the 64-bit `isize::MAX` value the crate/tests assume) |
+
+The `+ 1` structure was kept intact, so the value computed is still `2^63` (the largest legal alignment). Semantics are unchanged; this was a literal-for-constant substitution per the archive pattern, not a structural rewrite.
+
+The `#[cfg(test)]` module's own `isize::MAX as usize + 1` (in `const MAX_ALIGN`) was deliberately **not** touched: it is not extracted by Hax, and tests must not be modified. `cargo test` still passes (2/2), confirming the contract — including the underflow-panic boundary in `panics_when_align_exceeds_max` — is preserved.
+
+### Patterns considered but not changed
+
+- **No `while`/recursion** in the function, so the recursion-vs-`while` preference rule and the `while_loop` / `partial_fixpoint` guidance do not apply.
+- **No `loop_invariant!` / `loop_decreases!`** and **no `#[hax_lib::requires(...)]`**, so no `@[hax_spec]` auto-spec block is generated — nothing for `bv_decide` to fail on.
+- The extracted body is a single straight-line expression: `((← ((9223372036854775807 : usize) +? (1 : usize))) -? align)`. The `-? align` carries the subtraction-underflow overflow obligation, which is the *intended* proof obligation (matching the `panics_when_align_exceeds_max` test), not a degeneracy.
+
+### Semantics / proof-stage notes
+
+- No change is suspected of altering semantics. The substituted literal is the exact bit value of `isize::MAX` on the 64-bit target the crate documents and the tests assume (`MAX_ALIGN = isize::MAX as usize + 1 = 1 << 63`).
+- No Hax-degenerate patterns remain; the proof stage gets the cleanest possible shape (one straight-line arithmetic expression with the standard `+?` / `-?` partial-op Hoare triples).
+
+Final state: `cargo test` ✅ (2 passed) · `cargo hax into lean` ✅ · `lake build` ✅ (93 jobs, no `sorry`).
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/max_size_for_align_usize/attempted_changes/20260518-201829/*"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/rewrite_patterns/*.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/max_size_for_align_usize/attempted_changes/20260518-201829/0002_stage2_rust_hax_lean_patched/m... [+14 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/max_size_for_align_usize/attempted_changes/20260518-201829/0002_stage2_rust_hax_lean_patched/e... [+18 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/max_size_for_align_usize/attempted_changes/20260518-201829/0002_stage2_rust_hax_lean_patched/s... [+19 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/rewrite_patterns/primitive_int_assoc_const.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/max_size_for_align_usize/attempted_changes/20260518-201829/0002_stage2_rust_hax_lean_patched/b... [+10 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/max_size_for_align_usize/attempted_changes/20260518-201829/0002_stage2_rust_hax_lean_patched/a... [+9 chars])
+I've inspected the only `stage2_rust_hax_lean` attempt in this run's log. Here's the report.
+
+## Patterns written
+
+None.
+
+## Attempts inspected
+
+**`0002_stage2_rust_hax_lean_patched/`** — skipped: **already covered by `primitive_int_assoc_const.rs`**.
+
+- Trigger: `lake build: error: ... Unknown identifier 'core_models.num.Impl_5.MAX'` from `isize::MAX as usize`.
+- Fix: inline the literal — `(isize::MAX as usize + 1) - align` → `(9_223_372_036_854_775_807usize + 1) - align`.
+- This is exactly the root cause and mechanical fix already documented in `rewrite_patterns/primitive_int_assoc_const.rs` (associated constants on primitive integer types — `u32::MAX`, `usize::MAX`, etc. — extracting to undefined `core_models.num.Impl_<N>.MAX`; workaround is literal inlining). `isize::MAX` is the same family (`Impl_5` vs `Impl_8`), same substitution. The rewrite agent's own `trigger_error` and patch comment even cite `primitive_int_assoc_const.rs` by name, confirming it applied the existing archive pattern. No new pattern warranted.
+
+The other attempt in the directory (`0001_stage1_make_pbt_patched/`) is a stage 1 attempt and was ignored per scope.
+
+## Flagged for attention
+
+Nothing confusing. The single relevant attempt is a clean, expected reuse of an existing archived pattern — the archive is working as intended here.
+
+harvest_rewrite_patterns
+## Summary of changes
+
+The only functional change is in the body of `max_size_for_align`: the original computes `(isize::MAX as usize + 1) - align`, and the rewrite replaces `isize::MAX as usize` with the inlined literal `9_223_372_036_854_775_807usize`. An explanatory comment was added describing why the literal was substituted (the `isize::MAX` extraction maps to an undefined identifier in the Hax Lean prelude). The test module is byte-identical (it still uses `isize::MAX as usize + 1` for `MAX_ALIGN`).
+
+## Reasoning about behavior preservation
+
+This is a constant-inlining. On the 64-bit target this crate explicitly targets (documented in the module header, the rewrite note, and exercised by the tests over shifts `0..64`), `isize::MAX = 2^63 - 1 = 9_223_372_036_854_775_807`, so `isize::MAX as usize` is exactly `9_223_372_036_854_775_807usize`. The substitution is therefore a literal-for-expression replacement with identical value.
+
+Downstream semantics are unchanged:
+- `9_223_372_036_854_775_807 + 1 = 2^63 = 9_223_372_036_854_775_808`, which fits in `usize` (max `2^64 - 1`), so the addition does not overflow — same as the original.
+- The subtraction `- align` underflows for exactly the same inputs as before (`align > 2^63`), preserving the documented panic behavior on `MAX_ALIGN + 1`.
+- For every valid power-of-two alignment `1 << 0 .. 1 << 63`, the result is `2^63 - align`, identical to the original.
+
+The added text is a comment (verification/documentation only) and does not affect runtime behavior. The test module is unchanged and continues to pass because the function's observable behavior is identical.
+
+The only way this could diverge is on a non-64-bit target where `isize::MAX as usize ≠ 2^63 - 1`, but the crate is explicitly monomorphized and pinned to a 64-bit target, so that input class is out of domain.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/Clever044TriangleAreaModifiedObligations.lea... [+3 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/add_one_modified/manifest.json"})
+[tool] Glob({"pattern": "proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/*Obligations.lean"})
+[tool] Glob({"pattern": "proof_patterns/add_one_modified/proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "proof_patterns/add_one_modified/**/*.lean"})
+[tool] Glob({"pattern": "proof_patterns/clever_044_triangle_area_modified/**/*"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/**/*.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/add_one_modified/**/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/Clever_044_triangle_areaObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/add_one_modified/proofs/lean/extraction/Add_oneObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/add_one_modified/proofs/lean/extraction/add_one.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/{truncate_number_modified,average_ceil_u64_modified,saturating_sub_modified}/**/*Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/truncate_number_modified/**/*.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/average_ceil_u64_modified/**/*.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/**/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/truncate_number_modified/proofs/lean/extraction/Clever_002_truncate_numberObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/saturating_subObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/average_ceil_u64_modified/proofs/lean/extraction/Average_ceil_u64Obligations.lean"})
+## Selected examples
+
+```
+proof_patterns/clever_044_triangle_area_modified
+proof_patterns/add_one_modified
+proof_patterns/truncate_number_modified
+proof_patterns/saturating_sub_modified
+proof_patterns/average_ceil_u64_modified
+```
+
+The target is a straight-line `usize` body `(9223372036854775807 +? 1) -? align`: one partial add whose operands are **both constants** (can never overflow `usize`, since `2^63 < 2^64`) sequenced into one partial subtraction that **genuinely underflows** when `align > 2^63`. So the proof obstacles are: (A) statically discharge the constant `+?`, (B) pair an `ok`/`integerOverflow` success-failure theorem on the `-?`, (C) bv-nat-bridge the success value/precondition at 64-bit word width, (D) unfold a one-bind do-block. Picks ranked by how directly they hit A–D:
+
+1. **clever_044_triangle_area_modified** — strongest *structural* twin: two partial operators composed in one do-block, where one operator is collapsed by a static `decide` (`decide ((2:i64)=-1)=false` + `if_neg (2≠0)`) and the other is exposed as a `_ok` (precond ⇒ `RustM.ok value`) / `_overflow` (precond ⇒ `RustM.fail Error.integerOverflow`) pair. Maps almost verbatim onto "static-discharge `+?` on literals, expose `-?` as ok/underflow pair" (A+B+D).
+
+2. **add_one_modified** — minimal canonical single-partial-operator success/failure pair (`add_one_postcondition` under `¬ addOverflow`, `add_one_overflow_failure` under `addOverflow`) via `rw [def]; rw [hax_..._def]; rw [if_neg/if_pos]`. Exactly the skeleton for the target's `-?` clause once `+?` is folded; its `hax_add_def` private-lemma trick transfers directly to the `usize` `-?`/`+?` (B+D).
+
+3. **truncate_number_modified** — canonical static-discharge of a partial operator that can't fail because an operand is a static constant (`%? 1000` → `if_neg (by decide : (1000:u64)≠0)`), plus the bv-nat-bridge toolkit (`UInt64.lt_iff_toNat_lt`, `UInt64.toNat_*`, `Nat.*`, `omega`) for a numeric bound/postcondition at word width. The `9223372036854775807 +? 1` discharge is the same `decide` move (A+C).
+
+4. **saturating_sub_modified** — unsigned-subtraction no-underflow reasoning: `UInt8.subOverflow_iff` + `lt/le_iff_toNat_lt` + `omega` under an ordering precondition, with `by_cases` totality split between the two domains. The success branch needs exactly `align ≤ 2^63 ⇒ ¬ USize.subOverflow …`, and the domain split mirrors `saturating_sub_total` (B+C; note surface differs — it's guarded/total, target genuinely fails).
+
+5. **average_ceil_u64_modified** — bv-nat-bridge for an unsigned subtraction at 64-bit width (`UInt64.toNat_sub_of_le _ _ hle` then `omega`), `Triple_iff_BitVec` → `RustM.ok` case-split for the equational form, and `UInt64.ofNat`/`toNat` round-trip for stating an in-word numeric result. Tooling for computing `.toNat ((2^63) − align)` with no underflow when `align ≤ 2^63` at the matching word width (C).
+
+## Gaps
+
+- No example combines a **constant-folded partial add known statically not to overflow** *and* a **second partial subtraction that genuinely fails out-of-domain** in one straight-line `usize` body. triangle_area is closest (static-discharge + exposed precondition) but is signed `i64` mul/div; truncate_number does the static-discharge but has no failure clause. A small `usize` add-then-sub example with one static operand and one failing operand would be the ideal library addition.
+- **No `usize`-typed example.** All picks are `u8`/`u64`/`i64`; the `USize` lemma names (`USize.subOverflow_iff`, `USize.lt_iff_toNat_lt`, `USize.toNat_sub_of_le`, `USize.toNat_ofNat`) must be transposed from their `UInt8`/`UInt64` analogues — a likely friction point for the proof stage.
+- The exact `isize::MAX + 1` boundary constant is unmodeled by any pattern, but it is purely numeric (handled by `decide`/`omega`) and needs no dedicated example.
+
+## Rejections
+
+- **square_modified** — same single-partial-binop success/failure shape as add_one but with mul; redundant, adds nothing for add/sub composition.
+- **slice_get_u64_modified** — has branch-split totality + partial-operator-discharge, but the discharge is slice-bounds (`dif_pos`), not arithmetic overflow; no slices in target.
+- **average_floor_u64_modified** — bit-manip overflow-avoidance like average_ceil but lacks the subtraction-no-underflow clause; average_ceil strictly dominates it here.
+- **clamp_modified / min_modified / is_zero_modified** — total comparison-only, no partial arithmetic operator and no failure mode.
+- **factorial_modified / sum_to_n_modified** — overflow-failure but recursive; the induction machinery is irrelevant to a straight-line body.
+- **gcd_while_modified / while_example / gcd_recursive_modified** — loop-invariant / recursion apparatus; target has neither.
+- All `recursion`/`strong-induction`/slice-scan examples (below_zero, contains_u64, is_prime, the `clever_0xx` family, sum_product, rescale_to_unit, etc.) — target is non-recursive, non-slice, single expression; their oracle/induction scaffolding would actively mislead the proof stage.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Max_size_for_align_usizeObligations.lean
+[scaffold] registered Max_size_for_align_usizeObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/Clever_044_triangle_areaObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/add_one_modified/proofs/lean/extraction/Add_oneObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/truncate_number_modified/proofs/lean/extraction/Clever_002_truncate_numberObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/saturating_subObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/average_ceil_u64_modified/proofs/lean/extraction/Average_ceil_u64Obligations.lean"})
+[tool] Grep({"pattern": "abbrev usize|def usize|notation.*usize|usize :=", "output_mode": "content", "-n": true})
+[tool] Glob({"pattern": "**/hax/proof-libs/lean/**/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+47 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+51 chars])
+[tool] Grep({"pattern": "subOverflow|addOverflow|declare_uint_theorems|additional_uint_decls", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_si... [+155 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+87 chars])
+Now I have a clear picture of the model. `usize := USize64`; `+?`/`-?` are the partial unsigned ops that `.fail .integerOverflow` on `BitVec.uaddOverflow`/`usubOverflow`. The constant `9223372036854775807 + 1 = 2^63 = 9223372036854775808 < 2^64` (add never overflows); the subtraction underflows iff `align > 2^63`. Let me write the obligations.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Max_size_for_align_usizeObligations.lean", "patch": "<<< SEARCH\n-- Add `theorem` declarations below.\n===\n/-- Postcondition o... [+2382 chars])
+Now let me verify the statements are well-typed with a build.
+[tool] run_lake_build({})
+Build succeeds — all three theorem statements are well-typed (only the expected `sorry` warnings remain).
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Max_size_for_align_usizeObligations.lean`
+
+**Model recap:** `usize = USize64`; `+?`/`-?` are partial unsigned ops that `RustM.fail Error.integerOverflow` on `BitVec.uaddOverflow`/`usubOverflow`. The body is `(9223372036854775807 +? 1) -? align`. The constant add is `2^63 - 1 + 1 = 2^63 = 9223372036854775808 < 2^64`, so it can never overflow; the subtraction underflows exactly when `align > 2^63`.
+
+**Theorems added (one line each, naming the contract clause):**
+
+- `max_size_for_align_postcondition` — postcondition over the valid domain: `align ≤ MAX_ALIGN (2^63) ⟹ result = (isize::MAX + 1) − align`. Captures the Rust test `postcondition_formula_over_valid_alignments`.
+- `max_size_for_align_boundary_zero` — boundary edge explicitly pinned by that same test: `align = MAX_ALIGN ⟹ result = 0`.
+- `max_size_for_align_overflow` — failure condition: `align > MAX_ALIGN ⟹ RustM.fail Error.integerOverflow`. Captures the Rust test `panics_when_align_exceeds_max`.
+
+**Property tests classified as derived facts:** none skipped on derived-fact grounds. Both Rust contract-style tests map to theorems.
+
+**Uncertain framing:**
+- `max_size_for_align_boundary_zero` is, strictly, an algebraic instance of `max_size_for_align_postcondition` (`MAX_ALIGN − MAX_ALIGN = 0`) rather than a fully independent clause. I included it because the test docstring explicitly calls it out as "the contractual boundary case" and the guidance is to include when in doubt; it is a separate, non-bundled theorem so it does no harm if the proof stage finds it trivial.
+- `max_size_for_align_overflow` is stated for the *general* failure region (`align > 2^63`) rather than only the exact test point `MAX_ALIGN + 1`; this matches the reference style (`add_one_overflow_failure`) and the failure region subsumes the single tested value.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+
+make_lean_obligations
+
+[make_proof] attempt 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/Clever_044_triangle_areaObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/add_one_modified/proofs/lean/extraction/Add_oneObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/truncate_number_modified/proofs/lean/extraction/Clever_002_truncate_numberObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/saturating_subObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/average_ceil_u64_modified/proofs/lean/extraction/Average_ceil_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/add_one_modified/proofs/lean/extraction/Add_oneObligations.lean", "offset": 14, "limit": 5})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/**/*.lean"})
+[tool] Glob({"pattern": "**/proof-libs/lean/**/*.lean"})
+[tool] Bash({"command": "find / -name \"*.lean\" -path \"*proof-libs*\" 2>/dev/null | head -50"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/USize64.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+51 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+54 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+47 chars])
+[tool] Grep({"pattern": "addOverflow|subOverflow|declare_uint_theorems|additional_uint_decls", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_si... [+170 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+87 chars])
+[tool] Grep({"pattern": "declare_uint_theorems|lt_iff_toNat_lt|le_iff_toNat_le|toNat_ofNat|toNat_sub_of_le\\b|theorem toNat_ofNat_of_lt", "path": "/home/tobias/uni/pipeline... [+225 chars])
+[tool] Grep({"pattern": "declare_uint_theorems", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extrac... [+86 chars])
+[tool] Grep({"pattern": "macro \"declare_uint_theorems\"", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/l... [+72 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+49 chars])
+[tool] Grep({"pattern": "def uaddOverflow|def usubOverflow|theorem uaddOverflow|theorem usubOverflow", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/allo... [+105 chars])
+[tool] Grep({"pattern": "lt_iff_toNat_lt|le_iff_toNat_le|toNat_ofNat_of_lt", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize... [+158 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib... [+61 chars])
+I've reviewed the references and the Hax prelude model. The key facts:
+- `usize = USize64`; `+?`/`-?` are partial ops: `x +? y = if USize64.addOverflow x y then .fail else pure (x+y)` (provable by `rfl`, exactly the `add_one` `hax_add_def_u8` trick).
+- `USize64.subOverflow_iff : subOverflow a b ↔ a.toNat < b.toNat`, `USize64.le_iff_toNat_le`, `USize64.lt_iff_toNat_lt` exist (the `saturating_sub` bridge pattern, transposed to `USize64`).
+
+Let me check the LSP diagnostics on the current file first, then write the proof.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/Max_size_for_align_usizeOb... [+16 chars])
+Now I'll write the complete proof, preserving the obligation statements and docstrings, adding the `private theorem` helpers (the `add_one` `hax_*_def` trick transposed to `USize64`).
+[tool] write_working_file({"path": "proofs/lean/extraction/Max_size_for_align_usizeObligations.lean", "overwrite": true, "error_message": "All three obligations are `sorry`; filling in p... [+5344 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified/proofs/lean/extraction/Max_size_for_align_usizeOb... [+16 chars])
+The Lean LSP tools aren't available here, so I'll use `run_lake_build` as the ground-truth check.
+[tool] run_lake_build({})
+Build succeeded with **no errors and no `sorry` warnings** — all three obligations are closed.
+
+## Final output
+
+### Files changed
+
+`proofs/lean/extraction/Max_size_for_align_usizeObligations.lean` — replaced all three `sorry`s with complete proofs and added five `private theorem` helpers. Obligation statements and docstrings were left **unchanged** (not weakened).
+
+**Helpers added:**
+- `hax_add_def_usize` / `hax_sub_def_usize` — `rfl` unfoldings of the partial `usize` `+?`/`-?` into their overflow-guarded `if`-form. This is the `add_one` `hax_add_def_u8` trick transposed from `UInt8` to `USize64` (the selector-flagged "no `usize`-typed example" gap).
+- `const_add : (isize::MAX) + 1 = 2^63` — closed `BitVec 64` computation by `decide`.
+- `const_toNat : (2^63 : usize).toNat = 2^63` — by `decide` (`2^63 < 2^64`).
+- `no_add_overflow : ¬ USize64.addOverflow (isize::MAX) 1` — static discharge of the constant `+?` (the `truncate_number`/`triangle_area` "operand is a static constant ⇒ partial op can't fail" move) by `decide`.
+
+**Obligation proofs:**
+- `max_size_for_align_postcondition` — establish `¬ subOverflow` from `align ≤ 2^63` via `USize64.subOverflow_iff` + `USize64.le_iff_toNat_le` + `omega` (the `saturating_sub` bridge, transposed to `USize64`); then `unfold`, `rw [hax_add_def_usize, if_neg no_add_overflow]`, `simp only [pure_bind]` to collapse the one-bind do-block, `rw [hax_sub_def_usize, if_neg hsub, const_add]`, `rfl`.
+- `max_size_for_align_boundary_zero` — derived as the `align = 2^63` instance of the postcondition (`rw [max_size_for_align_postcondition …]; decide`), since `2^63 - 2^63 = 0`.
+- `max_size_for_align_overflow` — symmetric: `subOverflow` from `2^63 < align` via `USize64.lt_iff_toNat_lt`, then the same unfold chain ending in `rw [hax_sub_def_usize, if_pos hsub]` (the `add_one_overflow_failure` skeleton).
+
+### Difficult sub-goals and how resolved
+
+- **Bridging the `usize` literal `isize::MAX + 1` to `2^63`:** done with the `const_add` / `const_toNat` `decide`-backed helpers so the symbolic `align` rewrites cleanly; `decide` is fast here because `USize64` is `BitVec 64` over kernel `Nat`.
+- **Collapsing the do-block:** the single `(← (C +? 1)) -? align` bind needed `simp only [pure_bind]` (beta-reducing the continuation) after the static add discharge, not a plain `rw`.
+- **`USize64` lemma transposition:** the references are `UInt8`/`UInt64`/`i64`; the proof uses the `USize64.{subOverflow_iff, le_iff_toNat_le, lt_iff_toNat_lt, addOverflow}` analogues, confirmed present in the Hax prelude (`additional_uint_decls USize64 64` / `declare_uint_theorems USize64 64`).
+
+### Obligations left as `sorry`
+
+None. All three obligations (`max_size_for_align_postcondition`, `max_size_for_align_boundary_zero`, `max_size_for_align_overflow`) are fully closed; `lake build` completes successfully with no `sorry` warnings.
+[make_proof] attempt 1 done — 0 sorry remain
+[make_proof] closed after 1 attempt(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+## Analysis
+
+**Proof obstacles in this target:**
+
+1. **Inlined-constant arithmetic discharged by closed `decide`**: `const_add` (`9223372036854775807 + 1 = 2^63`), `const_toNat`, and `no_add_overflow` are three lemmas that fold the inlined `isize::MAX` literal and prove the *static* inner add never overflows. The source comment explains this is forced: `isize::MAX as usize` extracts to `core_models.num.Impl_5.MAX`, undefined in the Hax Lean prelude, so it's inlined and the proof must reconstruct closed-form facts about it.
+
+2. **Static-total operator chained before a contractually-conditional operator**: the add is discharged unconditionally via `if_neg no_add_overflow`; the subtraction carries the entire precondition (`align ≤ 2^63 ⟺ ¬ subOverflow`).
+
+3. **usize subtraction underflow as the precondition boundary**, with paired success / failure / boundary-zero theorems, bridged to Nat via `USize64.subOverflow_iff` + `le/lt_iff_toNat` + `omega`.
+
+**Comparison with the library:**
+
+- `add_one_modified` / `square_modified`: paired success/failure on a *single* binop, u8, no static folding, no bv-nat-bridge.
+- `clever_044_triangle_area_modified` (`signed-div-static-discharge`) and `truncate_number_modified` discharge a *static divisor* via `decide` — but neither folds an inlined constant nor proves a static add overflow-free.
+- `average_ceil_u64`, `recursion_example`, `while_example` carry `subtraction-no-underflow` but are bit-manip / recursive / loop totals with no failure theorem.
+
+The **static-constant-fold** obstacle (inline a prelude-missing constant, prove its closed-form value + no-overflow via `decide`, thread through an equational postcondition) does not appear in any existing manifest, and it is a recurring situation for monomorphized `core` extractions. This earns a new entry.
+[tool] add_proof_pattern({"name": "max_size_for_align_usize_modified", "features": ["subtraction-no-underflow", "integer-overflow-failure", "if-branch-on-overflow", "partial-operator-di... [+745 chars])
+ADDED `max_size_for_align_usize_modified`
+
+- **Features**: `subtraction-no-underflow`, `integer-overflow-failure`, `if-branch-on-overflow`, `partial-operator-discharge`, `static-constant-fold`, `bv-nat-bridge`, `functional-correctness`
+- **Summary**: Computes `(isize::MAX+1) - align` on usize with `isize::MAX` inlined as a literal; pairs equational success / failure / boundary-zero theorems — the static inner add is folded and proved overflow-free by closed-literal `decide` lemmas, while the trailing subtraction's underflow condition is the sole precondition, bridged to Nat.
+
+**Observation for human review**: The genuinely new obstacle here is `static-constant-fold` — the `const_add` / `const_toNat` / `no_add_overflow` triplet exists *only* because `isize::MAX as usize` extracts to the undefined prelude identifier `core_models.num.Impl_5.MAX`, forcing constant inlining. This is a structural workaround likely to recur across monomorphized `core` extractions, which is why the exemplar earns its place despite the rest of the proof skeleton (paired success/failure, `partial-operator-discharge`, `bv-nat-bridge`) being individually well-covered. Worth noting that the inlining slightly diverges the Lean obligation from the literal Rust source — a reviewer should confirm the pipeline's policy treats this as acceptable.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260518-201829_max_size_for_align_usize_stage_notes.json
+[cleanup] freed 348.8MB from benchmarks/claude-opus-4-7/alloc/max_size_for_align_usize_modified

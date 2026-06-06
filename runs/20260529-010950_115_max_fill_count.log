@@ -1,0 +1,451 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260529-010950_115_max_fill_count.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/115_max_fill_count/attempted_changes/20260529-010950
+Stages: all 8 (1-8), in order
+[setup] Crate not yet set up — running setup_crate.bash on /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/115_max_fill_count
+[setup] Done.
+
+[tool] Read({"file_path": "Cargo.toml"})
+Now I'll analyze the contract:
+
+**Contract of `sort_by_popcount`:**
+- **Preconditions:** None — total function on any `&[u64]`.
+- **Postconditions:** Returns a permutation of the input, sorted by key `(popcount(x), x)` in ascending order.
+- **Failure conditions:** None.
+
+**Independent claims:**
+1. *Permutation* — output is a multiset rearrangement of input.
+2. *Sortedness by key* — consecutive elements respect `(popcount asc, value asc)`.
+
+Length preservation is implied by permutation, so I won't add it as a separate test. Idempotence (`sort(sort(l)) == sort(l)`) is derived from these two. I'll keep the existing concrete `known` example to pin down the tiebreaker direction (ascending vs. descending value).
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "error_message": "Add property-based tests capturing the contract of sort_by_popcount (permutation + sortedness by (popcount, value) key)... [+2381 chars])
+[tool] run_cargo_test({})
+All three tests pass.
+
+## Summary
+
+**Tests added** (alongside the existing `known` concrete example):
+
+1. **`output_is_permutation_of_input`** — captures the postcondition that the result is a multiset rearrangement of the input. Catches implementations that drop, duplicate, or substitute elements.
+2. **`output_is_sorted_by_popcount_then_value`** — captures the postcondition that consecutive output elements respect the lex key `(popcount asc, value asc)`. Catches wrong primary ordering, wrong tiebreaker direction, and unsorted output. The `<=` (rather than `<`) on the value tiebreaker permits duplicate inputs.
+
+Together these two properties uniquely characterise the function up to determinism, so they form a tight specification.
+
+**Properties considered but excluded:**
+
+- *Length preservation* — strictly implied by the permutation property; no extra information.
+- *Idempotence* (`sort(sort(l)) == sort(l)`) — derived from sortedness + determinism; not an independent claim.
+- *Separate "popcount non-decreasing" test* — already subsumed by the lex-key sortedness test.
+- *Algebraic facts about popcount itself* (e.g. `popcount(2x) == popcount(x)`) — properties of the input metric, not of `sort_by_popcount`.
+- *Preservation of "already-sorted" inputs as a fixed point* — derived from permutation + sortedness.
+
+**Pre/failure conditions:** the function is total with no panics or error returns, so there are no failure-condition tests to write. The 0-length boundary is exercised naturally by the proptest range `0..16`.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+I'll start by reading the working crate to confirm the source matches what's in the prompt, then plan rewrites.
+[tool] Bash({"command": "find . -maxdepth 3 -type f \\( -name \"*.rs\" -o -name \"*.toml\" \\) | head -50", "description": "List Rust source and config files"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/intersperse_modified/src/lib.rs"})
+[tool] Read({"file_path": "./src/lib.rs"})
+Confirmed — the working crate matches what's in the prompt, and the proptest block is real. Now let me run the baseline tests, then plan rewrites.
+[tool] TodoWrite({"todos": [{"content": "Baseline cargo test", "activeForm": "Running baseline cargo test", "status": "in_progress"}, {"content": "Rewrite insert_sorted to tail ... [+435 chars])
+[tool] run_cargo_test({})
+Baseline tests pass. Now let me apply the rewrite — convert the `while`-loop + `Vec::push` in `insert_sorted` to tail recursion + `extend_from_slice` with typed array chunks (per `vec_push_to_extend_from_slice_typed_chunk` and `while_loop_to_recursion` patterns).
+[tool] write_working_file({"path": "src/lib.rs", "overwrite": true, "error_message": "Anticipated Hax-incompatibilities in insert_sorted: (1) Vec::push is unmodeled in the Hax Lean prelu... [+4730 chars])
+[tool] TodoWrite({"todos": [{"content": "Baseline cargo test", "activeForm": "Running baseline cargo test", "status": "completed"}, {"content": "Rewrite insert_sorted to tail re... [+439 chars])
+[tool] run_cargo_test({})
+Tests still pass. Now extraction.
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+All three stages pass. Let me sanity-check the extracted Lean for any silent `sorry` bodies or Hax-degenerate patterns.
+[tool] Bash({"command": "grep -nE \"sorry|RustM\\.fail|from_machine \\(0 : u32\\)\" ./proofs/lean/extraction/clever_115_max_fill_count.lean || echo \"no sorry / no constant... [+114 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/115_max_fill_count_modified/proofs/lean/extraction/clever_115_max_fill_count.lea... [+3 chars])
+All three pipeline stages pass and the extracted Lean is clean:
+- All functions extracted as `partial_fixpoint` (proof-friendly recursion shape, not `while_loop`).
+- All `Vec` operations route through modeled prelude symbols (`alloc.vec.Impl.new`, `alloc.vec.Impl_2.extend_from_slice`).
+- `RustArray u64 1` carries the size in its type ascription (`(chunk : (RustArray u64 1) := ...)`), so `unsize` elaborates cleanly.
+- No `sorry`, no `RustM.fail`, no constant-0 termination measure.
+[tool] TodoWrite({"todos": [{"content": "Baseline cargo test", "activeForm": "Running baseline cargo test", "status": "completed"}, {"content": "Rewrite insert_sorted to tail re... [+441 chars])
+## Final report
+
+### What was changed and why
+
+The only Hax-incompatibility in the original source was `insert_sorted`, which used `Vec::push` inside a `while` loop:
+
+```rust
+fn insert_sorted(v: Vec<u64>, x: u64) -> Vec<u64> {
+    let mut r: Vec<u64> = Vec::new();
+    let mut i = 0usize;
+    let mut done = false;
+    while i < v.len() {
+        if !done && !lex_less(v[i], x) { r.push(x); done = true; }
+        r.push(v[i]); i += 1;
+    }
+    if !done { r.push(x); }
+    r
+}
+```
+
+Two issues, two patterns from the archive:
+
+1. **`Vec::push` is undefined in the Hax Lean prelude** (`alloc.vec.Impl_1.push`). Applied [`rewrite_patterns/vec_push_to_extend_from_slice_typed_chunk.rs`](../rewrite_patterns/vec_push_to_extend_from_slice_typed_chunk.rs): replaced each `r.push(x)` with `let chunk: [u64; 1] = [x]; r.extend_from_slice(&chunk);`. The typed `let` binding pins `RustArray u64 1`, so the size in `unsize` elaborates cleanly.
+
+2. **`while` loop adds proof burden** vs. the cleaner `partial_fixpoint` shape. Applied [`rewrite_patterns/while_loop_to_recursion.rs`](../rewrite_patterns/while_loop_to_recursion.rs): lifted the loop into a tail-recursive helper `insert_sorted_at(v, x, i, done, r)` with decreasing measure `v.len() - i`, single-accumulator state. The loop had no `break`/`continue`/early return — clean fit for the rewrite.
+
+### Patterns considered but not changed
+
+- `popcount_at`, `lex_less`, `sort_at`, `sort_by_popcount` — already minimal-Rust (no `requires`, no `loop_invariant!`, no library calls, pure tail recursion). No changes needed.
+- `popcount_at` uses `n / 2`, `n % 2` — both safe on `u64` (divisor is the literal `2`), no `RustM.fail` risk.
+- The `&&` in the rewritten `insert_sorted_at` (`!done && !lex_less(v[i], x)`) has a partial op in the RHS (`v[i]` indexing), but the surrounding `else` branch guarantees `i < v.len()`, so Hax's eager bind hits the safe case unconditionally. Not a true short-circuit-over-partial-op case.
+
+### Library calls inlined
+
+None — no `.pow()`, `.abs()`, `.checked_*`, `.is_power_of_two()`, etc. in the source.
+
+### Hax-degenerate patterns that survived
+
+None. Extracted file is free of `sorry`, `RustM.fail`, and constant-`0` measures; all four `def`s use `partial_fixpoint`.
+
+### Semantic preservation
+
+The rewrite is byte-identical to the original Rust semantics: the helper threads exactly the same `(r, i, done)` triple, with `extend_from_slice(&[x])` equivalent to `push(x)`. All 3 tests (1 unit + 2 proptest, 256 cases each) pass post-rewrite.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/115_max_fill_count/attempted_changes/20260529-010950/", "description": "List attempt log d... [+10 chars])
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/115_max_fill_count/attempted_changes/20260529-010950/0002_stage2_rust_hax_lean_written/", ... [+38 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/115_max_fill_count/attempted_changes/20260529-010950/0002_stage2_rust_hax_lean_written/meta... [+11 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/115_max_fill_count/attempted_changes/20260529-010950/0002_stage2_rust_hax_lean_written/erro... [+15 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/115_max_fill_count/attempted_changes/20260529-010950/0002_stage2_rust_hax_lean_written/befo... [+7 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/115_max_fill_count/attempted_changes/20260529-010950/0002_stage2_rust_hax_lean_written/afte... [+6 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/rewrite_patterns/vec_push_to_extend_from_slice_typed_chunk.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/rewrite_patterns/while_loop_to_recursion.rs"})
+There's only one `stage2_rust_hax_lean_*` attempt and it directly references both existing patterns it uses. Nothing new to harvest.
+
+## Summary
+
+**Patterns written:** 0
+
+**Attempts inspected:**
+
+- `0002_stage2_rust_hax_lean_written/` — **skipped: already covered**. The rewrite combines two existing patterns:
+  - `vec_push_to_extend_from_slice_typed_chunk.rs` (Vec::push → typed `[T; N]` chunk + `extend_from_slice`)
+  - `while_loop_to_recursion.rs` (while loop → tail recursion via `partial_fixpoint`)
+
+  The trigger error (and the agent's own in-source comment) explicitly cite both pattern files by name, so there's no new root cause to document. The shape (a `done` flag flowing through the recursion as an extra parameter) is a natural consequence of combining those two patterns and doesn't warrant a third one.
+
+**Anything confusing:** nothing — the log is clean, status is `written` with `change_count: 0` because it was a whole-file rewrite (kind `write`, not patch-based), which is consistent with how the harness records full-file replacements.
+
+harvest_rewrite_patterns
+Looking at the two files, the only substantive change is in `insert_sorted`, which has been refactored from a `while` loop with `Vec::push` to a tail-recursive helper `insert_sorted_at` using `extend_from_slice(&[x])`. Everything else (`popcount_at`, `lex_less`, `sort_at`, `sort_by_popcount`, tests) is byte-identical.
+
+**Analysis of the rewrite:**
+
+Original loop body for each `i` in `0..v.len()`:
+1. If `!done && !lex_less(v[i], x)`: push `x`, set `done = true`.
+2. Push `v[i]`.
+3. `i += 1`.
+
+After the loop, if `!done`: push `x`.
+
+Rewritten recursion:
+- Base case `i >= v.len()`: if `!done`, append `[x]`. Return.
+- Recursive case: if `!done && !lex_less(v[i], x)`: append `[x]`, set `done = true`. Then append `[v[i]]`. Recurse with `i + 1`.
+
+The structure is a faithful translation. Each step performs the same conditional `x`-append, then the same `v[i]`-append, then advances `i`, with `done` correctly carried as an argument instead of a mutable local.
+
+**`push` vs `extend_from_slice(&[x])`:** `r.push(x)` appends one element `x` to the end of `r`. `r.extend_from_slice(&[x])` copies one element `x` to the end of `r`. For `u64: Copy`, these are observationally identical on every input — same final `Vec` contents, same length, same ordering.
+
+**Termination:** The recursion depth is at most `v.len()`, identical to the loop's iteration count. No new panic sites are introduced (`v[i]` indexing is in the same guarded range).
+
+**Done-flag handling:** `done` flows in as `false` from `insert_sorted` and is monotonically set to `true` exactly when the original loop would have set it. The post-loop `if !done { r.push(x); }` lives in the base case, preserving its semantics.
+
+No input produces a different output between the two versions.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target crate's Lean extraction and Rust source, I need to identify the proof obstacles:
+
+**Target obstacles:**
+- **u64 insertion sort** via `partial_fixpoint` recursion with a `done : Bool` state flag (`insert_sorted_at`)
+- **TWO consecutive size-1 `extend_from_slice` calls** in the keep branch (push `[x]` then `[v[i]]`), NOT a single size-2 chunk
+- **Sort-driver `sort_at` invoking `insert_sorted` per element** (multi-helper composition)
+- **Custom comparator `lex_less`** built from a recursive `popcount_at` helper (recursive bit/digit-decomposition via `n / 2`, `n % 2`) — sorts by lex key (popcount, value)
+- **Contract**: multiset preservation (permutation) + sortedness under lex key
+- Standard machinery: `usize_add_one_no_overflow`, `bv_nat_bridge`, slice-indexing, vec-output via `extend_from_slice`
+
+Let me inspect the two most promising candidates to verify they really fit.
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/ /home/tobias/uni/pipeline_v6/proof_patterns/clever_087_sort_array... [+57 chars])
+[tool] Bash({"command": "cat /home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/src/lib.rs | head -80", "description": "Inspect 103's insertion s... [+10 chars])
+This confirms `clever_103_unique_digits_modified` is the closest structural match: u64 + `done: bool` + TWO consecutive size-1 `[u64;1]` extends + driver-calls-insertion-sort + recursive `n/10`-style helper for the per-element decision. The shape lines up almost exactly with the target's `insert_sorted_at` and `popcount_at`.
+[tool] Bash({"command": "cat /home/tobias/uni/pipeline_v6/proof_patterns/clever_087_sort_array_modified/src/lib.rs | head -60", "description": "Inspect 087's insertion sort... [+7 chars])
+Confirmed: `clever_087_sort_array_modified` shares the exact `sort_at` driver shape with the target (`sort_at(l, i+1, insert_sorted(s, l[i]))`) and same `insert_asc_at` insertion-sort skeleton, but uses a size-2 chunk in the insert branch. Combined with 103 (which has the two-consecutive-size-1 pattern), these two cover the target's body shape almost completely.
+
+---
+
+## Selected patterns
+
+```
+proof_patterns/clever_103_unique_digits_modified
+proof_patterns/clever_087_sort_array_modified
+proof_patterns/clever_033_unique_modified
+proof_patterns/clever_069_strange_sort_list_modified
+proof_patterns/clever_106_even_odd_palindrome_modified
+```
+
+### Rationale per pick
+
+- **`clever_103_unique_digits_modified`** — Closest body match. u64 + `done: bool` state-flag insertion sort + **two consecutive size-1 `extend_from_slice` calls** (`[e]` then `[v[i]]`), driver `filter_at` calling `insert_asc` per element, plus a recursive `n/10`-style predicate helper structurally analogous to target's `popcount_at` (`n/2` recursion). Provides the dual fail-step lemmas (`insert_asc_at_step_insert_fail_e` / `_fail_v`) needed for two sequential size-1 push overflow discharges and the `sorted_asc_append_singleton` applied twice pattern.
+
+- **`clever_087_sort_array_modified`** — u64 insertion sort with `inserted: Bool` flag and the IDENTICAL `sort_at(l, i, s) → sort_at(l, i+1, insert_asc(s, l[i]))` driver shape as target's `sort_at`. Provides `sort_at_inv` (vec_count multiset preservation through the sort phase) and `sort_at_sorted` (sortedness preservation) — directly transferable to target's permutation + sortedness contracts.
+
+- **`clever_033_unique_modified`** — i64 insertion sort with `inserted: Bool` flag, three-arm step-case structure (insert / pass-not-yet-inserted / pass-already-inserted), carried `acc[k] ≤ v[i]` + `(¬inserted → acc[k] ≤ x)` upper-bound invariant — the canonical template for the insertion-sort sortedness-preservation proof that target's `insert_sorted_at` needs.
+
+- **`clever_069_strange_sort_list_modified`** — Sequential composition of `insert_sorted_at` + `sort_at` (multi-helper pipeline of `partial_fixpoint` helpers) closely mirrors the target's helper layering; provides the template for proving sortedness preservation through a `sort_at`-style driver that wraps `insert_sorted`.
+
+- **`clever_106_even_odd_palindrome_modified`** — Most relevant precedent for the **custom-comparator-via-recursive-helper** aspect: `is_palindrome` is computed by composing `rev_at` (a recursive `n/10` walk producing a value) with a self-equality test, then the OUTER scan invokes the composed predicate per element. Target's `lex_less` similarly composes two `popcount_at` recursions with an ordering test, then the outer insertion sort uses `lex_less` as its comparator. Provides the discharge style for the partial `/?` and `%?` operators in the divide-by-static-constant recursion and the Nat-level oracle bridging idiom for the composed predicate.
+
+### Gaps (no existing example covers these)
+
+- **Custom comparator parameterising insertion sort.** Every existing insertion-sort proof (033, 036, 069, 087, 103) hardcodes `≤` on i64/u64. Target's `lex_less` is a non-trivial total order from a derived key (popcount). Target will need (a) a Nat-level `popcount_nat` oracle, (b) a Bool-level `lex_less` Rust↔Nat correctness lemma and (c) transitivity/totality lemmas for `lex_less` to thread `arr_sorted` through the insert-sort step.
+- **Sort key ≠ value identity.** The final "sorted" postcondition is on `(popcount(v[k]), v[k]) ≤_lex (popcount(v[k+1]), v[k+1])`, not on values themselves. Library has no entry where the sortedness contract is on a derived key — all use direct value comparison.
+- **`popcount` / bit-counting via `n/2, n%2` recursion.** Existing digit-decomp examples (035, 103, 106, 107) all recurse via `n/10`. The `n/2` shape is structurally analogous but no existing entry uses it for a Nat-level popcount oracle.
+
+### Rejections
+
+- **`clever_036_sort_even_modified`** — has insertion-sort + vec_count, but the parity-positional-interleave second pass complicates the template far beyond target's simple `sort_at` driver.
+- **`clever_032_sort_third_modified`** — insertion sort is implemented as a Rust `while` loop with three layered Hoare-triple invariants; target uses `partial_fixpoint` recursion.
+- **`clever_025_remove_duplicates_modified`** — filter-by-count, no sortedness or insertion sort.
+- **`clever_046_median_modified`** — uses sort only as an existence witness via `List.mergeSort`; entirely different from a Rust-extracted insertion sort.
+- **`clever_035_fizz_buzz_modified` / `clever_107_count_nums_modified`** — share the digit-decomposition recursion shape but feed a counter/value, not a comparator; less useful than 106 which actually composes the recursive helper into a Bool-result predicate.
+- **`triangle_area_heron_isqrt_modified` / `sqrt_u64_modified` / `cbrt_u64_modified`** — root-finding, irrelevant.
+- **`gcd_*_modified`** — straight-line scalar recursion, no Vec output or sort.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Clever_115_max_fill_countObligations.lean
+[scaffold] registered Clever_115_max_fill_countObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean", "... [+12 chars])
+[tool] Bash({"command": "grep -n \"^theorem\\|^private theorem\\|^/-! ##\" /home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extract... [+119 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean", "... [+28 chars])
+[tool] Bash({"command": "grep -n \"^theorem\\|^/-! ##\" /home/tobias/uni/pipeline_v6/proof_patterns/clever_087_sort_array_modified/proofs/lean/extraction/Clever_087_sort_ar... [+93 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_087_sort_array_modified/proofs/lean/extraction/Clever_087_sort_arrayObligations.lean", "offset... [+22 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_087_sort_array_modified/proofs/lean/extraction/Clever_087_sort_arrayObligations.lean", "offset... [+22 chars])
+[tool] Bash({"command": "grep -n \"^theorem\\|^/-! ##\" /home/tobias/uni/pipeline_v6/proof_patterns/clever_069_strange_sort_list_modified/proofs/lean/extraction/Clever_069_... [+95 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_069_strange_sort_list_modified/proofs/lean/extraction/Clever_069_strange_sort_listObligations.... [+36 chars])
+I have enough context from the references. Let me look at the empty/sorted shapes in 103 to confirm my form for the existence + size-zero anchor, then write the obligations.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_069_strange_sort_list_modified/proofs/lean/extraction/Clever_069_strange_sort_listObligations.... [+33 chars])
+[tool] TodoWrite({"todos": [{"content": "Draft obligation theorems + spec oracles (vec_count, popcount_nat)", "activeForm": "Drafting obligation theorems + spec oracles", "statu... [+411 chars])
+Now let me apply the patch with the spec oracles and three obligation theorems.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Companion file currently has a placeholder `-- Add `theorem` decl... [+3155 chars])
+[tool] TodoWrite({"todos": [{"content": "Draft obligation theorems + spec oracles (vec_count, popcount_nat)", "activeForm": "Drafting obligation theorems + spec oracles", "statu... [+415 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean"})
+Only `sorry` warnings, no type errors. Now let me run `lake build` to confirm.
+[tool] run_lake_build({})
+[tool] TodoWrite({"todos": [{"content": "Draft obligation theorems + spec oracles (vec_count, popcount_nat)", "activeForm": "Drafting obligation theorems + spec oracles", "statu... [+415 chars])
+Build succeeded with only the expected `sorry` warnings.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Clever_115_max_fill_countObligations.lean`
+
+**Spec oracles added (private helpers, not obligations):**
+- `vec_count` — per-target occurrence count; used to phrase multiset equality.
+- `popcount_nat` — Nat-level number-of-1-bits recursion mirroring the Rust `popcount_at` (`n+1 ↦ (n+1)%2 + popcount_nat ((n+1)/2)`), with a `termination_by`/`decreasing_by` clause following the 103 reference pattern.
+- `popcount` — lift to `u64` via `popcount_nat ·.toNat`; corresponds to `u64::count_ones`.
+
+**Theorems added:**
+
+1. `empty_input_yields_empty_output` — anchor: empty input slice yields `RustM.ok v` with `v.val.size = 0`.
+2. `output_is_permutation_of_input` — captures the proptest `output_is_permutation_of_input`: multiset equality via `vec_count v.val target v.val.size = vec_count l.val target l.val.size`, conditioned on `sort_by_popcount l = RustM.ok v`.
+3. `output_is_sorted_by_popcount_then_value` — captures the proptest `output_is_sorted_by_popcount_then_value`: adjacent-pair sortedness under the lex key `(popcount, value)` — `popcount v[k] < popcount v[k+1] ∨ (popcount v[k] = popcount v[k+1] ∧ v[k].toNat ≤ v[k+1].toNat)`, conditioned on `sort_by_popcount l = RustM.ok v`.
+
+**Property tests not promoted to obligations:** none. Both contract-style proptests map one-to-one to theorems 2 and 3. The `known` unit test (`sort_by_popcount(&[1,5,2,3,4]) = [1,2,4,3,5]`) is a concrete instance of the same two contract clauses, so it adds no new contract surface beyond what 2 and 3 already capture.
+
+**Feasibility check:** the natural universal statement holds. The Rust slice carries `size < USize64.size`, and the insertion-sort body's `extend_from_slice` calls grow the accumulator by 1 per step, capped at `l.val.size`, so no push triggers `r.val.size + 1 = 2^64`. The `i +? 1` increments stop at `i = v.len() - 1 ≤ USize64.size - 2`. The `popcount_at` accumulator is bounded by the bit width (≤ 64) so its `+?` never overflows. The `n /? 2`, `n %? 2`, and array-index `[i]_?` calls are guarded by the surrounding `i >=? len` and constant-`2` checks. Hence no precondition is needed beyond what the `RustSlice` invariant gives, and theorems 2 and 3 are stated as guarded equalities/disjunctions over arbitrary input.
+
+**Uncertainty:** none on framing. All three statements are well-typed (`lake build` clean apart from the expected `sorry` warnings at lines 47/58/72).
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 3 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Bash({"command": "pwd && ls proofs/lean/extraction/ 2>/dev/null | head -30", "description": "Check working directory and extraction folder"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean"})
+[tool] Bash({"command": "wc -l /home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean... [+619 chars])
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/", "description": "Check for README in 103"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean", "... [+25 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean", "... [+27 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean", "... [+27 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean", "... [+28 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_087_sort_array_modified/proofs/lean/extraction/Clever_087_sort_arrayObligations.lean", "offset... [+19 chars])
+[tool] Grep({"pattern": "sort_at|sort_array|insert_asc", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_087_sort_array_modified/proofs/lean/extraction/Clever_0... [+88 chars])
+[tool] TodoWrite({"todos": [{"content": "Study reference patterns (103 + 087) for sort_at + insert_sorted_at proof structure", "status": "in_progress", "activeForm": "Studying r... [+1759 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_087_sort_array_modified/proofs/lean/extraction/Clever_087_sort_arrayObligations.lean", "offset... [+22 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/115_max_fill_count_modified/proofs/lean/extraction/clever_115_max_fill_count.lea... [+3 chars])
+[tool] Bash({"command": "ls proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/ 2>/dev/null | head -30", "description": "Check Hax prelude location"})
+[tool] Bash({"command": "ls proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/", "description": "List Hax prelude folder"})
+[tool] Grep({"pattern": "cmp\\.lt|cmp\\.gt|UInt64\\.lt|UInt64\\.gt|lt_iff_toNat|gt_iff_toNat", "path": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/rust_p... [+49 chars])
+[tool] Grep({"pattern": "^def|^theorem|cmp\\.lt|cmp\\.gt", "path": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/rust_primitives/ops.lean", "output_mode": ... [+40 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 60, "limit": 100})
+Let me check the prelude for what's available and confirm the current build state:
+[tool] Bash({"command": "cat proofs/lean/extraction/Clever_115_max_fill_countObligations.lean | wc -l", "description": "Current obligations file size"})
+[tool] Grep({"pattern": "UInt64\\.size_eq|UInt64\\.lt_iff_toNat_lt|UInt64\\.le_iff_toNat_le|UInt64\\.toNat_inj", "path": "proofs/lean/extraction/.lake/packages/Hax/proof-li... [+51 chars])
+[tool] TodoWrite({"todos": [{"content": "Study reference patterns (103 + 087) for sort_at + insert_sorted_at proof structure", "status": "completed", "activeForm": "Studying ref... [+1761 chars])
+[tool] Grep({"pattern": "size_lt_usizeSize|toNat_ofNat_of_lt'|le_iff_toNat_le|toNat_add_of_lt|uaddOverflow_iff", "path": "proofs/lean/extraction/.lake/packages/Hax/proof-li... [+51 chars])
+I have enough context. Now let me write the comprehensive proof file. Given the size, I'll overwrite the entire file with the full proof structure:
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "overwrite": true, "error_message": "Overwriting file to insert ~1900 lines of help... [+88469 chars])
+Let me check the current state with the LSP:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+I see multiple structural issues. Let me check what's available for UInt64 and reformulate:
+[tool] Grep({"pattern": "uaddOverflow|addOverflow|toBitVec", "path": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/MissingLean/Init/Data/UInt/Lemmas.lean",... [+56 chars])
+[tool] Grep({"pattern": "Nat\\.strongRecOn|Nat\\.strong_induction|Nat\\.strongInductionOn", "output_mode": "files_with_matches", "path": "proofs/lean/extraction/.lake/packa... [+23 chars])
+[tool] Grep({"pattern": "strongRecOn|strong_induction|strongInductionOn|strongInduction", "path": "proofs/lean/extraction/.lake/packages/", "output_mode": "files_with_match... [+21 chars])
+[tool] mcp__lean__lean_multi_attempt({"file_path": "Clever_115_max_fill_countObligations.lean", "line": "240", "tactics": "[\"exact (popcount_nat.eq_def 0)\", \"rfl\", \"unfold popcount_nat; rfl\"]... [+2 chars])
+[tool] Grep({"pattern": "UInt64\\.toNat_add|UInt64\\.add_toNat|uaddOverflow_iff_lt_size|UInt64\\.toNat_add_of", "path": "proofs/lean/extraction/.lake/packages/Hax/proof-lib... [+69 chars])
+[tool] Grep({"pattern": "UInt64\\.toNat_add_of_lt|toNat_add", "path": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/MissingLean/Init/Data/UInt/Lemmas.lean"... [+57 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/MissingLean/Init/Data/UInt/Lemmas.lean"})
+[tool] Grep({"pattern": "uaddOverflow_iff|addOverflow_iff|BitVec\\.uaddOverflow", "path": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/", "output_mode": "... [+21 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/MissingLean/Init/Data/UInt/Basic.lean", "offset": 70, "limit": 60})
+Let me address all the issues by rewriting the file with the fixes:
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "overwrite": true, "error_message": "Rewriting to fix: missing Decidable instances ... [+26984 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "by_contra", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsO... [+41 chars])
+[tool] Grep({"pattern": "by_contra|byContra", "path": "proofs/lean/extraction/.lake/packages/Hax/", "output_mode": "files_with_matches", "head_limit": 5})
+Let me apply targeted fixes:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Fix by_contra usage (not available without Mathlib), restructure ... [+2661 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Fix popcount_nat_zero (rfl fails because of termination_by/WellFo... [+2283 chars])
+Now fix `popcount_at_correct` and `lex_less_correct`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "popcount_at_correct succ case: remove unused h_two_toNat rewrite ... [+789 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Add explicit closers for 0 \u2264 0 goals in popcount_nat_le_self... [+562 chars])
+Now let me look at the lex_less_correct issues at lines 391, 404, 477, 489:
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "offset": 383, "limit": 110})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Remove redundant rfl after simp only at line 391, fix h_zero_toNa... [+2045 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Add explicit rfl closers after decide_eq_true / decide_eq_false r... [+4557 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "offset": 375, "limit": 35})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Fix unsolved goals: rw chains close already, simp leaves pure acc... [+1993 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+[tool] Bash({"command": "wc -l proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "description": "Check current line count"})
+[tool] Bash({"command": "grep -n \"^end\\|^namespace\\|^private theorem\\|^theorem\\|^private def\\|^private instance\" proofs/lean/extraction/Clever_115_max_fill_countObli... [+67 chars])
+[tool] TodoWrite({"todos": [{"content": "Study reference patterns (103 + 087) for sort_at + insert_sorted_at proof structure", "status": "completed", "activeForm": "Studying ref... [+2140 chars])
+Now let me add the step_insert + fail lemmas. First, let me check the structure of step_insert in the function:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Add insert_sorted_at_step_insert + fail variants, mirroring 103's... [+7837 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "def not|logical_op.not|def and |logical_op.and", "path": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/Hax/rust_primitives/", "output_... [+47 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "step_insert: after simps and rewrites, term has `do let x \u2190 ... [+2458 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+Now let me add the fail variants and step_pass:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Add step_insert_fail_x, step_insert_fail_v, step_pass, step_pass_... [+13130 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Fix h_cond_false parsing \u2014 extra parens needed around `(!(de... [+8138 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+All step lemmas are now proved. Let me update todos and add the invariants:
+[tool] TodoWrite({"todos": [{"content": "Study reference patterns (103 + 087) for sort_at + insert_sorted_at proof structure", "status": "completed", "activeForm": "Studying ref... [+2144 chars])
+Now add the invariant lemmas (multiset preservation + sortedness):
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Add insert_sorted_at_inv (size + vec_count multiset preservation)... [+11867 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+Multiset invariant proves. Now adding the sortedness preservation:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Add insert_sorted_at_sorted (sortedness preservation under lex_le... [+14238 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+Sortedness preservation proved. Now adding insert_sorted wrappers and sort_at:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_115_max_fill_countObligations.lean", "error_message": "Add insert_sorted wrappers (from empty acc, i=0) and sort_at OOB ... [+18136 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean", "severity": "error"})
+No errors! Let me check for any warnings or sorries:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_115_max_fill_countObligations.lean"})
+Only warnings (unused simp args), no errors and no sorries! Let me update todos and run the build:
+[tool] TodoWrite({"todos": [{"content": "Study reference patterns (103 + 087) for sort_at + insert_sorted_at proof structure", "status": "completed", "activeForm": "Studying ref... [+2114 chars])
+[tool] run_lake_build({})
+Build completed successfully with no errors and no `sorry` warnings — only style warnings about unused simp arguments. All three obligations are now proved.
+[tool] TodoWrite({"todos": [{"content": "Study reference patterns (103 + 087) for sort_at + insert_sorted_at proof structure", "status": "completed", "activeForm": "Studying ref... [+2112 chars])
+## Final output
+
+**File changed:** `proofs/lean/extraction/Clever_115_max_fill_countObligations.lean` (85 → ~1400 lines)
+
+**All three obligations are closed; `lake build` succeeds with no errors and no `sorry` warnings.**
+
+### What was added
+
+**Specification oracles (Nat-level)**
+- `popcount_nat : Nat → Nat` (kept from snapshot, mirroring Rust `popcount_at` via `(n+1)%2 + popcount_nat ((n+1)/2)`)
+- `popcount`, `vec_count` (kept from snapshot)
+- New: `lex_le_u64`, `lex_lt_u64` predicates on `u64` keyed by `(popcount, value)`, with Decidable instances
+- New: `sorted_lex` array predicate
+
+**Scaffolding (adapted from `clever_103_unique_digits`)**
+- usize arithmetic helpers (`usize_add_one_toNat`, `usize_add_one_ok`, etc.)
+- `u64_add_ok` / `u64_add_toNat` (new, using `UInt64.addOverflow_iff`)
+- `push_one` / `push_one_size`
+- `vec_count_succ` / `vec_count_prefix` / `vec_count_append_singleton`
+- `sorted_lex_empty` / `sorted_lex_append_singleton`
+- `lex_le_u64_refl` / `lex_le_u64_trans` / `lex_lt_u64_imp_le` / `not_lex_lt_iff_lex_le` / `lex_lt_of_not_le`
+
+**popcount + lex_less correctness (new — not in any reference example)**
+- `popcount_nat_le_self` via auxiliary induction on a bound (replacing the missing `Nat.strong_induction_on`)
+- `popcount_at_correct` — handles the recursive `n /? 2`, `n %? 2`, `acc +? r` chain with full overflow bookkeeping
+- `popcount_at_zero_correct` — specialized form starting `acc = 0`
+- `lex_less_correct : lex_less a b = RustM.ok (decide (lex_lt_u64 a b))`
+
+**`insert_sorted_at` lemmas (mirroring 103's two-consecutive-size-1-pushes pattern)**
+- OOB: `_oob_done` / `_oob_not_done` / `_oob_not_done_fail`
+- Step-insert (insert `x`, then push `v[i]`): `_step_insert` / `_step_insert_fail_x` / `_step_insert_fail_v`
+- Step-pass: `_step_pass` / `_step_pass_fail`
+- `insert_sorted_at_inv` (size + vec_count multiset preservation)
+- `insert_sorted_at_sorted` (sortedness preservation under lex_le, threading invariants)
+
+**`insert_sorted` + `sort_at` (from 087 pattern)**
+- `insert_sorted_inv` / `insert_sorted_sorted` (wrappers from empty acc, i=0)
+- `sort_at_oob` / `sort_at_step`
+- `sort_at_inv` (size + multiset count) and `sort_at_sorted`
+
+**The three obligation theorems**
+1. `empty_input_yields_empty_output` — direct from `sort_at_oob` on size-0 slice
+2. `output_is_permutation_of_input` — via `sort_at_inv`
+3. `output_is_sorted_by_popcount_then_value` — via `sort_at_sorted`, unfolded at indices `k, k+1`
+
+### Sub-goals that required care
+- **Decidable instances for lex_le_u64 / lex_lt_u64** — these aren't auto-derived; added explicit `unfold; exact inferInstance` instances.
+- **Lean tactic vocabulary without Mathlib** — `Nat.strong_induction_on` and `by_contra` are unavailable; replaced with auxiliary induction on a `≤`-bound and `by_cases h; · exact h; · exfalso; exact …` style.
+- **`popcount_at_correct` overflow bookkeeping** — the accumulator `acc +? n%2` requires `acc.toNat + popcount_nat n.toNat < 2^64` as a carried invariant; closed using `popcount_nat n ≤ n < 2^64`.
+- **`insert_sorted_at` step lemmas with `lex_less`** — the body is nested `do` with three monadic conditionals (`!?done`, `&&?`, `lex_less`). Had to compute `(!done) && (!decide(lex_lt_u64 v[i] x)) = false` as a Bool equation and rewrite under it; required careful parenthesisation around the `decide` term.
+
+### Surviving `sorry`s
+None. All three public obligation theorems are proved.
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+Looking at this target, the key proof obstacles are:
+
+1. **Insertion sort by a COMPOSITE LEX-ORDER KEY** `(popcount, value)` — distinct from every existing sort entry (clever_087, 033, 036, 069, 103) which sort by direct `≤` on values
+2. **Recursive base-2 popcount oracle** — sibling to clever_106/107's base-10 digit recursions but with bit-level mod-by-2
+3. **Bool comparator helper** (`lex_less`) separating comparator correctness from sort correctness, with totality/transitivity lemmas on the lex order
+4. **Insertion sort with `done : Bool` state and TWO consecutive size-1 extends** — pattern inherited from clever_103_unique_digits_modified but applied to a non-direct comparator
+
+The lex-order key sort over a recursively-computed Nat oracle is a genuinely new obstacle not covered by existing library entries. clever_103 is the closest (same insertion-sort body shape) but sorts by direct u64 `≤` after a Boolean filter; the lex-key algebra (totality `¬lex_lt b a ↔ lex_le a b`, transitivity by 4-way case-split, `lex_lt_of_not_le`) is unique here.
+[tool] add_proof_pattern({"features": ["recursion", "strong-induction", "recursive-equation-unfold", "slice-indexing", "vec-output-construction", "extend-from-slice-step", "existential-... [+7345 chars])
+The default name doesn't match the validator's regex (must start with a letter). Looking at existing entries with similar naming (clever_004, clever_032, etc.), I'll use the CLEVER-prefixed form per the source comment.
+[tool] add_proof_pattern({"features": ["recursion", "strong-induction", "recursive-equation-unfold", "slice-indexing", "vec-output-construction", "extend-from-slice-step", "existential-... [+7030 chars])
+ADDED `clever_115_max_fill_count_modified` with 37 features.
+
+Features: recursion, strong-induction, recursive-equation-unfold, slice-indexing, vec-output-construction, extend-from-slice-step, existential-postcondition, usize-add-no-overflow, u64-add-no-overflow, bv-nat-bridge, shared-aux-lemma, nested-recursive-call, multi-clause-contract, bundled-postcondition-projection, sequential-helper-composition, multi-helper-spec-composition, insertion-sort-correctness, sortedness-preservation-invariant, branch-flag-state-parameter, two-consecutive-size-1-extends, carried-upper-bound-invariant, multiset-preservation-via-count, pairwise-non-decreasing-output, recursive-oracle-spec, partial-operator-discharge, division-by-zero, short-input-boundary-theorem, boundary-case-projection, helper-totality-oracle, **lex-order-key-sort**, **lex-order-totality**, **lex-order-transitivity**, **composite-key-sortedness**, **popcount-oracle-base-2**, **base-2-digit-decomposition**, **bool-comparator-helper**, **derived-comparator-correctness**.
+
+Summary: Stable insertion sort on a u64 slice by the composite lex-order key `(popcount, value)` where popcount is a Nat-level base-2 digit-recursion oracle; four-helper composition (popcount_at, lex_less Bool comparator, insert_sorted_at with `done : Bool` flag and two consecutive size-1 extends, sort_at driver) with permutation + lex-sortedness postconditions.
+
+Observations for human readers: The seven new feature tags introduced (lex-order-{key-sort,totality,transitivity}, composite-key-sortedness, popcount-oracle-base-2, base-2-digit-decomposition, bool-comparator-helper, derived-comparator-correctness) capture genuinely new obstacle structure — every existing insertion-sort entry orders by direct `≤` on element values, so the lex-pair algebra (reflexivity/transitivity/totality lemmas, the `sorted_lex` predicate replacing `sorted_asc`) and the Bool-returning comparator helper as a separate proof layer have no precedent in the library. The popcount oracle is a base-2 sibling of clever_106/107's base-10 digit recursions but with a structurally distinct `(n+1)%2 + popcount((n+1)/2)` shape that handles termination without an explicit `n > 0` guard. The two-consecutive-size-1-extends pattern from clever_103 is reused but here paired with a non-direct comparator forcing two lex-typed carried invariants instead of direct-`≤` ones.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260529-010950_115_max_fill_count_stage_notes.json
+[cleanup] freed 528.8MB from benchmarks/claude-opus-4-7/clever_3/115_max_fill_count_modified

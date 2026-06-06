@@ -1,0 +1,484 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260525-023852_024_factorize.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/clever_2/024_factorize/attempted_changes/20260525-023852
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "src/lib.rs"})
+The file already contains a well-structured set of property-based tests. Let me verify they pass.
+[tool] run_cargo_test({})
+All 4 tests pass. The existing test suite already captures the contract well. Here is the summary of the suite as it stands:
+
+## Summary
+
+### Tests in the suite
+
+1. **`empty_for_n_le_one`** — *Failure / edge case (precondition fallback).* Pins down the documented behaviour that for any `n ≤ 1`, `factorize` returns an empty `Vec`. Covers the "no factorization" branch with `n ∈ {-5, ..., 1}`.
+
+2. **`product_of_factors_equals_n`** — *Postcondition (1/3).* The product of the returned factors equals `n`. Independent claim: a buggy implementation returning `[2, 3]` for `n = 12` would still satisfy primality + ordering but fail this.
+
+3. **`every_factor_is_prime`** — *Postcondition (2/3).* Every returned factor is prime (checked against an independent trial-division reference `is_prime`). Independent claim: returning `[1, n]` would satisfy product + ordering but fail this.
+
+4. **`factors_non_decreasing`** — *Postcondition (3/3).* Factors are returned in non-decreasing order. Independent claim: returning `[3, 2]` for `n = 6` would satisfy product + primality but fail this.
+
+Together, these three postconditions fully characterise the canonical prime factorization (existence-by-product, primality of parts, and unique sorted ordering), and the edge-case test covers the `n ≤ 1` branch.
+
+### Properties deliberately omitted
+
+- **Length bounds** (e.g. `factors.len() ≤ log₂(n)`): a derived consequence of "product = n" and "every factor ≥ 2"; would not catch a different valid implementation.
+- **Sum / divisor-function identities** (e.g. σ(n) computed from factor multiplicities): derived facts about factorizations, not part of `factorize`'s own contract.
+- **Idempotence of re-factorizing the product**: follows from `product = n` plus determinism — adds nothing independent.
+- **Comparison against an alternative factorization algorithm**: would just re-state the three postconditions above and inflate the downstream proof obligations.
+- **Behaviour at `i64::MAX` or near-overflow inputs**: the implementation uses `p * p` which can overflow; the proptest range `2..1_000_000` keeps tests in a regime where the function is well-defined, matching the documented domain rather than probing UB-adjacent edges.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Glob({"pattern": "**/Cargo.toml"})
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+[tool] Read({"file_path": "proofs/lean/extraction/clever_024_factorize.lean"})
+The error matches the archive pattern `vec_push_to_extend_from_slice_typed_chunk.rs` — `Vec::push` is unmodeled. I'll rewrite using `extend_from_slice` with a typed `[i64; 1]` chunk.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\nfn factorize_at(n: i64, p: i64, mut acc: Vec<i64>) -> Vec<i64> {\n    if n <= 1 {\n        acc\n    } else if p * p... [+1139 chars])
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\nfn factorize_at(n: i64, p: i64, mut acc: Vec<i64>) -> Vec<i64> {\n    if n <= 1 {\n        acc\n    } else if p * p... [+1150 chars])
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+All three stages pass. Let me verify the extracted Lean looks clean.
+[tool] Read({"file_path": "proofs/lean/extraction/clever_024_factorize.lean"})
+Clean extraction. `factorize_at` is extracted as `partial_fixpoint`, `chunk` carries the size in its type `RustArray i64 1`, and `extend_from_slice` resolves cleanly.
+
+## Final report
+
+### Errors driving the change
+
+`lake build` failed with:
+```
+error: clever_024_factorize.lean:30:9: Unknown identifier `alloc.vec.Impl_1.push`
+error: clever_024_factorize.lean:35:11: Unknown identifier `alloc.vec.Impl_1.push`
+```
+
+The Hax Lean prelude does not model `Vec::push` (it does model `Vec::new`, `Vec::len`, and `Vec::extend_from_slice`).
+
+### Change applied
+
+Archive pattern match: `rewrite_patterns/vec_push_to_extend_from_slice_typed_chunk.rs`.
+
+Replaced both `acc.push(x)` calls with:
+```rust
+let chunk: [i64; 1] = [x];
+acc.extend_from_slice(&chunk);
+```
+
+The **typed let-binding** `let chunk: [i64; 1] = [x]` is essential — without the explicit type ascription, Hax leaves the `RustArray` size parameter as an unsolvable metavariable. With it, the extracted Lean reads `let chunk : (RustArray i64 1) := …`, which routes through `rust_primitives.unsize chunk` and `Impl_2.extend_from_slice` cleanly.
+
+### Library calls inlined
+
+None beyond the `Vec::push → extend_from_slice` swap above.
+
+### Patterns considered but not changed
+
+- **`factorize_at` is already tail-recursive** with a single decreasing measure (`n / p` decreases when the prime divides, `p + 1` increases until `p * p > n`). No `while` loop to rewrite. The function extracts as `partial_fixpoint` — the preferred shape per the recursion-preference rule. The proof stage can discharge this with `Nat.strongRecOn` on a suitable measure (e.g. `n.toNat + (n.toNat - p.toNat)` or just structural induction on the residual range).
+- **Test code uses iterator chains** (`factors.iter().product()`, `for f in &factors`, `factors.windows(2)`), but tests are not extracted by Hax — they sit under `#[cfg(test)]` and are untouched.
+- **No short-circuit `&&`/`||` over partial ops** in the source.
+- **No `loop_invariant!` / `loop_decreases!` annotations** to drop.
+
+### Suspected semantics changes
+
+None. `acc.push(x)` and `acc.extend_from_slice(&[x])` are observationally identical for `Vec<i64>` — both append exactly `x` to the end. The four tests (the `n ≤ 1` edge case and three property-based postconditions over `n ∈ 2..1_000_000`) all pass post-rewrite.
+
+### Hax-degenerate patterns left unresolved
+
+None. Extraction is fully successful — no `sorry` in the body, no `RustM.fail` reachable on test inputs, and `partial_fixpoint` is the proof-friendly shape.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_2/024_factorize/attempted_changes/20260525-023852/*stage2_rust_hax_lean*"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_2/024_factorize/attempted_changes/20260525-023852/*"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_2/024_factorize/attempted_changes/20260525-023852/0002_stage2_rust_hax_lean_patched/metadata.... [+6 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_2/024_factorize/attempted_changes/20260525-023852/0002_stage2_rust_hax_lean_patched/error_con... [+10 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_2/024_factorize/attempted_changes/20260525-023852/0002_stage2_rust_hax_lean_patched/search_re... [+11 chars])
+This patch directly applies an existing pattern (`vec_push_to_extend_from_slice_typed_chunk.rs`). Let me check the error attempt to see if there's anything else worth noting.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_2/024_factorize/attempted_changes/20260525-023852/0001_stage2_rust_hax_lean_error/metadata.js... [+4 chars])
+The error attempt is just a malformed patch — not pattern material. The only successful patch in this log directly applies an already-archived pattern.
+
+## Final report
+
+**Patterns written:** none.
+
+**Attempts inspected:**
+- `0001_stage2_rust_hax_lean_error/` — skipped: status `error` (malformed patch format), no `after.rs` so no known fix to document. Root cause was the same `Vec::push` issue handled in attempt 0002.
+- `0002_stage2_rust_hax_lean_patched/` — skipped: already covered by existing `rewrite_patterns/vec_push_to_extend_from_slice_typed_chunk.rs`. The trigger error explicitly cites that pattern, and the patch is a textbook application (replacing `acc.push(x)` with `let chunk: [i64; 1] = [x]; acc.extend_from_slice(&chunk);`).
+
+**Anything worth a human's attention:** nothing unusual. The rewrite stage cleanly resolved a single known failure mode on the second attempt after a malformed-patch first try.
+
+harvest_rewrite_patterns
+## Summary of changes
+
+The only difference between the original and rewritten source is in `factorize_at`: two occurrences of `acc.push(x)` have been replaced with:
+
+```rust
+let chunk: [i64; 1] = [x];
+acc.extend_from_slice(&chunk);
+```
+
+This is a known Hax rewrite pattern (vec_push → extend_from_slice with a typed length-1 chunk) used because `Vec::push` is unmodeled by Hax.
+
+## Behavior analysis
+
+`acc.push(x)` appends a single element `x` to the end of `acc`. `acc.extend_from_slice(&[x])` copies the elements of the slice `&[x]` (a single element, `x`) to the end of `acc`. Both produce the same resulting vector with identical element order and length. There is no observable behavioral difference:
+
+- Same element appended.
+- Same position (end of the vector).
+- Same resulting length (`len + 1`).
+- No panics introduced; both succeed for any `i64` value.
+
+The rest of the function (`if/else if/else` structure, recursive calls, base cases, arithmetic) is byte-identical. The test module is byte-identical.
+
+No edge case (e.g., `n = i64::MIN`, large primes, etc.) can produce a divergence because the substitution operates only on the vector-append mechanic, which is semantically identical between `push` and `extend_from_slice(&[x])`.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target `clever_024_factorize`, I need to identify its key verification challenges:
+
+1. **`partial_fixpoint` recursion** with non-trivial termination (both `n` shrinks via `/p` and `p` grows via `+1`, exit at `p*p > n`)
+2. **Vec output via `extend_from_slice` with typed `[i64; 1]` chunks** (per the rewrite_patterns comment in the source)
+3. **Signed `i64` arithmetic** with partial `*?` (mul overflow), `%?`, `/?` (signed div + Int64.minValue/-1), `+?`
+4. **Multi-clause contract**: product-of-factors = n / every factor prime / factors non-decreasing
+5. **Wrapper → worker composition** (`factorize` → `factorize_at`)
+6. **Trial-division loop** structure (`d*d > n` exit, advancing `p → p+1`)
+
+Let me spot-check the most promising candidates before finalising.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_prime_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_divisor_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/rescale_to_unit_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/gcd_recursive_modified/src/lib.rs"})
+Based on this review, here are my selections:
+
+```
+proof_patterns/clever_025_remove_duplicates_modified
+proof_patterns/is_prime_modified
+proof_patterns/largest_divisor_modified
+proof_patterns/rescale_to_unit_modified
+proof_patterns/gcd_recursive_modified
+```
+
+## Per-pick rationale
+
+- **`proof_patterns/clever_025_remove_duplicates_modified`** — Near-structural twin. Filter-style Vec output on i64 built via `extend_from_slice` with a typed `[i64;1]` chunk (identical Vec-construction idiom flagged in the target's source comment), recursive helper with conditional inclusion (`count_at` divisibility-style branch), nested call structure (`build_at` calls `count_at` inside its body — same shape as factorize_at's wrapper→worker plus the `n%p==0` decision), and a three-conjunct contract projected from a shared aux. **Covers: `vec-output-construction`, `extend-from-slice-step`, `filter-style-output`, `nested-recursive-call`, `elementwise-output-invariant`, multi-clause contract.**
+
+- **`proof_patterns/is_prime_modified`** — The trial-division skeleton `has_divisor_at n d` with the `d*d > n` √n exit and `d → d+1` advance is *exactly* the inner shape of factorize_at's `else-else` branch. Provides the canonical `has_divisor_at_unfold` lemma jointly discharging the three partial operators `d *? d` / `n %? d` / `d +? 1`, and `mul_fits_of_ok` to recover no-mul-overflow by contradiction from `RustM.ok` — directly reusable for `p *? p`. **Covers: `partial-operator-discharge` for `*?`/`%?`/`+?`, `unsigned-mul-overflow` (adapt to signed), `recursive-equation-unfold`, `ok-result-implies-no-overflow`.**
+
+- **`proof_patterns/largest_divisor_modified`** — The canonical signed-i64 divisibility pattern: `Int64.toInt_mod → Int.tmod_eq_emod_of_nonneg → Int.dvd_of_emod_eq_zero`, partial `%?` discharged by casing on `Int64.minValue && d=-1` and `d=0`, partial `-?` via `BitVec.ssubOverflow + Int64.subOverflow_iff` (mirror for `+?`), and bundled multi-clause projection (divides / strict-bound / maximality) from a single bundled postcondition — directly applicable for "every factor divides n" and for projecting the three contract clauses. **Covers: `divisibility-postcondition`, `signed-int-toInt-bridge`, `tmod-emod-bridge`, `bundled-postcondition-projection`, `partial-operator-discharge`.**
+
+- **`proof_patterns/rescale_to_unit_modified`** — Wrapper→two-worker composition (`rescale_to_unit` → `min_at`+`shift_at`) mirrors factorize→factorize_at, Vec output via `extend_from_slice` typed `[i64;1]` chunk on i64, multi-clause contract derived from a shared `*_aux` lemma. The `short_input_returns_empty` boundary theorem maps directly to factorize's `n ≤ 1 ⇒ Vec::new()` clause. **Covers: `sequential-helper-composition`, `vec-output-construction`, `short-input-boundary-theorem`, `shared-aux-lemma`, `extend-from-slice-step`.**
+
+- **`proof_patterns/gcd_recursive_modified`** — Cleanest `partial_fixpoint` + strong-induction example on a non-trivial decreasing measure with signed-style termination (`b > 0 ⇒ a % b < b`). Pattern for closing a recursive postcondition by IH-on-the-shrinking-argument is what factorize_at needs for its `n /? p` recursion arm; the `b=0`/`d=0` partial-divisor discharge is reusable. **Covers: `partial-fixpoint`, `strong-induction`, `recursive-equation-unfold`, `division-by-zero`, `gcd-rec-identity` (analogous to Euclid step).**
+
+## Gaps
+
+- **Two-argument non-monotone `partial_fixpoint` termination.** No example has `factorize_at`'s shape where one argument decreases (`n /? p`) on some branches and another increases (`p +? 1`) on others, with the loop exit being a *coupled* predicate `p*p > n`. The closest is `is_prime_modified`'s `has_divisor_at` but that uses `strong-induction` not `partial_fixpoint`.
+- **"Every element of a built Vec satisfies a property" (primality oracle invariant).** `clever_025_remove_duplicates_modified` has the Vec construction but the per-element invariant is structural ("count=1"), not arithmetic. No example combines Vec construction with a primality oracle like `clever_038_prime_fib_modified`'s `is_prime_nat`.
+- **Multiplicative running invariant on output (`product = n_init`).** Examples carry additive invariants (`below_zero_modified`, `sum_product_modified` for sum side) but no example threads a multiplicative invariant through a Vec-of-factors construction.
+- **Strict monotonicity / non-decreasing output ordering combined with Vec construction.** `clever_025_remove_duplicates_modified` covers strict monotonicity of *indices* via `List.pairwise_iff_getElem`, but not non-decreasing of *values* arising from an algorithmic order (factorize's `p` only ever grows).
+
+## Rejections
+
+- **`clever_009_rolling_max_modified`** — has the Vec-via-typed-chunk idiom but redundant with rescale_to_unit + clever_025; its `prefix_max_int` oracle shape is less relevant than divisibility/primality reasoning.
+- **`clever_038_prime_fib_modified`** — has `is_prime_nat` oracle which could help with "every factor prime", but the proof is dominated by `native_decide` on a finite Fibonacci range (open-conjecture termination) which doesn't transfer to factorize's unbounded input.
+- **`000_has_close_elements_modified`** — partial_fixpoint over pair counting, no Vec output and no divisibility/factorization reasoning.
+- **`clever_020_find_closest_elements_modified`** — multi-clause contract with bundled projection, but the 2D pair-scan / extremum-witness machinery is alien to factorize's straight 1D recursion.
+- **`sum_product_modified`** — has signed-mul-overflow + paired accumulator but operates over an input slice rather than building output via push.
+- **`gcd_stein_u64_modified`** / **`gcd_while_modified`** — gcd-shape specific, less close to factorization than `gcd_recursive_modified` (already picked for the partial_fixpoint skeleton alone).
+- **`clever_044_triangle_area_modified`** — signed-mul-overflow + signed-div-static-discharge but completely straight-line; the dynamic divisor `p` in factorize means the `signed-div-static-discharge` trick doesn't apply.
+- **`factorial_modified`** / **`sum_to_n_modified`** — recursive with overflow failure but on a single accumulator, no divisibility/Vec construction.
+- **`binomial_u64_modified`** — multi-helper composition with `nchoose` oracle is structurally interesting but binomial-specific machinery (Pascal recurrence, gcd-cancellation) is far from factorize's needs.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Clever_024_factorizeObligations.lean
+[scaffold] registered Clever_024_factorizeObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/Clever_025_remove_duplicatesObligations.... [+6 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/Clever_025_remove_duplicatesObligations.... [+20 chars])
+[tool] Grep({"pattern": "^theorem |^private theorem .* :", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction... [+85 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/Clever_025_remove_duplicatesObligations.... [+36 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_prime_modified/proofs/lean/extraction/Clever_030_is_primeObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_divisor_modified/proofs/lean/extraction/Clever_023_largest_divisorObligations.lean", "limit":... [+5 chars])
+[tool] Grep({"pattern": "^theorem |^/-- ##|^private theorem .*postcondition|^private theorem .*correct", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_diviso... [+116 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_divisor_modified/proofs/lean/extraction/Clever_023_largest_divisorObligations.lean", "offset"... [+20 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/rescale_to_unit_modified/proofs/lean/extraction/Clever_021_rescale_to_unitObligations.lean", "limit":... [+5 chars])
+[tool] Grep({"pattern": "^theorem ", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/rescale_to_unit_modified/proofs/lean/extraction/Clever_021_rescale_to_unitObligati... [+48 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/rescale_to_unit_modified/proofs/lean/extraction/Clever_021_rescale_to_unitObligations.lean", "offset"... [+20 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/gcd_recursive_modified/proofs/lean/extraction/Clever_013_greatest_common_divisorObligations.lean", "l... [+11 chars])
+Now let me check the Hax prelude for the types and operators I'll need.
+[tool] Glob({"pattern": "proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean"})
+Now let me look briefly at how `i64` arithmetic and `Nat.Prime` interact in the references, and confirm `List.prod` works for Int:
+[tool] Grep({"pattern": "Nat.Prime|is_prime|List.prod|\\.prod", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "glob": "*.lean", "output_mode": "files_with_matches"... [+1 chars])
+[tool] Grep({"pattern": "is_prime_nat|Nat.Prime", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_038_prime_fib_modified/proofs/lean/extraction/Clever_038_prime... [+78 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_038_prime_fib_modified/proofs/lean/extraction/Clever_038_prime_fibObligations.lean", "offset":... [+17 chars])
+Now I have a clear picture. Let me write the obligations file:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\nnamespace Clever_024_factorizeObligations\n\n-- Add `theorem` decl... [+4786 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+[tool] mcp__lean__lean_completions({"file_path": "Clever_024_factorizeObligations.lean", "line": 33, "column": 32})
+I'll switch to `foldr` since `List.prod` isn't available:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Integer product of the entries of the output `Vec`. -/\nprivat... [+509 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+Only `sorry` warnings remain. Let me confirm with a `lake build`:
+[tool] run_lake_build({})
+Build succeeds — only the four expected `sorry` warnings remain.
+
+---
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Clever_024_factorizeObligations.lean`
+
+**Helpers added (private):**
+- `factor_product v` — integer product of the `Vec`'s entries (`foldr (· * ·) 1` on `v.val.toList.map (·.toInt)`; `List.prod` is not in the prelude).
+- `is_prime_int p` — standard `2 ≤ p ∧ ∀ k, 2 ≤ k → k < p → ¬ k ∣ p` over `Int`, mirroring `is_prime_nat` in `clever_038_prime_fib_modified`.
+
+**Theorems added (one per contract clause):**
+
+| Theorem | Captures Rust property test |
+|---|---|
+| `factorize_empty_for_n_le_one` | `empty_for_n_le_one` — for all `n ≤ 1`, returns empty `Vec` |
+| `factorize_product_equals_n` | `product_of_factors_equals_n` — product of output equals `n` |
+| `factorize_every_factor_is_prime` | `every_factor_is_prime` — every entry is prime |
+| `factorize_factors_non_decreasing` | `factors_non_decreasing` — entries non-decreasing (stated on consecutive pairs, matching the test's `windows(2)`) |
+
+**Property tests classified as derived facts:** none — all four Rust property tests are genuine contract clauses and got a theorem.
+
+**Feasibility / preconditions.** Universal `factorize n = ok v` is *false* in the Lean model at `n ≈ i64::MAX`: trial-division reaches `p ≈ ⌈√n⌉ + 1`, and `p *? p` overflows `i64` (since `(⌈√(2^63)⌉ + 1)² > i64::MAX`). I therefore added `2 ≤ n.toInt ∧ n.toInt < 2^62` to the three positive postconditions — strictly weaker than the proptest's `n < 10^6`, but enough to keep `p² ≤ 2^62 + 2^32 < 2^63`. The boundary clause (`n ≤ 1`) is universal — no precondition needed, since the function bypasses the loop entirely.
+
+**Uncertainties to flag.** The `2^62` upper bound is a *sufficient* safety bound, not a sharp one. The strongest true precondition is closer to `(⌈√n.toInt⌉ + 1)² < 2^63`, which is unwieldy; `n.toInt < 2^62` is the cleanest form that's both true and easy for the proof stage to discharge from. If the proof stage finds it inconvenient, the bound can be loosened toward the sharp version without changing the contract surface.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 4 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/Clever_025_remove_duplicatesObligations.... [+6 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/Clever_025_remove_duplicatesObligations.... [+20 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/Clever_025_remove_duplicatesObligations.... [+35 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_prime_modified/proofs/lean/extraction/Clever_030_is_primeObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_divisor_modified/proofs/lean/extraction/Clever_023_largest_divisorObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/gcd_recursive_modified/proofs/lean/extraction/Clever_013_greatest_common_divisorObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/rescale_to_unit_modified/proofs/lean/extraction/Clever_021_rescale_to_unitObligations.lean"})
+Now let me look at the README and patterns in the proof_patterns directory:
+[tool] Glob({"pattern": "proof_patterns/recursion_example/**"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/**"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/README.md"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/proofs/lean/extraction/Recursion_exampleObligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proofs/lean/extraction/Clever_024_factorizeObligations.lean"})
+[tool] Glob({"pattern": "**/Clever_024_factorize*"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/**/*.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/**/*.lean"})
+[tool] Grep({"pattern": "partial_fixpoint", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "partial_fixpoint", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/RustM.lean", "output_mode": "cont... [+14 chars])
+[tool] Grep({"pattern": "Int64.toInt_div|Int64.toInt_mod|Int64.divOverflow|Int64.toInt_add_of_not_addOverflow|Int64.addOverflow", "path": "proofs/lean/extraction/.lake/pack... [+36 chars])
+[tool] Grep({"pattern": "Int64", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/SInt/Lemmas.lean", "output_mode": "con... [+25 chars])
+[tool] Grep({"pattern": "additional_int_lemmas|Int64\\.", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/SInt/Basic.le... [+49 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/SInt/Basic.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/SInt/Lemmas.lean"})
+[tool] Grep({"pattern": "Int.tmod|Int.tdiv|tmod_eq_emod|Int64.toInt_div|Int64.toInt_mod|divOverflow|divOverflow_iff", "path": "proofs/lean/extraction/.lake/packages/Hax", "... [+35 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/Int/DivMod/Lemmas.lean"})
+[tool] Grep({"pattern": "toInt_div|toInt_mod|toInt_div_of", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/SInt/Lemmas... [+40 chars])
+[tool] Grep({"pattern": "alloc\\.vec\\.Impl\\.new|alloc\\.vec\\.Impl_2\\.extend_from_slice|alloc\\.vec\\.Vec", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_... [+28 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/epilogue/alloc.lean"})
+[tool] Grep({"pattern": "unsize|RustArray", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "unsize|RustArray\\.ofVec", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/hax/array.lean", "output_... [+17 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/hax/array.lean"})
+Let me check the structure of the file using LSP tools first:
+[tool] mcp__lean__lean_file_outline({"file_path": "Clever_024_factorizeObligations.lean"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+Let me start by writing the easy theorem and test:
+[tool] mcp__lean__lean_goal({"file_path": "Clever_024_factorizeObligations.lean", "line": 76})
+[tool] Grep({"pattern": "Seq|sequence\\.Seq", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/sequence.lean", "output_mode": ... [+28 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/sequence.lean"})
+[tool] Grep({"pattern": "partial_fixpoint|spec\\] lemma|factorize_at", "path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "output_mode": "content"})
+[tool] Read({"file_path": "proofs/lean/extraction/clever_024_factorize.lean"})
+Let me test the simple boundary theorem first:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Failure/edge clause: for any `n \u2264 1`, `factorize n` retur... [+1114 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "start_line": 72, "end_line": 90})
+Let me write a draft for the unfold and test if `partial_fixpoint` allows unfolding:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Postcondition 1 (product of factors equals `n`).\n\n    Captur... [+2085 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Test: can we unfold factorize_at? -/\nprivate theorem test_unf... [+1326 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Test: can we unfold factorize_at? -/\nprivate theorem test_unf... [+1412 chars])
+Let me look for Int64 specific div/mod lemmas:
+[tool] Grep({"pattern": "Int64\\.toInt_div|Int64\\.toInt_mod", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "content", "head_limit": 20})
+[tool] Grep({"pattern": "toInt_div_of_ne_right|toInt_mod", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/SInt/Lemmas_... [+57 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/SInt/Lemmas_Int128.lean", "offset": 490, "limit": 100... [+1 chars])
+Let me make a big iteration. First add helper lemmas and the structural step lemmas:
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean"})
+Let me add the numeric helper lemmas first:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Failure/edge clause: for any `n \u2264 1`, `factorize n` retur... [+16194 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+[tool] mcp__lean__lean_multi_attempt({"file_path": "Clever_024_factorizeObligations.lean", "line": "76", "snippets": "[\"example (p : Int) : 0 \u2264 p * p := mul_self_nonneg p\", \"example (p : In... [+253 chars])
+[tool] mcp__lean__lean_completions({"file_path": "Clever_024_factorizeObligations.lean", "line": 76, "column": 10})
+[tool] mcp__lean__lean_leansearch({"query": "a * a is non-negative integer"})
+[tool] Grep({"pattern": "mul_self_nonneg|Int\\.mul_self_nonneg", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "Int\\.mul_nonneg", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "content", "head_limit": 5})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- `p *? p = pure (p * p)` when `p.toInt * p.toInt` fits in `i64`... [+3565 chars])
+Now fix the other places using `push_neg` and `mul_self_nonneg` in step lemmas:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  rw [mul_self_pure p h_p_nn h_pp_fits]\n  simp only [pure_bind]\n... [+1154 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  rw [mul_self_pure p (by omega) h_pp_fits]\n  simp only [pure_bin... [+2227 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  rw [mul_self_pure p (by omega) h_pp_fits]\n  simp only [pure_bin... [+2164 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "offset": 210, "limit": 15})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  have h_tdiv : (n / p).toInt = n.toInt.tdiv p.toInt :=\n    Int64... [+326 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "offset": 285, "limit": 15})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-! ## Numeric helper lemmas (i64 \u21c4 Int bridges). -/\n\npriva... [+635 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  -- Now we need to reduce unsize and extend_from_slice\n  rw [sho... [+1598 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "offset": 365, "limit": 20})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  -- Reduce unsize and extend_from_slice for the [p] chunk\n  rw [... [+1753 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+Let me now write the main correctness lemma and derive the three obligations. I'll start with the signature and obligation derivations:
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "offset": 435, "limit": 55})
+Let me first write the lemma signature and derive the three obligations from it. I'll start with a placeholder body for the main lemma and iterate:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Failure/edge clause: for any `n \u2264 1`, `factorize n` retur... [+7568 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "offset": 456, "limit": 12})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  obtain \u27e8d, hd\u27e9 := h_dvd\n  -- d > 0:\n  have h_n_pos :... [+1181 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  have h_m_lt_p : m < p := by\n    by_contra h\n    have h_p_le_m ... [+456 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "Int\\.lt_or_le|Int\\.le_min|Int\\.min_le|Int\\.min_eq|Int\\.lt_or_ge", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "files_with_... [+27 chars])
+[tool] Grep({"pattern": "lt_or_ge|lt_or_le|Int.lt_or", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "head_limit": 20})
+[tool] Grep({"pattern": "Int.min_eq|Int.le_min|Int.min_le|Int\\.lt_or_ge", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "head_limit": 10... [+1 chars])
+[tool] Grep({"pattern": "min_eq_left|le_min_iff|min_le_left", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "head_limit": 5})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\nprivate theorem is_prime_of_no_small_divisor (n : Int) (p : Int)\n... [+4574 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+Now let me replace the three obligation sorries with proofs using `factorize_at_correct`:
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "offset": 595, "limit": 50})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Postcondition 1 (product of factors equals `n`).\n\n    Captur... [+6047 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "offset": 615, "limit": 40})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  rw [factorize_to_factorize_at n h_lo]\n  have h_n_lo : 1 \u2264 ... [+471 chars])
+Now let me fix the `Array.mem_toList` and `Array.length_toList` issues:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  refine \u27e8v, hres, ?_\u27e9\n  intro k hk\n  have h_mem : (v.... [+523 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  refine \u27e8v, hres, ?_\u27e9\n  intro k hk\n  -- Pairwise on t... [+2583 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "Array\\.mem_toList|Array\\.getElem_toList|Array\\.toList_get", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "he... [+14 chars])
+[tool] Grep({"pattern": "Array\\..*toList|getElem_toList", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "head_limit": 15})
+[tool] Grep({"pattern": "val\\.toList", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified", "output_mode": "content", "head_limit":... [+4 chars])
+[tool] Grep({"pattern": "Pairwise.*iff_getElem|pairwise_iff_getElem", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "head_limit": 15})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/Clever_025_remove_duplicatesObligations.... [+34 chars])
+[tool] Grep({"pattern": "getElem_mem", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "head_limit": 10})
+[tool] mcp__lean__lean_completions({"file_path": "Clever_024_factorizeObligations.lean", "line": 665, "column": 15})
+Let me simplify the obligation proofs by working with `v.val.toList` directly:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Postcondition 2 (every returned factor is prime).\n\n    Captu... [+5913 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_hover_info({"file_path": "Clever_024_factorizeObligations.lean", "line": 688, "column": 15})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  have h_p_lo : 2 \u2264 (2 : i64).toInt := by rw [i64_two_toInt];... [+153 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Postcondition 2 (every returned factor is prime).\n\n    Captu... [+6291 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- Helper: array \u2192 list indexing bridge (definitionally `rfl... [+5259 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  subst hval\n  refine \u27e8v, hres, ?_\u27e9\n  intro k hk\n  ap... [+402 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "offset": 510, "limit": 40})
+Now let me write the main correctness proof. This is the longest part:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\nprivate theorem factorize_at_correct\n    (n p : i64) (acc : alloc... [+15755 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n/-- The \"size-bound preserved across one push\" arithmetic. -/\np... [+3445 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n        have h_n_ge_p : p.toInt \u2264 n.toInt := by\n          --... [+687 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n          have h_p_prime : is_prime_int p.toInt := by\n           ... [+700 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n          have h_no_small_new :\n              \u2200 d : Int, 2 \... [+1468 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n            -- n/p.toNat < n.toNat (since n \u2265 2, p \u2265 2)\... [+2048 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n          \u00b7 intro x hx\n            rcases List.mem_cons.mp h... [+322 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  have h_lift : (2 * (n / p).toNat : Int) \u2264 (n.toNat : Int) :... [+464 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  have h_np_nn : 0 \u2264 n / p := Int.ediv_nonneg h_n_nn (by omeg... [+2312 chars])
+Now let me fix the dvd transitivity and mul issues:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n          have h_p_prime : is_prime_int p.toInt := by\n           ... [+855 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n            have h_np_p_eq_n : (n.toInt / p.toInt) * p.toInt = n.t... [+904 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n            -- n/p < n (since n \u2265 2, p \u2265 2)\n           ... [+1883 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n  have h_2np_nat : 2 * (n / p).toNat \u2264 n.toNat := by\n    hav... [+753 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+Excellent! The file compiles. Let me clean up the warning and run the build:
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "offset": 748, "limit": 10})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_024_factorizeObligations.lean", "patch": "<<< SEARCH\n          \u00b7 -- Product: p * (rest product) = p * (n/p) = n\n ... [+431 chars])
+[tool] run_lake_build({})
+The build succeeded! Let me run final diagnostic check:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_024_factorizeObligations.lean"})
+All proofs complete with no `sorry`, no warnings, and `lake build` succeeds.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Clever_024_factorizeObligations.lean`
+
+**All four obligations closed:**
+
+1. `factorize_empty_for_n_le_one` — straightforward unfold + decide for the `n ≤ 1` branch.
+2. `factorize_product_equals_n` — derived from `factorize_at_correct`.
+3. `factorize_every_factor_is_prime` — derived from `factorize_at_correct`.
+4. `factorize_factors_non_decreasing` — derived from `factorize_at_correct` via `List.pairwise_iff_getElem`.
+
+**Architecture:**
+- **Numeric helpers** (`mul_self_pure`, `add_one_pure`, `mod_pure`, `div_pure`, `toInt_mod_of_nonneg`, `toInt_div_of_nonneg`) — discharge the partial `i64` operators when `p > 0`, `n ≥ 0`, and `p² < 2^63`.
+- **Branch step lemmas** (`factorize_at_n_le_one`, `factorize_at_pp_gt_n`, `factorize_at_dvd_step`, `factorize_at_nondvd_step`) — unfold one level of `factorize_at` for each of the four conditional branches.
+- **`is_prime_of_no_small_divisor`** — standard "smallest factor ≤ √n" primality argument from `h_no_small` + `p² > n`.
+- **`acc_size_bound_after_div`** — proves `(acc + 1) + (n/p).toNat < USize64.size` from `acc + n.toNat < USize64.size` when `p ∣ n, p ≥ 2, n ≥ 2`.
+- **`factorize_at_correct`** — main strong-induction lemma on measure `n.toInt.toNat + (2^33 - p.toInt.toNat)`. Tracks `acc.val.toList = old_acc ++ rest` where `rest` is a list of primes ≥ p, non-decreasing, with product = n.
+
+**Sub-goals that took the most work:**
+- **The recursion measure decrease** — needed to show `(n/p).toNat < n.toNat` (decomposed via `n = p*q ⇒ n/p = q < p*q = n`).
+- **Cast bridges Int ↔ Nat** — `push_cast`/`exact_mod_cast` plus explicit `Int.toNat_of_nonneg` equations to lift integer inequalities through `(·).toNat`.
+- **`d ∣ (n/p) ⇒ d ∣ n`** — discharged by witnessing `n/p * p = n` (since `p ∣ n`).
+- **The accumulator's `extend_from_slice` step** — replaced `pure_bind` with `RustM_ok_bind` (`RustM.ok x >>= f = f x`) after each `dif_pos` rewrite of `extend_from_slice`.
+
+**Preconditions on positive postconditions:** unchanged — `2 ≤ n.toInt ∧ n.toInt < 2^62` (as set by the obligations stage; the proof shows this is sufficient to avoid `p*p` overflow throughout the trial-division loop).
+
+**No `sorry`, no `axiom`, no weakened obligations.**
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+I'll analyze the proof structure of `024_factorize_modified` against the existing library.
+
+**Key obstacles in this proof:**
+
+1. **Prime factorization output**: Recursive descent producing an ordered list of prime factors, with three simultaneously-maintained invariants (all-prime via `is_prime_int`, non-decreasing via `List.Pairwise`, product = n).
+
+2. **Two-variable combined induction measure**: `Nat.strongRecOn` on `n.toInt.toNat + (2^33 - p.toInt.toNat)` — `n` strictly decreases in the divides branch, `p` strictly increases in the non-divides branch. Existing recursions either decrement a single variable (`largest_divisor_modified`, `is_prime_modified`), descend on `size − i` (slice scans), or use a multiplicative 2D measure (`clever_020`). This additive "one-up-one-down unified via bound subtraction" shape is structurally new.
+
+3. **Carried `no_small_divisor` invariant**: An inductive invariant `∀ d ∈ [2, p), ¬ d ∣ n` re-derived across both recursive branches — used both to certify each pushed `p` is prime (via composition with `p ∣ n`) and, on the `p² > n` exit, to certify the final element `n` is prime via the standard `factor-pair-min-witness` argument.
+
+4. **List-cons output invariant**: `rest` built via `p :: rest` from IH (rather than the index-list approach of `clever_025_remove_duplicates_modified` or the elementwise-index approach of `clever_009_rolling_max_modified`).
+
+5. Familiar mechanics: `extend-from-slice-step` with typed `[i64;1]` chunks, signed `%?`/`/?`/`+?`/`*?` discharge, `tmod-emod-bridge` for nonneg dividend, three-conjunct projection from one bundled aux.
+
+**Comparison to closest existing entries:**
+- `largest_divisor_modified`: also recursive trial-division on i64 — but single descending variable, no factorization-list output, no carried "no smaller divisor" invariant.
+- `is_prime_modified`: shares the sqrt-bound + factor-pair argument — but returns a Bool, single variable, no vec output, no list-of-factors structure.
+- `clever_025_remove_duplicates_modified`: similar vec-of-elements output via extend-from-slice + Pairwise — but slice-driven (single `size − i` measure), index-list spec rather than recursive list-cons, no number-theoretic invariant.
+
+None of these subsume the combined-measure + carried-divisor-invariant + prime-factorization-list shape. This is worth adding as a template for "recursive number-theoretic decomposition producing an ordered list with multiple coupled invariants."
+[tool] add_proof_pattern({"features": ["recursion", "strong-induction", "recursive-equation-unfold", "signed-int-toInt-bridge", "signed-overflow", "partial-operator-discharge", "divisio... [+3491 chars])
+[tool] add_proof_pattern({"features": ["recursion", "strong-induction", "recursive-equation-unfold", "signed-int-toInt-bridge", "signed-overflow", "partial-operator-discharge", "divisio... [+3487 chars])
+ADDED `factorize_modified` — features: recursion, strong-induction, recursive-equation-unfold, signed-int-toInt-bridge, signed-overflow, partial-operator-discharge, division-by-zero, tmod-emod-bridge, bv-nat-bridge, usize-add-no-overflow, vec-output-construction, extend-from-slice-step, existential-postcondition, bundled-postcondition-projection, multi-clause-contract, shared-aux-lemma, factor-pair-min-witness, sqrt-bound-primality-int, two-variable-combined-measure, one-up-one-down-induction, carried-no-small-divisor-invariant, prime-factorization-list-output, pairwise-non-decreasing-output, list-cons-output-invariant, running-accumulator-invariant, overflow-bound-precondition. Summary: recursive trial-division prime factorization on i64 emitting an ordered Vec<i64>, with the distinctive two-variable combined measure `n.toNat + (2^33 − p.toNat)` decreasing in both arms (n↓ on divides, p↑ on non-divides) and a carried `no_small_divisor` invariant doing double duty for both pushed-element primality and final-element primality at the √n exit.
+
+Observations for human readers: (i) the renamed `name` is `factorize_modified` because pattern names must start with a letter (the default `024_factorize_modified` was rejected — worth flagging upstream if numeric-leading benchmark names are common); (ii) the combined-measure pattern is a natural template for any "ascending search variable + descending value variable" recursion (Euclidean-style algorithms, GCD by subtraction with side accumulator, etc.) and may be worth elevating to a generic structural tag; (iii) the carried-divisor-invariant idiom — propagating a `∀ d ∈ [bound₀, bound), ¬P(d, n)` claim through a search that increments `bound` — generalizes beyond primality to any "search exhausted small witnesses" recursion.
+
+ADDED `factorize_modified`.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260525-023852_024_factorize_stage_notes.json
+[cleanup] freed 525.9MB from benchmarks/claude-opus-4-7/clever_2/024_factorize_modified

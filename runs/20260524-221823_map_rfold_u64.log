@@ -1,0 +1,394 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260524-221823_map_rfold_u64.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "src/lib.rs"})
+The file already contains the original tests plus two property-based tests. Let me verify they pass with `cargo test`.
+[tool] run_cargo_test({})
+All 4 tests pass. Here is a summary of the property-based test suite.
+
+## Summary
+
+### Contract clauses captured
+
+**`empty_range_returns_init_without_calling_closures`** — Captures the *failure/precondition* clause: when `iter` is empty, neither `f` nor `g` is ever invoked, and the result is exactly `init`. The test uses panicking closures so a buggy implementation that called either on an empty range would be caught. Edge values (`0..0`, `5..5`, `u64::MAX..u64::MAX`) and edge `init` values (`0`, `1`, `42`, `u64::MAX`) are covered.
+
+**`matches_iter_rfold_specification`** — Captures the *main postcondition*: `Map { iter, f }.rfold(init, g)` equals the reference computation `iter.rfold(init, |a, e| g(a, f(e)))`. This single grid-driven test pins down two independent semantic claims:
+- (a) `f` is applied to *every* element before `g` sees it, and
+- (b) elements are folded in *right-to-left* order.
+
+Claim (b) is genuinely independent of (a) because the closure grid includes non-commutative `g`s (`|a,x| a*10 + x`, `|a,x| a-x`); an implementation that traversed left-to-right would disagree with the reference on at least one input. The grid also includes the empty range, a singleton, and a pair — the smallest case that distinguishes traversal direction.
+
+### Properties deliberately excluded
+
+- **Algebraic identities of `g` on the result.** E.g. "if `g` is commutative, `rfold` agrees with `fold`." This is a property of `g`, not of `Map::rfold`; it's already exercised by `rfold_equals_fold_for_addition`, and adding more such tests creates extra downstream proof obligations for no contract coverage.
+- **Distributive/linearity claims** ("`rfold(init+k, ...)` shifted by `k`", etc.). These are facts about specific choices of `g`, not about `Map::rfold`.
+- **Composition laws** ("mapping with `f` then `g` equals mapping with `g ∘ f`"). True, but derived from the postcondition tested by `matches_iter_rfold_specification` — adding it would duplicate the same contract.
+- **"Shifted range" identity** (`Map{0..n, |x|x+k}.rfold == (k..n+k).rfold`). Already covered as a concrete sanity test (`rfold_matches_shifted_rfold`); generalizing it adds no new contract content beyond what `matches_iter_rfold_specification` already pins down.
+- **Length / call-count invariants** ("`g` is called exactly `iter.len()` times"). Indirectly enforced by agreement with the reference rfold (which itself walks each element exactly once); a separate test would add a proof obligation without isolating a new contract clause.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+Looking at the original source, I can identify two Hax-incompatibility patterns that apply:
+
+1. **`map_fold` returns `impl FnMut(u64, u64) -> u64`** — matches `return_impl_fnmut_unfixable.rs` (HAX0001 on associated-type equality of `FnOnce::Output` parent trait).
+2. **`Map::rfold` calls `Range::rfold`** — matches the sibling pattern `iter_fold_to_while_loop.rs`: `Range::rfold` is not modeled in the Hax Lean prelude.
+
+The combined fix (per `iter_fold_to_while_loop.rs` for `Range::fold`, adapted to `rfold`):
+- Drop the `map_fold` helper entirely (its only caller is `rfold`).
+- Change `g: impl FnMut(u64, u64) -> u64` → `g: fn(u64, u64) -> u64` (closures in tests are non-capturing so they coerce to `fn` pointers).
+- Inline `rfold` as a `while` loop walking from `end` down to `start`, applying `self.f` to each index.
+
+Let me first verify the baseline state, then apply the rewrite.
+[tool] run_cargo_test({})
+Baseline passes. Now apply the rewrite.
+[tool] write_working_file({"path": "src/lib.rs", "overwrite": true, "error_message": "Hax incompatibility: (1) `map_fold` returns `impl FnMut(u64, u64) -> u64` which triggers HAX0001 \"U... [+5830 chars])
+[tool] run_cargo_test({})
+Tests pass. Now Hax extraction:
+[tool] run_cargo_hax_into_lean({})
+Hax extraction succeeds. Now lake build:
+[tool] run_lake_build({})
+All three stages pass: `cargo test` ✓, `cargo hax into lean` ✓, `lake build` ✓.
+
+Let me inspect the extracted Lean to verify it's not Hax-degenerate (no constant-0 measure that matters, no `sorry`, no `pureP` failure):
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/map/map_rfold_u64_modified/proofs/lean/extraction/map_rfold_u64.lean"})
+The extraction is clean:
+- `while_loop` combinator (the supported one) — not `while_loop_return`.
+- No `sorry`, no degenerate body.
+- The constant-0 termination measure on line 36 is harmless here: no `#[hax_lib::requires(...)]` on the function, so no `@[hax_spec]` auto-spec is generated (per the rules: "Without `requires`, no auto-spec is generated and the constant-`0` measure is harmless").
+- No `loop_invariant!` → no `pureP` synthesis to fail.
+- No short-circuit `&&`/`||` over partial ops.
+
+Why not tail recursion instead of `while`? The function takes a `Range<u64>` from the user, so iteration depth is data-dependent and can exceed the ~10⁵ stack budget — the recursion-preference rule's "do NOT rewrite when … iteration depth is unbounded or could be very large" applies. The sibling pattern `iter_fold_to_while_loop.rs` made the same call for `Map::fold`.
+
+---
+
+## Summary
+
+**Patterns matched and applied:**
+
+| Pattern (archive entry) | Symptom it would have produced | Fix |
+|---|---|---|
+| `return_impl_fnmut_unfixable.rs` | `map_fold` returning `impl FnMut(u64, u64) -> u64` → HAX0001 "Unsupported equality constraints on associated types of parent trait" (`FnOnce::Output` on `FnMut`'s parent) | Deleted the `map_fold` helper — its only caller was `Map::rfold`, which now inlines the composition directly. |
+| `iter_fold_to_while_loop.rs` (adapted to `rfold`) | `Range::rfold` is not modeled in the Hax Lean prelude → `Unknown identifier core_models.ops.range.Range.rfold` at `lake build` | Inlined as a back-to-front `while` loop: read `self.iter.start`/`.end` directly, walk `end` down to `start`, apply `(self.f)(end)` then `g`. |
+| `assoc_type_equality_on_parent.rs` (parameter form) | `g: impl FnMut(u64, u64) -> u64` would hit the same HAX0001 once the body no longer hides it | Changed parameter to `g: fn(u64, u64) -> u64`. All test callers pass non-capturing closures, which coerce to `fn`. |
+
+**Library calls inlined:** None (no `.abs()`/`.pow()`/`.wrapping_*`/`.checked_*` in the source).
+
+**Patterns considered but not changed:**
+- **`while` → tail recursion:** considered per the recursion-preference rule, rejected because `Range<u64>` makes iteration depth data-dependent and unbounded.
+- **Constant-0 `loop_decreases`** in extracted Lean: documented as harmless because no `#[requires]` ⇒ no auto-spec.
+
+**Semantic-change risk:** The `g` parameter went from `impl FnMut` to `fn`, which forbids mutable captures. Tests only pass non-capturing closures (`let g = |a, b| 2*acc + b;`-style, and `panicking_g`), all of which coerce fine — verified by `cargo test` passing post-rewrite.
+
+**Hax-degenerate patterns left for proof stage:** None. The extracted Lean uses the supported `rust_primitives.hax.while_loop` combinator with a clean two-element tuple state `⟨acc, _end⟩`, exactly the shape the proof stage's `Spec.MonoLoopCombinator.while_loop` lemma is designed for.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823/*"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823/*_stage2_rust_hax_lean_*/"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823/*/metadata.json"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823/**/metadata.json"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823/0001_stage2_rust_hax_lean_written/metadata.json"... [+1 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823/0001_stage2_rust_hax_lean_written/error_context.... [+5 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823/0001_stage2_rust_hax_lean_written/before.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823/0001_stage2_rust_hax_lean_written/after.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/rewrite_patterns/iter_fold_to_while_loop.rs"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/map/map_rfold_u64/attempted_changes/20260524-221823/**/*"})
+## Final report
+
+**Patterns written:** none.
+
+**Attempts inspected:**
+
+- `0001_stage2_rust_hax_lean_written` — **skipped**. Two reasons:
+  1. Status is `written` (full-file rewrite, `change_count: 0`), not `patched` — per the workflow only `*_patched/` attempts are pattern-worthy, and there's no `search_replace.txt` to mine.
+  2. Even setting the status aside, the root causes are already covered:
+     - `impl FnMut(...) -> _` return type → `return_impl_fnmut_unfixable.rs`
+     - `Range::rfold` (an iterator-combinator with `FnMut(Acc, Self::Item) -> Acc` bound) → `iter_fold_to_while_loop.rs`, whose header explicitly generalizes to "`Range::fold` (or any iterator-combinator method whose bound is `FnMut(Acc, Self::Item) -> Acc`)". The applied fix (drop the helper, inline as a `while` loop, replace `impl FnMut` parameter with a `fn` pointer) is the exact recipe that pattern already documents — only the loop direction differs (`end` down to `start` instead of `start` up to `end`), which is not a new mechanical insight.
+
+**Flagged for a human:** nothing. The single attempt looks consistent with existing coverage; no confusing entries.
+
+harvest_rewrite_patterns
+## Summary of changes
+
+The rewrite removes the `map_fold` helper (which returned `impl FnMut(u64, u64) -> u64`) and the delegation to `Range::rfold`, replacing them with a direct inlined `while` loop that walks `end` down to `start`. The closure-trait parameter `impl FnMut(u64, u64) -> u64` was also tightened to a `fn(u64, u64) -> u64` pointer. Tests are unchanged.
+
+## Behavior analysis
+
+**Loop semantics.** `Range::<u64>::rfold(init, h)` is defined via repeated `next_back`, which on each call (while `start < end`) decrements `end` by 1 and yields the new `end`. So it visits `end-1, end-2, …, start` in that order, computing `acc = h(acc, elt)`. With `h = map_fold(f, g) = |acc, elt| g(acc, f(elt))`, each step is `acc = g(acc, f(elt))`.
+
+The rewritten loop:
+```rust
+while end > start {
+    end = end - 1;
+    acc = g(acc, (self.f)(end));
+}
+```
+visits exactly `end-1, end-2, …, start` and applies `acc = g(acc, f(elt))` per step. Identical order, identical per-step computation.
+
+**Empty range.** Both versions take `init` and don't invoke `f` or `g` when `start >= end`. The `while end > start` guard handles `start == end` and the (degenerate) `start > end` case the same way `next_back` would (returning `None` immediately).
+
+**Underflow.** `end = end - 1` only runs after the guard `end > start`, and since `start: u64 >= 0`, we have `end >= 1` at that point, so no underflow. Same effective guard as `next_back`.
+
+**Signature tightening (`impl FnMut → fn`).** This narrows the set of accepted callers (no captured-state closures), but on any input both versions accept, behavior is identical. All in-crate test sites pass non-capturing closures or explicit `fn` pointers, which coerce fine. This is an API change, not a runtime-behavior divergence on accepted inputs.
+
+**No panicking arithmetic introduced.** The only arithmetic is `end - 1` under a guard that makes it safe.
+
+The inlining of `Range::rfold` + `map_fold` into the explicit back-to-front loop is faithful on every input.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target, the key obstacles are:
+
+**From Lean extraction (`map_rfold_u64.lean`):**
+- `rust_primitives.hax.while_loop` form with mutable state tuple `⟨acc, _end⟩`
+- Body calls two higher-order function fields: `Map.f : u64 → RustM u64` and `g : u64 → u64 → RustM u64` (both can fail in the model)
+- Partial subtraction `_end -? 1` discharged by `_end >? start` guard
+- u64 throughout — no signed obstacles
+
+**From Rust source:**
+- `Map` struct with `f: fn(u64) -> u64` field — exact match with one existing example
+- Contract is "matches `iter.rfold(init, |a,e| g(a,f(e)))`" — needs a recursive Lean-side reference spec and a loop invariant linking partial accumulator to partial fold
+
+Let me confirm the Map shape and conditional-totality pattern in the closest candidate:
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/map_next_u64_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/while_example/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/max_odd_part_modified/src/lib.rs"})
+I have enough confirmation. The selection follows.
+
+---
+
+**Selected examples:**
+
+```
+proof_patterns/map_next_u64_modified
+proof_patterns/while_example
+proof_patterns/max_odd_part_modified
+proof_patterns/gcd_while_modified
+proof_patterns/trailing_zeros_u64_modified
+```
+
+**Per-pick rationale:**
+
+- **`proof_patterns/map_next_u64_modified`** — *Identical `Map` struct* (`iter: Range<u64>`, `f: fn(u64)->u64`). Has the canonical `higher-order-function-field` + `conditional-totality-hypothesis` + `record-with-update` + `branch-split-totality` patterns. Same `f : u64 → RustM u64` semantics in the extracted Lean — proof stage needs to thread `self.f start = RustM.ok r` exactly as here, and the target additionally has the binary `g : u64 → u64 → RustM u64` requiring the same conditional totality but two-argument.
+
+- **`proof_patterns/while_example`** — Closest match to the *underlying loop shape*: `rust_primitives.hax.while_loop` with mutable state, partial subtraction (`x -= b` ≅ `_end -= 1`) discharged via the `loop_guard ⇒ no-underflow` argument, Lean-side invariant strengthening via `triple-to-equation` (the skill's exact warning about pureP/grind failing applies — target also can't express `acc = rfold_spec ...` at the Rust level).
+
+- **`proof_patterns/max_odd_part_modified`** — Canonical *"outer while loop whose body calls a callable returning `RustM`"* pattern. The `helper-triple-in-loop-body` + `triple-to-equation` composition step (`mo_body_eq` consumes the helper's existential to rewrite the body to `pure ⟨new_best, i+1⟩`) is the exact shape needed to thread `f(end)` and `g(acc, f(end))`'s `RustM.ok` results through the loop body for `map_rfold`. Also demonstrates `bundled-postcondition-projection` for the multi-clause contract (empty-range identity + fold-spec match).
+
+- **`proof_patterns/gcd_while_modified`** — Minimal *while loop with a tuple-state loop invariant carrying a closed-form quantity* (`Nat.gcd a b = Nat.gcd a₀ b₀`). The target needs the analogous invariant `acc = rfold_spec init start _end f g` with state `⟨acc, _end⟩` — same two-element tuple, same `triple-to-equation` + `bv-nat-bridge` mechanics, just decrement-end instead of `(a,b) ↦ (b,a%b)`.
+
+- **`proof_patterns/trailing_zeros_u64_modified`** — Canonical *count-and-update while-loop invariant linking the accumulator to a witness through a recursive identity* (`x₀ = y · 2^count`). The target's invariant `acc = ⟨partial rfold over numbers popped so far⟩` has the same structural shape: relate one mutable variable to a function of the other plus an oracle. Also the cleanest reference for `RustM.Triple_iff_BitVec` + `Spec.MonoLoopCombinator.while_loop` two-stage extraction.
+
+**Gaps (signals for future library additions):**
+- *No example proves "loop matches a higher-order reference fold/rfold spec"* — closest is `gcd_while_modified` (proves a Nat-level identity) and `trailing_zeros_u64_modified` (proves a multiplicative identity), but neither carries an oracle parameterised by a callable. The proof stage will need to invent a Lean-level `rfold_spec (f g : u64 → ...) ...` recursive oracle without a worked template.
+- *No example has TWO higher-order function parameters with conditional-totality hypotheses* — `map_next_u64_modified` only has one (`self.f`). The proof stage must extend that pattern to the pair `(self.f, g)`.
+- *No example proves a right-to-left/reverse-iteration spec* — would need to recurse the oracle from the high end downward, no existing reference.
+
+**Rejections (considered, dropped):**
+- `map_next_u64_modified` already taken — but note: it is a *straight-line `if/else`*, not a loop, so it can't carry the loop-invariant burden alone; hence the four loop-shaped picks alongside it.
+- All `partial-fixpoint` / `recursion` examples (recursion_example, gcd_recursive, sqrt_u64, binomial, contains_u64, factorial, sum_to_n, abs_diff_i64, below_zero, clever_*, sum_product, rescale_to_unit, etc.) — target is a `rust_primitives.hax.while_loop`, not `partial_fixpoint`; the strong-induction-over-recursive-call machinery is the wrong template.
+- All bit-trick / power-of-two examples (`average_floor_u64`, `average_ceil_u64`, `is_size_align_valid_usize`, `padding_needed_for_usize`, `repeat_packed_usize`, `repeat_usize`, `gcd_stein_u64`) — target has no bit manipulation, no `bv_decide` opportunity.
+- All signed-arithmetic / overflow-pinning examples (`abs_diff_i64`, `triangle_area`, `add_one`, `square`, `largest_divisor`, `truncate_number`) — target's only partial op is `_end -? 1`, fully guarded by `_end > start`; no `integerOverflow` clause to prove.
+- `slice_get_u64`, `clamp`, `min`, `is_zero`, `saturating_sub` — straight-line scalar proofs, no loop machinery.
+- `is_prime_modified` — has nice `partial-operator-discharge` + loop-ish reasoning but is recursive with two strong-induction measures; structural overkill, would mislead toward partial_fixpoint.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Map_rfold_u64Obligations.lean
+[scaffold] registered Map_rfold_u64Obligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/map_next_u64_modified/proofs/lean/extraction/Map_next_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/While_exampleObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/max_odd_part_modified/proofs/lean/extraction/Max_odd_partObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/Gcd_whileObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/trailing_zeros_u64_modified/proofs/lean/extraction/Trailing_zeros_u64Obligations.lean"})
+Let me examine the current state of the obligations file and the extracted file:
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/map_next_u64_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/map_next_u64_modified/proofs/lean/extraction/map_next_u64.lean"})
+Now I have a strong understanding. Let me check the available `Range` accessor names and any `Map.iter` accessor patterns we need:
+[tool] mcp__lean__lean_file_outline({"file_path": "map_rfold_u64.lean"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+Now let me write the obligations file:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\nopen Std.Do\nopen Std.Tactic\n\nset_option mvcgen.warning false\nset_opti... [+4327 chars])
+Let me use the write tool instead since I'm essentially replacing most of the file:
+[tool] write_working_file({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "content": "-- Companion obligations file for the `map_rfold_u64` extraction.\n-- Each property... [+4456 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+All three theorems are well-typed (only the expected `sorry` warnings). Let me confirm with `lake build`:
+[tool] run_lake_build({})
+Build succeeds with only the expected `sorry` warnings. Here is the final report.
+
+---
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Map_rfold_u64Obligations.lean`
+
+**Theorems added** (one per contract clause):
+
+| Theorem | Contract clause it captures |
+|---|---|
+| `rfold_empty_range_returns_init` | Empty-range identity: `_end ≤ start` ⇒ result is `RustM.ok init` and neither closure is invoked. From `empty_range_returns_init_without_calling_closures`. |
+| `rfold_matches_spec` | Main postcondition: function equals the recursive right-to-left reference fold `rfoldSpec`. From `matches_iter_rfold_specification`. Stated **unconditionally** (equation form): the partiality of `self.f` / `g` is mirrored on both sides, so no totality precondition is needed for the equation itself. |
+| `rfold_total` | Totality: if both `self.f` and `g` are total, so is `Map.rfold`. The `_end -? 1` step is guarded by `_end > start`, so the only failure mode in the body is propagation of a closure failure. |
+
+A reference `rfoldSpec : Nat → u64 → u64 → (u64 → RustM u64) → (u64 → u64 → RustM u64) → RustM u64` is defined as a structurally-recursive Lean oracle mirroring the loop step-for-step; the proof stage will instantiate it.
+
+**Property tests classified as derived facts (intentionally not separate theorems):**
+
+- `rfold_matches_shifted_rfold` — a specific-input instance asserting that `Map { iter: 0..10, f: |x| x+3 }.rfold(7, g)` equals `(3..13).rfold(7, g)`. This is a structural fact about additive shifts and follows from `rfold_matches_spec` + the shift identity `f(k) = k+3 ⇒ rfold over (0..10) of f equals rfold over (3..13) of id`. No verification value beyond the main spec.
+- `rfold_equals_fold_for_addition` — a specific-input instance asserting `fold = rfold` for addition on `1..7` with `f(x) = 2x`. This is the algebraic fact that addition is commutative/associative combined with the main spec. Pure derived consequence.
+
+**Uncertainties flagged:**
+
+- `rfold_total` is well-typed but uses a permissive precondition (`∀ x : u64, ∃ y, self.f x = RustM.ok y`) — total on every `u64` input, not only those the loop actually visits. The tighter `∀ x ∈ [start, _end), …` form would be strictly stronger as a contract but harder to use; the chosen form matches the precedent in `Map_next_u64Obligations.next_total` (which makes the same simplifying choice). If a downstream consumer needs the tighter version, it is a strict refinement of the present statement.
+- `rfold_matches_spec` is stated unconditionally and threads partiality through both sides. This is the strongest honest contract in the Lean model. The proof stage may find it easier to prove a "totality-conditioned" variant first and derive the unconditional form by case analysis — but the contract statement here is intentionally permissive.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 3 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/map_next_u64_modified/proofs/lean/extraction/Map_next_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/while_example/proofs/lean/extraction/While_exampleObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/max_odd_part_modified/proofs/lean/extraction/Max_odd_partObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/gcd_while_modified/proofs/lean/extraction/Gcd_whileObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/trailing_zeros_u64_modified/proofs/lean/extraction/Trailing_zeros_u64Obligations.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/**/*.lean"})
+[tool] Glob({"pattern": "**/proof-libs/lean/**/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/hax/while_loop.lean"})
+[tool] Glob({"pattern": ".lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/hax/while_loop.lean", "path": "proofs/lean/extraction"})
+[tool] Glob({"pattern": "**/while_loop.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/hax/while_loop.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/While.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Std/Do/Triple/SpecLemmas.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/RustM.lean"})
+[tool] Glob({"pattern": "**/BVDecide.lean"})
+[tool] Grep({"pattern": "Triple_iff_BitVec", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "Triple_iff_BitVec", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/BVDecide.lean", "output_mode": "... [+19 chars])
+[tool] Grep({"pattern": "structure Range", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content", "-C": 5})
+[tool] Grep({"pattern": "cmp.gt", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content", "-C": 3})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 1, "limit": 130})
+[tool] Grep({"pattern": "forIn.loop", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content", "-C": 5})
+[tool] Grep({"pattern": "forIn.*loopCombinator", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "content", "-C": 5})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/**/*Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/proofs/lean/extraction/Recursion_exampleObligations.lean"})
+[tool] Grep({"pattern": "forIn.loop\\.eq", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "partial_fixpoint.*induct", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "files_with_matches"})
+[tool] mcp__lean__lean_multi_attempt({"file_path": "Map_rfold_u64Obligations.lean", "line": "31", "snippets": "[\"example (cond : u64 \u2192 Bool) (body : u64 \u2192 RustM u64) (init : u64) :\\n   ... [+418 chars])
+[tool] mcp__lean__lean_completions({"file_path": "Map_rfold_u64Obligations.lean", "line": 10, "column": 1})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] Grep({"pattern": "partial_fixpoint", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "content", "-C": 2})
+[tool] write_working_file({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "content": "-- Companion obligations file for the `map_rfold_u64` extraction.\n\nimport Hax\nim... [+2022 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] mcp__lean__lean_goal({"file_path": "Map_rfold_u64Obligations.lean", "line": 32})
+[tool] mcp__lean__lean_goal({"file_path": "Map_rfold_u64Obligations.lean", "line": 35})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\nprivate theorem test_unfold (cond : u64 \u2192 Bool) (body : u64 \u2192 R... [+1146 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\nprivate theorem while_loop_unfold {\u03b2 : Type} (cond : \u03b2 \u2192 B... [+2933 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\nprivate theorem while_loop_unfold {\u03b2 : Type} (cond : \u03b2 \u2192 B... [+4293 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\nprivate theorem forIn_loop_unfold_step {\u03b2 : Type}\n    (f : Unit \u2... [+938 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\nprivate theorem forIn_loop_unfold_step {\u03b2 : Type}\n    (f : Unit \u2... [+1079 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\nprivate theorem while_loop_unfold {\u03b2 : Type} (cond : \u03b2 \u2192 B... [+2397 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\n  by_cases hc : cond init\n  \u00b7 simp only [hc, if_true, bind_assoc, p... [+363 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\n  by_cases hc : cond init\n  \u00b7 simp only [hc, if_true, bind_assoc, p... [+380 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\ntheorem rfold_empty_range_returns_init\n    (self : Map) (init : u64) (g ... [+797 chars])
+[tool] mcp__lean__lean_goal({"file_path": "Map_rfold_u64Obligations.lean", "line": 63})
+[tool] mcp__lean__lean_goal({"file_path": "Map_rfold_u64Obligations.lean", "line": 61})
+[tool] write_working_file({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "content": "-- Companion obligations file for the `map_rfold_u64` extraction.\n-- Each property... [+11527 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "offset": 220, "limit": 30})
+[tool] mcp__lean__lean_goal({"file_path": "Map_rfold_u64Obligations.lean", "line": 239})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean", "patch": "<<< SEARCH\n  | succ n ih =>\n      unfold rfoldSpec\n      obtain \u27e8v, hv\u27e9 ... [+673 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Map_rfold_u64Obligations.lean"})
+[tool] run_lake_build({})
+[tool] Grep({"pattern": "sorry", "path": "proofs/lean/extraction/Map_rfold_u64Obligations.lean"})
+All three obligations are closed. Here's the final report.
+
+---
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Map_rfold_u64Obligations.lean`
+
+**Build status:** `lake build` succeeds, no `sorry`, no warnings or errors.
+
+### What was added
+
+1. **`forIn_loop_unfold_step`** — single-step unfold lemma for `Lean.Loop.MonoLoopCombinator.forIn.loop`, exposing `partial_fixpoint`'s recursive structure as one bind: `f () init >>= matchForInStep · with done b → pure b | yield b → forIn.loop f b`.
+
+2. **`while_loop_unfold`** — one-step unfold for `Loop.MonoLoopCombinator.while_loop`: `while_loop cond init body = if cond init then body init >>= (while_loop cond · body) else pure init`. The inner `while_loop` on the RHS refolds via `rfl` so the equation is genuinely "one step".
+
+3. **`sub_one_succeeds`** — standard partial-op discharge: `start < _end ⇒ _end -? 1 = pure (_end - 1)`.
+
+4. **`loopCond`, `loopBody`, `rfoldLoop`, `rfold_eq_loop`** — names for the loop's pure condition, body, and full while-loop expression. `rfold_eq_loop` is `rfl`: the autoparam `pureCond.val` matches `fun s ↦ decide (UInt64.toNat s._1 > UInt64.toNat self.iter.start)` definitionally.
+
+5. **`loop_eq_rfoldSpec`** — the key lemma: by induction on `n = _end.toNat - start.toNat`, the projected loop equals the recursive `rfoldSpec`. Base case uses `while_loop_unfold` + `cond = false`. Inductive step uses `cond = true`, rewrites the body via `sub_one_succeeds`, applies monad-bind associativity, and threads `bind_congr` to apply the IH inside the two nested binds over `self.f (_end - 1)` and `g acc v`.
+
+6. **`rfoldSpec_total`** — recursive spec is total under totality of `f` and `g`. Induction on `n`.
+
+7. The three theorems are then short projections:
+   - `rfold_empty_range_returns_init`: `_end ≤ start ⇒ n = 0`, then `loop_eq_rfoldSpec` + `rfoldSpec 0 = RustM.ok init`.
+   - `rfold_matches_spec`: direct application of `loop_eq_rfoldSpec` with `n = _end.toNat - start.toNat`.
+   - `rfold_total`: rewrite via `rfold_matches_spec`, then `rfoldSpec_total`.
+
+### Sub-goals that were difficult and how resolved
+
+- **Unfolding `partial_fixpoint`-defined `forIn.loop`**. `unfold` inside `conv` is unavailable. Resolved by `show … = Loop.loopCombinator f (forIn.loop f) init` (the fixed-point equation) and then `unfold Loop.MonoLoopCombinator.forIn.loop; rfl` — the partial_fixpoint definitional `rfl` connects the abbreviation to one `loopCombinator` unrolling.
+
+- **Avoiding double-unfolding in `while_loop_unfold`**. After unfolding the outer `forIn`, both sides were exposing internal terms. Reformulated the LHS to show only `forIn` (not `while_loop`) and `rw`'d with `forIn_loop_unfold_step` once. The inner `while_loop` on the RHS then refolds for free via `rfl`.
+
+- **`simp only [pure_bind]` didn't reduce `RustM.ok v >>= f`**. `RustM.ok` is `some ∘ .ok`, not `pure` syntactically (though defeq). Worked around with `show` to coerce the goal to the post-reduction form definitionally, mirroring the discharge pattern in `recursion_example`.
+
+- **Threading partiality through the equation**. The unconditional equation `rfold = rfoldSpec` had to hold even when `self.f` or `g` fail. Using `bind_congr` after rewriting the body to its monadic normal form lets the recursive call sit inside both binds, so failures in either propagate identically on both sides — no totality precondition needed.
+
+### Obligations left as `sorry`
+
+None — all three are proven.
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+I'll analyze the working crate's proof structure against the existing library entries.
+
+**Proof obstacles in this entry:**
+1. **Loop = recursive monadic spec by induction on iteration count** — The proof's main mechanism is proving `while_loop ≡ rfoldSpec` (a `RustM`-valued recursive function), not the triple-to-equation pattern used by `gcd_while_modified`/`max_odd_part_modified`/`while_example`.
+2. **Direct `while_loop` unfolding** via custom `forIn_loop_unfold_step` and `while_loop_unfold` lemmas (one-step equation) — distinct from the Hoare-triple route.
+3. **Higher-order function field threaded through the loop body** — `map_next_u64_modified` covers HOF fields but only at iterator-step granularity (no loop).
+4. **Conditional totality hypothesis on both `f` and `g`** — pushed through the recursive spec via `rfoldSpec_total`.
+5. **Back-to-front iteration** with `end` decreasing.
+
+None of the existing while-loop entries (`gcd_while`, `trailing_zeros`, `max_odd_part`, `while_example`) prove loop-equals-recursive-spec by induction on iteration count; they all use the triple-to-equation route with a numeric/closed-form invariant. None of the recursive entries proves equivalence *back* to a loop with a HOF body. This combination is a structurally new obstacle worth capturing — a template for any `core::iter` adapter's fold/rfold/for_each whose extraction inlines the iterator as a while loop and whose spec is naturally recursive.
+
+Adding it.
+[tool] add_proof_pattern({"name": "map_rfold_u64_modified", "features": ["higher-order-function-field", "conditional-totality-hypothesis", "loop-to-recursive-monadic-spec", "while-loop-... [+1848 chars])
+ADDED `map_rfold_u64_modified`
+
+Features: `higher-order-function-field`, `conditional-totality-hypothesis`, `loop-to-recursive-monadic-spec`, `while-loop-unfold-equation`, `iteration-count-induction`, `monadic-recursive-spec`, `back-to-front-iteration`, `partial-operator-discharge`, `subtraction-no-underflow`, `bv-nat-bridge`, `branch-split-totality`, `functional-correctness`.
+
+Summary: Map::rfold over Range<u64> with a HOF field, extracted as a back-to-front while loop, proved equivalent to a recursive monadic spec by induction on the iteration count via direct while_loop equation unfolding — the canonical template for `core::iter` adapter folds whose extracted loop must match a recursive monadic specification.
+
+Observations for future readers:
+- The proof complements `map_next_u64_modified` (single-step) and `gcd_while_modified` (triple-to-equation): together they sketch the three canonical shapes for loops in extracted iterator code — single step, triple-to-closed-form, and loop-to-recursive-spec.
+- The two unfold lemmas (`forIn_loop_unfold_step`, `while_loop_unfold`) are reusable verbatim for any extraction whose loop matches the same `Lean.Loop.MonoLoopCombinator.while_loop Lean.Loop.mk ...` shape; future Filter/Take/Chain proofs should consider copying them rather than re-deriving.
+- The `loopBody`/`loopCond` abbrev split is what makes the inductive step tractable — without it, the body's monadic do-block doesn't beta-reduce cleanly through `bind_congr`.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260524-221823_map_rfold_u64_stage_notes.json
+[cleanup] freed 344.5MB from benchmarks/claude-opus-4-7/map/map_rfold_u64_modified

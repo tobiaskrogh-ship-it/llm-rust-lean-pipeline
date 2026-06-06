@@ -1,0 +1,703 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260525-000847_run_utf8_validation_u8.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/validations/run_utf8_validation_u8/attempted_changes/20260525-000847
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Glob({"pattern": "proof_patterns/**/manifest.json"})
+[tool] Glob({"pattern": "**/proof_patterns/**/*.rs"})
+[tool] Glob({"pattern": "**/*.rs"})
+[tool] Glob({"pattern": "**/*"})
+Looking at the task, I need to read the current state of the file and then add property-based tests. Let me analyze the contract of `run_utf8_validation`:
+
+**Independent contract claims:**
+1. **Validity recognition (postcondition)**: returns `Ok(())` iff input is valid UTF-8
+2. **`valid_up_to` soundness (postcondition on Err)**: the prefix `v[..valid_up_to]` is itself valid UTF-8
+3. **`error_len` shape (failure-condition shape)**: 
+   - `Some(n)` ⇒ 1 ≤ n ≤ 3 and the n "bad" bytes fit inside the slice
+   - `None` ⇒ we stopped mid-codepoint because we ran out of bytes (truncation)
+
+Let me check the file once more and add the tests.
+[tool] Read({"file_path": "src/lib.rs", "offset": 175, "limit": 50})
+[tool] Read({"file_path": "src/lib.rs", "offset": 280, "limit": 40})
+Now I'll add the property tests. I'll use `std::str::from_utf8` as the oracle and a hand-rolled corpus that thoroughly exercises the input space (all 1-byte and many 2-byte sequences, hand-picked 3/4-byte cases, valid strings, truncations, and inputs long enough to hit the wordwise fast path).
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "error_message": "Need to add property-based tests for run_utf8_validation; inserting them before the closing brace of the existing tests... [+10027 chars])
+Now let me verify everything compiles and passes.
+[tool] run_cargo_test({})
+All 19 tests pass (12 existing + 5 new property tests). Here's the summary.
+
+## Summary
+
+### Property tests added (5)
+
+Each test states one independent contract clause for `run_utf8_validation`, checked over a hand-rolled corpus that covers every single byte, every 2-byte sequence on a UTF-8 grammar boundary, valid 3/4-byte codepoints from real strings, mid-codepoint truncations, long ASCII buffers (to hit the wordwise fast path), and the canonical "invalid" cases.
+
+| Test | Contract clause |
+|---|---|
+| `prop_ok_iff_std_says_valid` | **Master postcondition.** Returns `Ok(())` iff input is valid UTF-8 (using `std::str::from_utf8` as the oracle definition of "valid"). |
+| `prop_valid_up_to_marks_valid_prefix` | **Postcondition on `Err`.** `valid_up_to ≤ v.len()` and `v[..valid_up_to]` is itself valid UTF-8 — the validator never claims to have validated more than it really has. |
+| `prop_error_len_some_is_bounded_and_in_range` | **Failure-shape, `Some` arm.** `error_len = Some(n)` ⇒ `1 ≤ n ≤ 3` and `valid_up_to + n ≤ v.len()`. The n bad bytes lie inside the slice. |
+| `prop_error_len_none_means_truncation` | **Failure-shape, `None` arm.** `error_len = None` ⇒ `valid_up_to < v.len()`, the byte at `valid_up_to` is a valid multi-byte leader (width ∈ {2,3,4}), and strictly fewer than that many bytes remain — i.e. we stopped because we ran out, not because of a bad byte. |
+| `prop_every_str_is_accepted` | **Positive specialization.** Every `&str` (statically guaranteed valid UTF-8) is accepted. Logically a corollary of the master oracle, but stated without reference to `from_utf8` — useful as its own proof obligation downstream, statable purely in terms of `str::as_bytes`. |
+
+### Properties considered and intentionally not included
+
+- **Per-codepoint correctness of `error_len = Some(n)` (i.e. "n equals the std-reported error_len")** — subsumed by `prop_ok_iff_std_says_valid` extended to error data; would add a theorem that mirrors the function's own match arms with no extra coverage.
+- **Determinism / purity / idempotence** — `run_utf8_validation` is a pure function of `&[u8]`; there is no state to abuse, so no test would exercise this beyond what calling it twice would.
+- **Concatenation: `valid(a) ∧ valid(b) ⇒ valid(a ++ b)`** — derivable from UTF-8 being a prefix code plus the master postcondition; doesn't catch any bug the oracle test misses.
+- **Prefix closure on `Ok`: every codepoint-aligned prefix of a valid string is valid** — direct corollary of `prop_valid_up_to_marks_valid_prefix` applied to the empty-extension case.
+- **Alignment / SIMD-path equivalence** — would test an implementation detail (the wordwise fast path) rather than a contract clause; the corpus already includes 257-byte ASCII buffers and a buffer with a bad byte past offset 128, so any divergence between the fast path and the scalar path would surface in the oracle test.
+- **Behaviour on aliasing / non-`Copy` inputs, etc.** — not applicable: the input is `&[u8]`.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Glob({"pattern": "**/*.rs"})
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] Read({"file_path": "proofs/lean/extraction/run_utf8_validation_u8.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/sum_to_n_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_035_fizz_buzz_modified/src/lib.rs"})
+Let me look at the slice-handling pattern reference to confirm how to handle `&[u8]` operations:
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_009_rolling_max_modified/src/lib.rs"})
+Now I have a clear picture of the rewrites needed. The main blockers are:
+
+1. **Raw pointers** (`as_ptr`, `align_offset`, `*const usize`, `unsafe` block) — rejected by Hax (`reject_RawOrMutPointer`). Need to drop the wordwise fast path entirely.
+2. **`size_of::<usize>()`, `from_ne_bytes`, `usize::MAX`, `is_multiple_of`, `wrapping_sub`** — all unmodeled in Hax prelude.
+3. **`while` loop with early `return` (via `err!`/`next!` macros)** — extracts to `while_loop_return` which is undefined.
+4. **Tuple-pattern matches with ranges** — `match (first, next!()) { (0xE0, 0xA0..=0xBF) | ... }` produced `let _ := sorry;` in extraction.
+5. **`as i8` reinterpretation for continuation-byte check** — fragile; replace with `(b & 0xC0) != 0x80`.
+
+The cleanest approach is to drop the unsafe fast path and convert the main loop to tail recursion per the `while_loop_to_recursion.rs` preference. Let me write the rewrite:
+[tool] write_working_file({"path": "src/lib.rs", "overwrite": true, "error_message": "Hax extraction emitted multiple `sorry` placeholders and references to unmodeled identifiers. The fu... [+24954 chars])
+Now let me verify tests still pass:
+[tool] run_cargo_test({})
+All 19 tests pass. Now let me run Hax extraction:
+[tool] run_cargo_hax_into_lean({})
+Hax extraction succeeded cleanly — no `Failed formatting`, no warnings. Let me check the extracted Lean and then run lake build:
+[tool] run_lake_build({})
+[tool] Read({"file_path": "proofs/lean/extraction/run_utf8_validation_u8.lean", "offset": 80, "limit": 30})
+[tool] Read({"file_path": "proofs/lean/extraction/run_utf8_validation_u8.lean", "offset": 335, "limit": 30})
+The 256-element array literal in the extracted Lean hits Lean's elaboration recursion depth. The clean source-side fix is to replace the table lookup with a branching function — the table has only 4 distinct ranges, so the function form is just as readable and avoids the giant literal entirely:
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "error_message": "lake build failed: extracted `UTF8_CHAR_WIDTH` 256-element `#v[...]` literal exceeds Lean's elaboration recursion depth... [+2879 chars])
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+All three stages pass. Let me verify the extracted Lean is clean (no `sorry`, no degenerate patterns):
+[tool] Grep({"pattern": "sorry|from_machine \\(0 : u32\\)|RustM\\.fail", "path": "proofs/lean/extraction/run_utf8_validation_u8.lean", "output_mode": "content"})
+[tool] Read({"file_path": "proofs/lean/extraction/run_utf8_validation_u8.lean"})
+All three stages are green and the extracted Lean is clean. Let me do a final audit for Hax-degenerate `&&`/`||` patterns over partial ops in the extracted file:
+[tool] Grep({"pattern": "&&\\?|\\|\\|\\?", "path": "proofs/lean/extraction/run_utf8_validation_u8.lean", "output_mode": "content", "-n": true})
+All `&&?` sites are pure comparisons on both sides — no partial ops under any guard. The `&&&?` (bitwise AND) is total, distinct from the short-circuit `&&?`. The slice indexing (`v[i1]_?`, `v[i2]_?`, `v[i3]_?`) sits in its own `let` binding or `if`-head, *outside* any `&&?`, gated by an explicit `iN >=? len` check. No short-circuit-over-partial-op degeneracy.
+
+## Summary
+
+**Pipeline stages — all green:**
+- `cargo test`: 19/19 tests pass
+- `cargo hax into lean`: extraction clean, no `Failed formatting`, no warnings
+- `lake build`: completed successfully
+
+**Hax / lake-build errors that drove each change:**
+
+1. **Raw pointer rejection** (Hax stderr: `a node of kind [Raw_pointer] have been found in the AST ... reject_RawOrMutPointer`, pointing at `core_models::ptr::const_ptr::impl__align_offset` and `core_models::slice::impl__as_ptr`). Drove the removal of the entire unsafe wordwise ASCII fast path.
+
+2. **`rust_primitives.hax.while_loop_return` undefined** (from the original extraction's `match (← (rust_primitives.hax.while_loop_return ...)) with Break ret => ... | Continue ...`). Drove the rewrite of the `while index < len { ... }` loop with macro-driven early `return Err(...)` into a tail-recursive `validate_at` helper. Pattern: `rewrite_patterns/while_loop_early_return.rs` + recursion preferred per `rewrite_patterns/while_loop_to_recursion.rs`. Extracted as `partial_fixpoint`.
+
+3. **`let _ := sorry;`** emitted for the tuple-pattern matches `match (first, next!()) { (0xE0, 0xA0..=0xBF) | ... }` in both the 3-byte and 4-byte branches. Drove the rewrite to sequential `if first == 0xE0 { b2 >= 0xA0 && b2 <= 0xBF } else if first >= 0xE1 && first <= 0xEC { ... } ...` chains over `first`, with explicit comparison ranges on `b2`.
+
+4. **`error: ...lean:87:27: maximum recursion depth has been reached`** during elaboration of the extracted 256-element `#v[...]` literal for `UTF8_CHAR_WIDTH`, cascading into `error: ...lean:348:7: Unknown identifier 'UTF8_CHAR_WIDTH'`. Drove the rewrite of the 256-byte lookup table into a 6-branch `if`/`else if` chain over `b`'s ranges (same 4 distinct width values: 0/1/2/3/4).
+
+**Library calls inlined / replacements:**
+| Original | Replacement |
+|---|---|
+| `v.as_ptr().align_offset(USIZE_BYTES)` | removed (fast-path-only) |
+| `align.wrapping_sub(index).is_multiple_of(USIZE_BYTES)` | removed |
+| `usize::MAX`, `size_of::<usize>()`, `usize::from_ne_bytes(...)` | removed (fast-path-only) |
+| `unsafe { *(ptr.add(index) as *const usize) }`, `contains_nonascii`, `NONASCII_MASK`, `repeat_u8` | removed |
+| `(b as i8) >= -64` (NOT a continuation byte) | `(b & 0xC0) != 0x80` (equivalent bit-pattern check, all unsigned) |
+| `UTF8_CHAR_WIDTH[b as usize] as usize` table | branch chain over `b < 0x80`, `< 0xC2`, `< 0xE0`, `< 0xF0`, `< 0xF5` |
+
+**Patterns considered but not changed:**
+- `Utf8Error` struct + `impl` methods (`valid_up_to()`, `error_len()`) — extract cleanly to `RustM`-typed `def Impl.valid_up_to` / `def Impl.error_len`, no rewrite needed.
+- `Option<u8>` field, `Result<(), Utf8Error>` return — both modeled by Hax (`core_models.option.Option`, `core_models.result.Result`).
+- The `match self.error_len { Some(len) => Some(len as usize), None => None }` in `Utf8Error::error_len` — extracts cleanly; left as-is.
+
+**Changes suspected of altering semantics (tests still cover them):**
+- **Removed wordwise ASCII fast path**: this was a performance optimization, not correctness. Byte-by-byte iteration produces bit-identical outputs for every input. The two long-ASCII tests (`long_ascii_triggers_wordwise_fastpath`, `long_ascii_with_bad_byte_at_end`) plus property tests with `vec![b'x'; 257]` exercise exactly the inputs the old fast path covered, and pass.
+- **`(b as i8) >= -64` → `(b & 0xC0) != 0x80`**: continuation bytes are precisely `0x80..=0xBF`, the bytes whose top two bits are `10`. The property tests sweep every single byte 0..=255 plus every 2-byte sequence over 20 boundary leaders × 256 second-bytes via `prop_ok_iff_std_says_valid`; any disagreement with `std::str::from_utf8` would surface.
+- **Table → branch chain**: by construction each branch corresponds to one of the table's contiguous ranges (verified row-by-row). All boundary-byte tests (`0x7F`/`0x80`, `0xC1`/`0xC2`, `0xDF`/`0xE0`, `0xEF`/`0xF0`, `0xF4`/`0xF5`) pass via the corpus.
+
+**Hax-degenerate patterns left for the proof stage:**
+None. The extracted Lean has:
+- No `sorry`, no `RustM.fail`, no `from_machine (0 : u32)` constant-0 termination measure.
+- All `&&?` sites have pure-comparison RHS — no partial-op-under-guard hazard.
+- `validate_at` is a clean `partial_fixpoint` with a single decreasing measure `v.len() - index`, suitable for `Nat.strongRecOn`-style induction (cf. `proof_patterns/recursion_example`).
+- `run_utf8_validation` is a trivial wrapper: `validate_at v 0`.
+- No `loop_invariant!` / `loop_decreases!` / `#[hax_lib::requires]`, so no auto-spec / `bv_decide` proof obligations are generated.
+
+The proof stage can proceed with standard induction on `(v.len() - index).toNat`.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/run_utf8_validation_u8/attempted_changes/20260525-000847/*"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/run_utf8_validation_u8/attempted_changes/20260525-000847/0003_stage2_rust_hax_lean_patch... [+18 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/run_utf8_validation_u8/attempted_changes/20260525-000847/0003_stage2_rust_hax_lean_patch... [+22 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/run_utf8_validation_u8/attempted_changes/20260525-000847/0003_stage2_rust_hax_lean_patch... [+23 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/run_utf8_validation_u8/attempted_changes/20260525-000847/0002_stage2_rust_hax_lean_writt... [+18 chars])
+Now I have what I need. Only attempt 0003 is a patched `stage2_rust_hax_lean` change. Attempt 0002 is `written` (full rewrite, not mechanical patch) — skip per rule 2. Attempt 0001 is stage1.
+
+The 0003 root cause — a large constant array literal extracted by Hax as `#v[...]` blowing past Lean's elaboration recursion depth — is not covered by any existing pattern. Writing it:
+[tool] write_rewrite_pattern({"name": "large_const_lookup_table_to_branches.rs", "content": "// unsupported: lake build fails with `maximum recursion depth has been reached`\n// when Hax ex... [+2136 chars])
+## Final report
+
+**Patterns written (1):**
+- `large_const_lookup_table_to_branches.rs` — large `const X: &[u8; N] = &[…]` literal extracted as a Lean `#v[…]` blows past `maximum recursion depth has been reached` in lake build; when the table compresses to a few contiguous ranges, replace the lookup with an if/else branch chain.
+
+**Attempts inspected and skipped:**
+- `0001_stage1_make_pbt_patched` — stage 1, not `stage2_rust_hax_lean`. Out of scope.
+- `0002_stage2_rust_hax_lean_written` — status is `written` (full file rewrite), not `patched`. Per rule 2, full rewrites are skipped. Its trigger_error blended several root causes that are already covered by existing patterns anyway (`while_loop_early_return.rs`, `while_loop_to_recursion.rs`, `for_loop_over_slice_to_recursion.rs`, `unsafe_ref_to_array_ref_unfixable.rs`).
+
+**Nothing flagged as confusing or worth a human's attention.**
+
+harvest_rewrite_patterns
+## Analysis
+
+### Summary of changes
+
+The rewrite removes the unsafe wordwise ASCII fast path entirely (Hax rejects raw pointers, `align_offset`, `from_ne_bytes`, etc.), replaces the 256-entry `UTF8_CHAR_WIDTH` lookup table with a six-branch `if/else if` chain, converts the main `while` loop into a tail-recursive helper `validate_at` (because Hax doesn't model `return` inside `while`), turns the tuple-pattern `match` for 3- and 4-byte sequences into sequential `if/else` chains on `first`, and replaces the continuation-byte check `(b as i8) >= -64` with the unsigned-equivalent `(b & 0xC0) != 0x80`.
+
+### Per-change reasoning
+
+**Removed wordwise fast path** — purely a performance optimization. The fast path only *advances* `index` past blocks confirmed to be all-ASCII; if it can't, it falls through to byte-by-byte. The slow path (which the rewrite keeps for every byte) returns the exact same answer on every input.
+
+**`utf8_char_width` table → branch chain** — verified against the table row-by-row:
+- `b < 0x80` → 1 covers 0x00..=0x7F (rows 0–7: all 1's) ✓
+- `b < 0xC2` → 0 covers 0x80..=0xC1 (rows 8–B all 0's, plus 0xC0/0xC1) ✓
+- `b < 0xE0` → 2 covers 0xC2..=0xDF (rest of row C, all of D) ✓
+- `b < 0xF0` → 3 covers 0xE0..=0xEF (row E) ✓
+- `b < 0xF5` → 4 covers 0xF0..=0xF4 ✓
+- else → 0 covers 0xF5..=0xFF ✓
+
+**`(b as i8) >= -64` → `(b & 0xC0) != 0x80`** — Continuation bytes are exactly `0x80..=0xBF` (top two bits `10`). Casting u8→i8: `0x80..=0xBF` → `-128..=-65` (all `< -64`); everything else (`0x00..=0x7F` → `0..=127`, `0xC0..=0xFF` → `-64..=-1`) is `>= -64`. The bit test `(b & 0xC0) != 0x80` returns false exactly when `b & 0xC0 == 0x80`, which is exactly `0x80..=0xBF`. Identical on all 256 byte values.
+
+**Tuple match → sequential `if/else` chain** — Verified for both 3-byte and 4-byte cases:
+- 3-byte: `(0xE0, 0xA0..=0xBF) | (0xE1..=0xEC, 0x80..=0xBF) | (0xED, 0x80..=0x9F) | (0xEE..=0xEF, 0x80..=0xBF)` — the chain checks each leader range and the corresponding b2 range with identical bounds. Leaders 0xE0/0xED/0xE1..=0xEC/0xEE..=0xEF are disjoint and exhaustive of 0xE0..=0xEF (which is what reaches w==3), so order doesn't matter.
+- 4-byte: same analysis for `(0xF0, 0x90..=0xBF) | (0xF1..=0xF3, 0x80..=0xBF) | (0xF4, 0x80..=0x8F)` — disjoint and exhaustive of 0xF0..=0xF4.
+
+**`while` → tail recursion** — Traced the index increments end-to-end:
+- ASCII (first < 128): `validate_at(v, index+1)` matches the original `index += 1` (post-fast-path).
+- w==2 success: `i1+1 = index+2` — matches original's `index += 1` after `next!()` (which already did `index += 1`).
+- w==3 success: `i2+1 = index+3` ✓; w==4 success: `i3+1 = index+4` ✓.
+- Truncation `err None` is raised whenever the next required byte index is `>= len`, exactly as the original `next!()` macro does its `if index >= len { err!(None) }` check.
+- The `error_len` values (`Some(1)/Some(2)/Some(3)`) are emitted at the same logical points, with the same `valid_up_to = old_offset` = the leader's index.
+- The `else` arm (w==0) returns `Some(1)`, matching the original `_ => err!(Some(1))`. (As the comment notes, w==1 is unreachable in the `first >= 128` branch.)
+
+The test corpus is bounded (largest single input ≈260 bytes), so recursion depth is not a concern.
+
+I find no input on which the rewrite would return a different `Result`, a different `valid_up_to`, or a different `error_len`.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target, I need to identify the verification challenges:
+- `partial_fixpoint` tail-recursive `validate_at` with measure `v.len() - index`
+- Multiple branches with different recursion steps (`+1`, `+2`, `+3`, `+4`)
+- Slice indexing `v[i]_?` with bounds checks
+- Bit manipulation (`b &&& 0xC0`)
+- Custom error struct `Utf8Error { valid_up_to, error_len }`
+- Multi-clause contract: iff-style "Ok iff valid UTF-8", prefix-validity, error_len bounded 1..=3, None means truncation
+- `usize +? 1` no-overflow discharge
+
+Let me inspect the most promising candidates.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/ContainsU64Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Contains_u64Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Clever_003_below_zeroObligations.lean", "limit": 100})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_divisor_modified/proofs/lean/extraction/Largest_divisorObligations.lean", "limit": 120})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_divisor_modified/proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_divisor_modified/proofs/lean/extraction/Clever_023_largest_divisorObligations.lean", "limit":... [+4 chars])
+I have enough to rank. The target's primary obstacles are: tail-recursive slice scan with `partial_fixpoint`, iff-style "Ok iff valid UTF-8" decomposition, strong induction on `len - index.toNat`, multi-branch step lemmas (with variable advance: +1/+2/+3/+4), `usize +? 1` overflow discharge, bit operation (`& 0xC0`), and a multi-clause contract over a custom error struct (`valid_up_to` prefix witness + `error_len` bounds + truncation characterisation).
+
+---
+
+**Selected examples:**
+
+```
+proof_patterns/contains_u64_modified
+proof_patterns/below_zero_modified
+proof_patterns/largest_divisor_modified
+proof_patterns/clever_025_remove_duplicates_modified
+proof_patterns/clever_009_rolling_max_modified
+```
+
+**Per-pick rationale:**
+
+- `proof_patterns/contains_u64_modified` — **canonical template**. Tail-recursive slice scan with `partial_fixpoint`, the exact `oob` / `found` / `recurse` step-lemma triad, workhorse iff lemma proved by `Nat.strongRecOn` on `arr.val.size - i.toNat`, and `usize +? 1` no-overflow via `BitVec.uaddOverflow` + `usize_add_one_toNat`. `validate_at` is structurally a *generalised* `contains_at`, just with five branches instead of two and variable advance.
+
+- `proof_patterns/below_zero_modified` — direct ancestor of `contains_u64` shape with extra mechanism the target needs: `iff-decomposition` of soundness/completeness from a single workhorse, a `running-accumulator-invariant` (analog of `valid_up_to`), `ok-result-implies-no-overflow` (recovering arithmetic preconditions by contradiction from `RustM.ok`), and a Lean-side `prefix_sum_int` oracle (analog of "is `v[..valid_up_to]` valid UTF-8") — same structural recipe for tying a Rust result to an `Int`/`Nat`-level recursive spec.
+
+- `proof_patterns/largest_divisor_modified` — `bundled-postcondition-projection` + `multi-clause-contract` is the key pattern: a single master postcondition closed by `Nat.strongRecOn` on the descending recursion measure, from which 3–4 contract clauses (divisibility / strict-less-than / maximality) are projected by specialisation. The target needs to project four clauses (iff / prefix-validity / `error_len ∈ 1..=3` / `None ⇒ truncation`) from a master `validate_at_correct` in the same way.
+
+- `proof_patterns/clever_025_remove_duplicates_modified` — `nested-recursive-call` + `three-conjunct-contract` + `shared-aux-lemma`. `validate_at` recurses with FOUR different offsets (`i+1`, `i1+1`, `i2+1`, `i3+1`) across branches, the closest existing analog to nested-helper composition. The three-conjunct contract proved from a single `build_at_correct_aux` is the right shape for the target's multi-clause projection.
+
+- `proof_patterns/clever_009_rolling_max_modified` — tail-recursive prefix scan with strong induction on `size - i.toNat`, `recursive-oracle-spec` (Nat-level oracle matched elementwise against Rust output), and `recursive-equation-unfold` for branching step lemmas. Useful template for the Nat-level "is_valid_utf8_prefix" spec that the iff contract will need to be defined against.
+
+**Gaps (worth adding to the library next):**
+
+- No example of recursion that advances by a *variable* step (`+1` / `+2` / `+3` / `+4` depending on which branch of a width-table fires). All existing tail-recursive scans advance by exactly `+1`.
+- No example with deeply nested `if/else if/.../else` chains over byte-range predicates (5+ levels).
+- No example of an error type with multiple fields (`valid_up_to : usize` plus `error_len : Option u8`) where the contract characterises both fields *jointly* (e.g. "`None` ⇔ truncated at a multi-byte leader with insufficient bytes remaining").
+- No encoding/parser-style validator (UTF-8, JSON, etc.) — the closest is `below_zero` (linear scan with state) and `contains` (linear scan, stateless).
+
+**Rejections:**
+
+- `is_prime_modified` — dual-induction-measures is interesting but target has a single natural measure (`len - index`); witness-finding via `min(k,q)` doesn't transfer.
+- `clever_039_triples_sum_to_zero_modified` — `multi-witness-ascending-indices` ladder doesn't fit (target has one witness `valid_up_to`, not three ascending indices).
+- `clever_044_triangle_area_modified` — pure signed-mul-overflow, no recursion.
+- `clever_038_prime_fib_modified`, `clever_045_fib4_modified` — `native_decide`-heavy on small finite ranges; target's contract is universally quantified over arbitrary slices.
+- `recursion_example` — too trivial; doesn't illustrate the iff-decomposition or step-lemma pattern.
+- `gcd_recursive_modified`, `sqrt_u64_modified`, `binomial_u64_modified` — arithmetic recurrences, not slice scans.
+- `gcd_while_modified`, `max_odd_part_modified`, `trailing_zeros_u64_modified`, `while_example` — `while_loop` + Hoare-triple proofs; target is `partial_fixpoint` recursion, different proof apparatus.
+- `map_next_u64_modified`, `map_rfold_u64_modified`, `map_try_rfold_u64_modified` — iterator adapter shape with higher-order field, no slice-scan recursion.
+- `sum_product_modified`, `rescale_to_unit_modified`, `clever_009_rolling_max_modified` (already picked) — sister tail-recursive scans, but `sum_product` is paired-accumulator and `rescale` is two-pass; `rolling_max` is the most general-purpose of the three.
+- `is_size_align_valid_usize_modified`, `padding_needed_for_usize_modified`, `repeat_packed_usize_modified`, `repeat_usize_modified`, `average_*` — bit-trick / `bv_decide` heavy; target has only one trivial `& 0xC0` mask comparison, not enough to justify importing the whole `bv_decide` apparatus.
+- `add_one_modified`, `square_modified`, `factorial_modified`, `sum_to_n_modified`, `clamp_modified`, `is_zero_modified`, `saturating_sub_modified`, `min_modified`, `abs_diff_i64_modified`, `truncate_number_modified`, `slice_get_u64_modified` — straight-line / one-branch toy functions, no recursion-over-slice obstacle.
+- `gcd_stein_u64_modified`, `000_has_close_elements_modified` — too specialised to their respective domains (Stein binary GCD / pair-index linearisation).
+
+select_examples
+[scaffold] created proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean
+[scaffold] registered Run_utf8_validation_u8Obligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Contains_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Clever_003_below_zeroObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_divisor_modified/proofs/lean/extraction/Clever_023_largest_divisorObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_009_rolling_max_modified/proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "limi... [+8 chars])
+Let me check the Hax prelude to understand the types.
+[tool] Glob({"pattern": "**/Hax/Prelude*.lean"})
+[tool] Glob({"pattern": "**/Hax.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/**/RustSlice*.lean"})
+[tool] Grep({"pattern": "RustSlice", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "files_with_matches"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/slice.lean"})
+[tool] Grep({"pattern": "structure Seq|def Seq|Seq \\(\u03b1", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives", "output_mode... [+25 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/**/sequence*.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/sequence.lean", "limit": 100})
+[tool] Read({"file_path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_009_rolling_max_modified/proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "offs... [+23 chars])
+[tool] Grep({"pattern": "def Array.take|theorem Array.take", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "files_with_matches", "head_limit": 5})
+[tool] Grep({"pattern": "Array.take", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "files_with_matches", "head_limit": 5})
+[tool] Grep({"pattern": "Array.extract", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "files_with_matches", "head_limit": 5})
+[tool] Grep({"pattern": "val\\.take|val\\.extract", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "-n": true, "head_limit": 15})
+[tool] Grep({"pattern": "abbrev u8|def u8|u8 :=", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "content", "-n": true, "head_limit": 10})
+[tool] Grep({"pattern": "abbrev u8|^def u8", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "-n": true})
+Now let me write the obligations file with the spec and theorems:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nnamespace Run_utf8_validation_u8Obligations\n\n-- Add `theorem` ... [+6801 chars])
+Now let me check the file with the LSP to see if there are any errors:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean"})
+Only `sorry` warnings, no errors. Let me run lake build to confirm ground truth:
+[tool] run_lake_build({})
+Build passes with only the four expected `sorry` warnings.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean`
+
+**Spec definitions added (in the obligations namespace):**
+
+- `leadWidth : u8 → Nat` — mirrors the Rust `utf8_char_width` (1/2/3/4/0).
+- `IsContByte : u8 → Prop` (with `Decidable` instance) — `0x80..=0xBF`.
+- `SecondByteOk : u8 → u8 → Prop` (with `Decidable` instance) — second-byte legality per RFC 3629 (excludes surrogates, caps at U+10FFFF).
+- `isValidUtf8From : Array u8 → Nat → Bool` — recursive validator on the suffix length `bs.size - k`.
+- `IsValidUtf8 : Array u8 → Prop := isValidUtf8From bs 0 = true`.
+
+**Theorems added (each closed with `sorry`):**
+
+| Theorem | Contract clause it captures |
+|---|---|
+| `run_utf8_validation_ok_iff_isValidUtf8` | `prop_ok_iff_std_says_valid` — `Ok(())` iff bytes are valid UTF-8 |
+| `run_utf8_validation_err_prefix_valid` | `prop_valid_up_to_marks_valid_prefix` — on `Err`, `valid_up_to ≤ size` and `v[..valid_up_to]` is valid |
+| `run_utf8_validation_err_error_len_some_in_range` | `prop_error_len_some_is_bounded_and_in_range` — `Some n ⇒ 1 ≤ n ≤ 3` and the range fits |
+| `run_utf8_validation_err_error_len_none_truncation` | `prop_error_len_none_means_truncation` — `None ⇒` truncated multi-byte leader |
+
+**Property tests classified as derived (skipped):**
+
+- `prop_every_str_is_accepted` — explicitly described in the Rust source as "logically a corollary of `prop_ok_iff_std_says_valid`". It's a positive specialisation: every valid UTF-8 byte sequence is accepted. This is exactly the (←) direction of `run_utf8_validation_ok_iff_isValidUtf8`. In Rust it has independent value because it can be stated via `str::as_bytes` without invoking `from_utf8`; in Lean we have no `String → IsValidUtf8` lemma to anchor it against, so adding a Lean theorem here would either restate the iff direction or just check a handful of byte-vector literals — pure restatement, no new contract surface.
+
+**Feasibility check:**
+
+All four theorems are stated universally over `v : RustSlice u8` with no extra precondition. The function only allocates fresh `usize` values as `index + 1`, where `index < v.val.size ≤ 2^64 − 1`; this guarantees `index + 1 ≤ 2^64 − 1 < 2^64`, so the `+? 1` operations cannot overflow on any reachable `index`. The function is `partial_fixpoint` but the descending measure `v.len() - index` strictly decreases at every recursive call, so the partial fixpoint coincides with the intended total function on every input the model permits. No precondition is needed.
+
+**Theorem framings I'm uncertain about:**
+
+- `run_utf8_validation_err_prefix_valid` uses `v.val.take err.valid_up_to.toNat`. `Array.take` is available in this Lean version (the Hax prelude itself uses `s.val.take mid.toNat`), and `lake build` accepts the statement, so the typing is fine. The proof stage may want a small lemma "`v.val.take n` is itself a `RustSlice`-compatible byte array on which `isValidUtf8From` is well-defined" — but as a *statement*, this is the natural form, and the iff theorem ensures coverage of validity.
+- `run_utf8_validation_err_error_len_none_truncation` packages the in-bounds proof as an `∃ hb, …` — same shape used in `contains_u64`'s `∃ (hj : j < arr.val.size), arr.val[j]'hj = target`. Well-typed; minor stylistic alternative would be to split into `valid_up_to.toNat < v.val.size ∧ ...` and write a separate `have` inside the proof, but the current form is more compact and keeps the witness explicit.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 4 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Contains_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Clever_003_below_zeroObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/largest_divisor_modified/proofs/lean/extraction/Clever_023_largest_divisorObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_009_rolling_max_modified/proofs/lean/extraction/Clever_009_rolling_maxObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/Clever_025_remove_duplicatesObligations.... [+6 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_025_remove_duplicates_modified/proofs/lean/extraction/Clever_025_remove_duplicatesObligations.... [+20 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/**/*.lean"})
+[tool] Glob({"pattern": "**/Hax/proof-libs/**/*.lean"})
+[tool] Glob({"pattern": "**/proof-libs/**/*.lean"})
+Let me check the LSP for the current state of the file and understand what the prelude offers.
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/USize64.lean", "limit": 200})
+[tool] Glob({"pattern": "**/USize64.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/.lake/packages/Hax/hax... [+69 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/.lake/packages/Hax/hax... [+53 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/.lake/packages/Hax/hax... [+56 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/.lake/packages/Hax/hax... [+58 chars])
+[tool] Grep({"pattern": "Impl\\.len[ \\t]*[:=]|def Impl.len", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/p... [+96 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/.lake/packages/Hax/hax... [+84 chars])
+[tool] mcp__lean__lean_file_outline({"file_path": "Run_utf8_validation_u8Obligations.lean"})
+[tool] mcp__lean__lean_multi_attempt({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": "117", "attempts": "[\"example (a : Array Nat) (n : Nat) : (a.take n).size \u2264 a.size := by e... [+262 chars])
+[tool] Grep({"pattern": "Array\\.size_take|Array\\.getElem_take|Array\\.take_size", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_va... [+104 chars])
+[tool] Grep({"pattern": "size_take|getElem_take", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/e... [+70 chars])
+[tool] Grep({"pattern": "size_take", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/.la... [+48 chars])
+[tool] Grep({"pattern": "Array\\.take", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/... [+51 chars])
+[tool] mcp__lean__lean_hover_info({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 128, "column": 21})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+46 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/run_utf8_validation_u8... [+35 chars])
+[tool] Grep({"pattern": "Array.size_take|Array.getElem_take", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/p... [+75 chars])
+[tool] Grep({"pattern": "v\\.val\\.take", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "head_limit": 30})
+[tool] Grep({"pattern": "\\.val\\.take", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "head_limit": 10})
+[tool] mcp__lean__lean_hover_info({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 131, "column": 26})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/.lake/packages/Hax/hax... [+51 chars])
+Let me start by writing the file with helpers, then iterate.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-! ## Contract clauses\n\nEach Rust property test maps to one t... [+6197 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+46 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nopen run_utf8_validation_u8 in\n/-- Out-of-bounds step: `index.t... [+930 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean"})
+The basic step lemmas check out. Let me verify the ASCII step lemma was proven successfully and then proceed to add the rest.
+[tool] mcp__lean__lean_goal({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 211})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- ASCII step: `index.toNat < v.val.size`, `first.toNat < 128` ... [+6776 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-! ### Width-table helpers \u2014 `utf8_char_width first = Rust... [+10656 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem utf8_char_width_w0_large (b : u8) (h : 245 \u226... [+10682 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Now let me add the width-specific step lemmas. I'll write step lemmas that pin down `w` and reduce each sub-branch.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n  simp only [core_models.slice.Impl.len, rust_primitives.slice.s... [+10538 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n  have h_neq2 : ((0 : usize) == (2 : usize)) = false := by decid... [+735 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "size_take|getElem_take|Array\\.take", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/... [+80 chars])
+[tool] mcp__lean__lean_hover_info({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 131, "column": 26})
+Now let me write the isValidUtf8From step lemmas and the master correctness lemma. Let me check what `Array.take` lemmas are available.
+[tool] mcp__lean__lean_hover_info({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 131, "column": 28})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+46 chars])
+Now I'll write the helper lemmas for IsContByte and SecondByteOk, then the step lemmas, then the master lemma. Let me first test the continuation byte lemma.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n  have h_neq2 : ((0 : usize) == (2 : usize)) = false := by decid... [+2083 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Continuation byte iff bit pattern `(b &&& 0xC0) = 0x80`. -/\... [+1320 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Continuation byte iff bit pattern `(b &&& 0xC0) = 0x80`. -/\... [+3571 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Lemma about `n &&& 192` for `n < 256`. -/\nprivate theorem n... [+4020 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "UInt8\\.toNat_and|UInt8.and_eq", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proof... [+69 chars])
+[tool] mcp__lean__lean_hover_info({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 683, "column": 3})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Continuation byte iff bit pattern `(b &&& 0xC0) = 0x80`. Pro... [+1481 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_hover_info({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 673, "column": 14})
+[tool] Grep({"pattern": "UInt8\\.toBitVec_inj|UInt8.toBitVec_injective|toBitVec_inj", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_... [+106 chars])
+[tool] Grep({"pattern": "UInt8\\.toBitVec.*inj|toBitVec_inj", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/p... [+85 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Continuation byte iff bit pattern `(b &&& 0xC0) = 0x80`. -/\... [+1975 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Continuation byte iff bit pattern `(b &&& 0xC0) = 0x80`. -/\... [+2175 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Continuation byte iff bit pattern `(b &&& 0xC0) = 0x80`. -/\... [+1827 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_goal({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 683, "column": 3})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Continuation byte iff bit pattern `(b &&& 0xC0) = 0x80`.\n  ... [+1941 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_goal({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 683, "column": 3})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n  rw [h_lhs]\n  -- Convert `b.toNat` to `b.toBitVec.toNat`.\n  h... [+741 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Continuation byte iff bit pattern `(b &&& 0xC0) = 0x80`.\n  ... [+2061 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Helper lemma: for any Nat-bounded value, the AND with 192 is... [+963 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Let me now write the SecondByteOk and isValidUtf8From step lemmas, plus the master lemma. This will be a large addition.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Continuation byte iff bit pattern `(b &&& 0xC0) = 0x80`. -/\... [+13409 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+The isValidUtf8From step lemmas have issues — `unfold` is unfolding both sides, and the `if 0 = 1` etc. aren't auto-reducing. Let me fix them.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-! ### isValidUtf8From step lemmas. -/\n\n/-- Base case: OOB \u... [+25193 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- ASCII step: k < size, bs[k] < 128 \u21d2 recurse to k+1. -/\... [+21241 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Width-4 bad third byte \u21d2 false. -/\nprivate theorem isV... [+1644 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Now let me check what `Array.size_take` and friends look like.
+[tool] mcp__lean__lean_completions({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 1037, "column": 25})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+47 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+46 chars])
+Given the immense complexity, let me proactively communicate progress and continue building the master proof. Let me first add the Array.take helpers and the SecondByteOk evaluation lemmas.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\ntheorem run_utf8_validation_ok_iff_isValidUtf8 (v : RustSlice u8... [+4649 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_hover_info({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 933, "column": 18})
+[tool] Grep({"pattern": "size_take|getElem_take|Array.take_size", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modifi... [+83 chars])
+[tool] Grep({"pattern": "Array.take|Array.size_take|Array\\.take", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modif... [+80 chars])
+[tool] mcp__lean__lean_hover_info({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 932, "column": 22})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-! ### Array.take helpers used by the prefix-valid invariant. -... [+1076 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error", "end_line": 945, "start_line": 930})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem secondByteOk_w3_explicit (first b2 : u8)\n    (h... [+7116 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+46 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n    \u00b7 right; right; left\n      refine \u27e8?_, ha, hb\u27... [+502 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Now let me write the master correctness lemma. I'll build the proof structure with strategic sorries first and fill in.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\ntheorem run_utf8_validation_ok_iff_isValidUtf8 (v : RustSlice u8... [+246 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+47 chars])
+Given the enormous complexity, let me write the master lemma in one comprehensive attempt.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\ntheorem run_utf8_validation_ok_iff_isValidUtf8 (v : RustSlice u8... [+3215 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n  \u00b7 intro h\n    show run_utf8_validation_u8.validate_at v ... [+834 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n        exact Bool.true_ne_false h_false\n===\n        exact abs... [+138 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Let me write the master lemma proof. Given complexity, I'll use prefix-valid helper lemmas and write each case carefully.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem validate_at_correct (v : RustSlice u8) :\n    \u... [+9450 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem prefix_at_self (bs : Array u8) (m : Nat) (h : m ... [+420 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem prefix_at_self (bs : Array u8) (m : Nat) (h : m ... [+397 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem prefix_at_self (bs : Array u8) (m : Nat) (h : m ... [+443 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Given the immense complexity, let me try writing the master proof. I'll write a substantial chunk and iterate.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem validate_at_correct (v : RustSlice u8) :\n    \u... [+5895 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n    \u00b7 push_neg at hi_ge\n      have h_size_lt : v.val.size ... [+9294 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n      \u00b7 -- ASCII case: recurse +1.\n        have h_step := ... [+2059 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n        | Err err =>\n          obtain \u27e8h_false, h_lo, h_hi... [+936 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+47 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n          \u00b7 intro n hn\n            injection hn with hn_eq... [+1883 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n          \u00b7 intro hn_none\n            exact (core_models.o... [+526 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Let me add leaf step lemmas for width 2 and the width-2 case in the master.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-! ### Continuation-byte and SecondByteOk decision lemmas. -/\n... [+5705 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "cont_byte_iff|validate_at_w2_unfold|validate_at_w2_bad_cont", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8... [+125 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+46 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-! ### Leaf step lemmas for the width-2 branches. -/\n\nprivate... [+5691 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Negated form for the != branches in the recursive body. -/\n... [+6035 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+46 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n  have h_eq_get : v.val[(index + 1).toNat]'hi1_take = v.val[inde... [+2317 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n          by_cases h_w2 : (v.val[index.toNat]'hi_lt).toNat < 224... [+4654 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n              \u00b7 intro _\n                refine \u27e8hi_lt... [+310 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n              \u00b7 intro _\n                refine \u27e8hi_lt... [+508 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Given how close I am to running out of time, let me make a strategic decision. I'll write w3 and w4 step lemmas + master cases as one large patch.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem validate_at_w2_recurse (v : RustSlice u8) (index... [+10124 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Given the time constraints, let me take a strategic step back. Let me roll back the incomplete w3 attempt and try a more compact approach.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-! ### Leaf step lemmas for the width-3 branches. -/\n\n/-- Wid... [+6387 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Given the time spent and complexity, let me make a pragmatic final push: complete the iff theorem and the other 3 obligation derivations using the master (which has w3/w4 sorries). Let me also remove the incomplete w3 leaf attempts and finalize.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- **`prop_valid_up_to_marks_valid_prefix`** \u2014 on `Err`, `... [+5808 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n  | Err err' =>\n    injection h with h1\n    injection h1 with ... [+1651 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "warning"})
+Let me run lake build to check the final state.
+[tool] run_lake_build({})
+The build succeeds with returncode 0 but has a sorry warning in the master lemma. Given the immense scope of remaining work (w3 + w4 cases would require ~1000 more lines of mechanical case analysis), let me update the master lemma's docstring with an honest acknowledgment of the partial state, and produce the final summary.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem validate_at_correct (v : RustSlice u8) :\n    \u... [+2255 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] run_lake_build({})
+The build completes. Let me provide the final summary.
+
+## Final Output
+
+### Files changed and what was added
+
+**File edited:** `proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean`
+
+I added a substantial proof infrastructure (~1600 lines of new content):
+
+**Helper lemmas:**
+- `RustM_ok_bind`, `usize_one_toNat`, `usize_add_one_toNat`, `usize_add_one_ok`, `getElem_ok` — boilerplate transferred from `contains_u64` / `below_zero` references
+- `u8_lit_toNat` family — explicit `.toNat` values for the byte thresholds (128/192/194/etc.)
+- `nat_and_192_iff` (via `native_decide` on Fin 256) and `cont_byte_iff` / `cont_byte_ne_iff` — bridge between the bit-pattern check `(b &&& 0xC0) = 0x80` and the `IsContByte` predicate
+- `array_take_size_le`, `array_take_getElem`, `prefix_at_self` — for the prefix-valid invariant
+
+**Step lemmas for `validate_at` (the Rust function):**
+- `validate_at_oob`, `validate_at_ascii`, `validate_at_w0`
+- `validate_at_non_ascii_unfold` — global unfolding under `index < size ∧ first ≥ 128`
+- `validate_at_w2_unfold`, `validate_at_w3_unfold`, `validate_at_w4_unfold` — width-specific unfoldings (collapse the `utf8_char_width` chain)
+- `validate_at_w2_trunc`, `validate_at_w2_bad_cont`, `validate_at_w2_recurse` — leaf step lemmas for the three w2 sub-cases
+- `secondByteOk_w3_explicit`, `secondByteOk_w4_explicit` — match the explicit byte-range chain in the Rust code against `SecondByteOk`
+
+**Step lemmas for `isValidUtf8From` (the Lean spec):**
+- One per branch (18 total): `_oob`, `_ascii`, `_invalid`, `_w2_trunc`, `_w2_bad`, `_w2_ok`, `_w3_trunc1`/`_bad_second`/`_trunc2`/`_bad_third`/`_ok`, `_w4_*` (7 sub-cases)
+
+**Prefix-valid-back helpers** (`prefix_valid_back_{ascii,w2,w3,w4}`): lift the IH's `isValidUtf8From (v.val.take K) (index+step) = true` to `isValidUtf8From (v.val.take K) index.toNat = true` by replaying the appropriate isValidUtf8From step lemma on the truncated array.
+
+**`ValidateAtSpec`** predicate and **master correctness lemma `validate_at_correct`** by strong induction on `v.val.size - index.toNat`.
+
+**Four obligation theorems** (`run_utf8_validation_ok_iff_isValidUtf8`, `run_utf8_validation_err_prefix_valid`, `run_utf8_validation_err_error_len_some_in_range`, `run_utf8_validation_err_error_len_none_truncation`) — each derived from `validate_at_correct` by a short pattern-match + projection.
+
+### Sub-goals that were difficult and how resolved
+
+- **Bit-pattern check `(b &&& 0xC0) = 0x80 ↔ IsContByte b`** — `decide` on the 256-element Fin overflowed the kernel reducer; `bv_decide` couldn't preprocess the mixed Nat/BitVec form. Resolved with `native_decide` on `∀ k : Fin 256, …`, lifted to the UInt8 statement via `nat_and_192_iff`.
+- **`isValidUtf8From` step lemmas** — the `unfold isValidUtf8From` initially unfolded *both* sides of the equation, breaking the recursive structure. Switched to `conv => lhs; unfold` and a single `isValidUtf8From_unfold_at` lemma that pins the unfolding to the LHS.
+- **`if_pos rfl` residuals** — every `decide_eq_true` substitution left `if True then ... else ...` residuals. Adding `if_true` to the simp set wasn't always enough; some w3/w4 cases needed an explicit `show ((true : Bool) = true) = True from by simp` rewrite to collapse a `(decide _ = true)` Bool predicate inside the `if`.
+- **`SecondByteOk` 7-disjunct case split** — the original definition has 7 disjuncts spanning both width-3 and width-4 leaders; the explicit byte-range chain in Rust gives 4 disjuncts (for w3) or 3 disjuncts (for w4). Resolved by `secondByteOk_w3_explicit` / `secondByteOk_w4_explicit` lemmas that prove the equivalence under the appropriate width precondition.
+
+### Obligations left as `sorry`
+
+**One `sorry`, in the private helper `validate_at_correct` (the master lemma).** Specifically, the `validate_at_correct` strong induction is finished for the **OOB**, **ASCII**, **width-0-small**, **width-0-large**, and **width-2** cases (5 of 17 leaf cases plus 1 base case), but the **width-3** (5 sub-cases) and **width-4** (7 sub-cases) cases — 12 of 17 — remain.
+
+The four top-level obligations themselves contain no `sorry`; they derive in 3–8 lines from `validate_at_correct` and would close fully if the master were fully proved. The build reports a single `declaration uses 'sorry'` warning, located at the master lemma.
+
+**Technical reason these cases were not closed in this turn:** each of the remaining 12 sub-cases requires (i) a leaf step lemma for `validate_at` derived from `validate_at_w{3,4}_unfold` — these have the additional `ok2` Bool computation that must be reduced to `decide (SecondByteOk first b2)` via the explicit byte-range chain — and (ii) a master sub-case that threads the IH (for the recurse branches) or constructs the spec directly (for the err branches), following the exact pattern of the completed width-2 case (~110 lines × 12 sub-cases ≈ 1300 lines of additional code). All the necessary supporting infrastructure — width-unfolding lemmas, `secondByteOk_*_explicit` equivalences, the eight `isValidUtf8From_w{3,4}_*` step lemmas, and the `prefix_valid_back_{w3,w4}` lift helpers — is already proved in this file. The remaining work is mechanical glue along the same shape as the completed width-2 case.
+
+**I cannot honestly write the strong admission required by the goal section** — namely, that no future iteration of this pipeline with the same model and references could complete this. The remaining work is mechanical, not impossible. A future pass picking up from this state with the existing infrastructure would close it. What I am admitting is only that the 1300-line continuation exceeded my time budget for this single turn.
+[make_proof] turn 1 done — 2 sorry remain
+
+[make_proof] turn 2/2
+Let me push through and finish the w3 and w4 cases. First, let me look at the current state of the file and find the sorries.
+[tool] Grep({"pattern": "sorry", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf... [+71 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+47 chars])
+Let me write the w3 helper lemma first, then the leaf step lemmas, then complete the w3 master case. I'll commit to a substantial patch.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+46 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+46 chars])
+Let me write the w3 case in the master. I'll take a strategic approach: write leaf step lemmas using `native_decide` for the ok2 evaluation.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n-- (Width-3 and width-4 leaf step lemmas are deferred \u2014 the... [+7437 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "private theorem secondByteOk_w3_explicit|private theorem w3_ok2_compute|private theorem isValidUtf8From_unfold_at|private theorem array_take_size_l... [+214 chars])
+[tool] Grep({"pattern": "infixl:.. \\\" &&\\?", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/ext... [+54 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/.lake/packages/Hax/hax... [+62 chars])
+Let me revert the broken w3 attempt and take a different approach: write the w3 and w4 master cases inline.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-! ### Leaf step lemmas for the width-3 branches.\n\nWe reduce ... [+7318 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "private theorem prefix_at_self|private theorem validate_at_correct|private theorem secondByteOk_w4_explicit|/-! ### Prefix-valid step", "path": "/h... [+199 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+47 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+47 chars])
+Let me try a different approach: write `w3_ok2_compute` more carefully using simp + by_cases.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\nprivate theorem prefix_at_self (bs : Array u8) (m : Nat) (h : m ... [+11733 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Let me write the w3 leaf step lemmas with a fresh approach.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-! ### Width-3 leaf step lemmas (combining `validate_at_w3_unfo... [+21596 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_completions({"file_path": "Run_utf8_validation_u8Obligations.lean", "line": 1357, "column": 74})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n    rw [decide_eq_decide.mpr h_b2_lo, decide_eq_decide.mpr h_b2_... [+3770 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n    rw [decide_eq_decide.mpr h_b2_lo, decide_eq_decide.mpr h_b2_... [+3384 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n    have h_and_decide :\n        decide (160 \u2264 b2.toNat) &&... [+3234 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "decide_and|@\\[simp\\].*decide.*and", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/... [+80 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n    have h_and_decide :\n        (decide (160 \u2264 b2.toNat) &... [+4044 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n    rw [decide_eq_decide.mpr h_b2_lo, decide_eq_decide.mpr h_b2_... [+2096 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n    rw [decide_eq_decide.mpr h_b2_lo, decide_eq_decide.mpr h_b2_... [+2271 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n    rw [decide_eq_decide.mpr h_b2_lo, decide_eq_decide.mpr h_b2_... [+1305 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Now let me write the 4 remaining w3 leaf step lemmas:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n          \u00b7 exfalso; have : first.toNat = (0xED : u8).toNat... [+12220 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+47 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n          \u00b7 exfalso; have : first.toNat = (0xED : u8).toNat... [+12280 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+The issue is that simp reduces the ok2 chain before h_ok2 can match. Let me restructure to apply h_ok2 first.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Width-3 bad second byte: i1 < size, \u00ac SecondByteOk \u21... [+22908 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+The issue is that `rust_primitives.cmp.ge` in simp unfolds the inner ok2 chain. Let me restructure to do step-by-step rewrites.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Width-3 bad second byte: i1 < size, \u00ac SecondByteOk \u21... [+5055 chars])
+[tool] Grep({"pattern": "validate_at_w3_bad_b2|validate_at_w3_trunc2|validate_at_w3_bad_cont|validate_at_w3_recurse", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claud... [+156 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+47 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Width-3 bad second byte: i1 < size, \u00ac SecondByteOk \u21... [+24749 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Given the magnitude of remaining issues and time, let me take a different strategy: revert the broken w3 leaf lemmas and instead use the `w3_ok2_eq` helper inline within the master lemma's w3 case.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Helper: the outer `(i1 >=? size)` check reduces to `pure (de... [+12309 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+47 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- Width-3 bad second byte: i1 < size, \u00ac SecondByteOk \u21... [+3857 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+Let me do a clean rollback by replacing the broken leaf lemmas with placeholders that build:
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf8_validation_u8... [+48 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n-- (Width-3 leaf step lemmas for bad-b2, trunc2, bad-cont, recur... [+9673 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Run_utf8_validation_u8Obligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "sorry", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified/proofs/lean/extraction/Run_utf... [+71 chars])
+The file is back to a buildable state with 2 sorries. Let me check the build status.
+[tool] run_lake_build({})
+The build succeeds with one sorry warning (the master lemma still has w3 and w4 sub-cases as sorries internally). I've made substantial additional progress this turn but the leaf step lemmas for w3 trunc2/bad_cont/recurse and all of w4 remain incomplete.
+
+Let me update the master's docstring to reflect the current state honestly.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Run_utf8_validation_u8Obligations.lean", "patch": "<<< SEARCH\n/-- **Partial completion.** This master lemma is proved by stron... [+4246 chars])
+[tool] run_lake_build({})
+## Final Summary
+
+### Additional progress this turn
+
+Building on the prior turn's infrastructure, this continuation added:
+
+**New helpers proven (closed proofs):**
+- `nat_neq_simp` — small bag of Nat inequalities for collapsing the `leadWidth = N` ifs in `isValidUtf8From_unfold_at`.
+- **`w3_ok2_eq`** (the critical w3 helper, ~140 lines): equates the explicit byte-range `ok2` chain in the Rust w3 path with `decide (SecondByteOk first b2)` under `224 ≤ first.toNat < 240`. The proof case-splits on `first.toNat ∈ {224, 225..236, 237, 238..239}` and reduces each branch via `decide_eq_decide.mpr` + the explicit byte-range form `secondByteOk_w3_explicit`. Uses `by_cases` on the `(decide P && decide Q) = decide (P ∧ Q)` Bool equation, proved by 4-way case analysis.
+- **`validate_at_w3_trunc1`**: closed proof of the w3 truncation-at-i1 case (Err None).
+
+**The 4 obligation theorems** continue to derive from the master `validate_at_correct` in 3-8 lines each.
+
+### Sub-goals that were difficult and how (partially) resolved
+
+The big new obstacle that emerged was the **tactic ordering problem** between `simp only [rust_primitives.cmp.ge, ...]` and `rw [h_ok2]`:
+
+- `rust_primitives.cmp.ge` unfolds *every* `>=?` in the goal — including the ones inside the inner ok2 byte-range chain (e.g., `b2 >=? 160`).
+- Once those `>=?` are rewritten to `pure (decide (...))`, the ok2 chain's syntactic shape no longer matches `w3_ok2_eq`'s LHS, and `rw [h_ok2]` fails to apply.
+- The fix is to reduce the *outer* `(i1 >=? size)` check via a targeted `rfl`-lemma (like `rust_ge_pure : a >=? b = pure (decide (b ≤ a))`) before any simp that would alter the inner chain, then apply `rw [h_ok2]` explicitly.
+
+I prototyped this fix and proved `w3_ok2_eq` with it, but ran out of time before completing the 4 w3 leaf step lemmas (`bad_b2`, `trunc2`, `bad_cont`, `recurse`) that wire the helper into the master's w3 sub-cases.
+
+### Obligations left as `sorry`
+
+**Still one `sorry` (in the private master `validate_at_correct`)**, on the w3 and w4 sub-cases of the strong induction. The 4 obligation theorems themselves contain no `sorry`; they all close in 3-8 lines from the master.
+
+**State of completion for the master lemma:**
+- ✅ OOB / ASCII / w0-small / w0-large / **w2 (full triad)** sub-cases — closed proofs.
+- ✅ All `isValidUtf8From_*` step lemmas, `validate_at_w*_unfold` lemmas, `secondByteOk_w*_explicit` lemmas, `prefix_valid_back_{ascii,w2,w3,w4}` helpers — closed proofs.
+- ✅ `w3_ok2_eq`, `validate_at_w3_trunc1` — closed proofs.
+- ❌ `validate_at_w3_{bad_b2, trunc2, bad_cont, recurse}` — 4 leaf step lemmas, structurally similar to the working `validate_at_w2_{bad_cont, recurse}` but with the ok2-chain reduction in the middle.
+- ❌ A `w4_ok2_eq` analogue (3-disjunct case split instead of 4).
+- ❌ 6 `validate_at_w4_*` leaf step lemmas.
+- ❌ The w3 and w4 sub-cases of the master `validate_at_correct` induction step.
+
+**Technical reason it's still not closed:** the 12 remaining sub-cases follow the same shape as the completed w2 triad, with the addition of the `ok2`-byte-range-chain reduction. Closing them is mechanical glue (estimated ~1000 lines of further tactic) — *not* the manifestation of an impossibility I could honestly disclaim. The tactic obstacle that I bumped into is concrete and documented in the master lemma's docstring; a future iteration can pick up from `w3_ok2_eq` and the `rust_ge_pure` reduction pattern.
+
+I cannot honestly write the strong admission that "no future iteration of this pipeline with the same model and references could complete this either." The remaining work is mechanical glue, and a future iteration with this turn's progress in the context window — particularly the `w3_ok2_eq` helper and the documented tactic-ordering fix — should be able to close it.
+[make_proof] turn 2 done — 2 sorry remain (was 2)
+[make_proof] used all 2 turns with 2 sorry remaining
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+[harvest_proof_patterns] (skipped: obligations file still contains `sorry` outside comments)
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260525-000847_run_utf8_validation_u8_stage_notes.json
+[cleanup] freed 356.5MB from benchmarks/claude-opus-4-7/validations/run_utf8_validation_u8_modified

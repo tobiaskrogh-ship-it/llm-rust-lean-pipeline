@@ -1,0 +1,387 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260525-021220_utf8_char_width_u8.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_char_width_u8/attempted_changes/20260525-021220
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "Cargo.toml"})
+Let me check the current state of the file and any other relevant context.
+[tool] Read({"file_path": "src/lib.rs"})
+Now I understand the contract. The function is total over `u8` (256 inputs, no preconditions, never panics), and its return value is fully determined by which of six ranges the input falls in. Since the input space is finite and small, exhaustive iteration over each range is the right "property-based" approach.
+
+I'll replace the existing boundary unit tests with property tests that cover the whole input space — each test asserts one independent clause of the contract.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n#[cfg(test)]\nmod tests {\n    use super::utf8_char_width;\n\n    #[test]\n    fn ascii_bytes_have_width_1() {\n   ... [+3226 chars])
+[tool] run_cargo_test({})
+All 6 tests pass.
+
+## Summary
+
+The function `utf8_char_width: u8 -> usize` is total (no preconditions, never panics) and its return value is entirely determined by the RFC 3629 partition of the 256 byte values. Because the input space is finite and small, the most thorough form of "property-based" test is exhaustive iteration over each contract range.
+
+### Tests included (each captures one independent postcondition clause)
+
+| Test | Range | Width | Contract clause |
+|------|-------|-------|-----------------|
+| `ascii_range_has_width_1` | `0x00..=0x7F` | 1 | ASCII bytes are single-byte sequences |
+| `continuation_and_overlong_have_width_0` | `0x80..=0xC1` | 0 | Continuation bytes (0x80–0xBF) and overlong 2-byte leaders (0xC0, 0xC1) are not valid first bytes |
+| `two_byte_leaders_have_width_2` | `0xC2..=0xDF` | 2 | 2-byte sequence leaders |
+| `three_byte_leaders_have_width_3` | `0xE0..=0xEF` | 3 | 3-byte sequence leaders |
+| `four_byte_leaders_have_width_4` | `0xF0..=0xF4` | 4 | 4-byte sequence leaders (capped at U+10FFFF) |
+| `high_invalid_have_width_0` | `0xF5..=0xFF` | 0 | High bytes beyond U+10FFFF are invalid |
+
+Total / no-panic behaviour is implicitly tested by every iteration (a panic on any input would fail the corresponding range test).
+
+### Properties considered but deliberately excluded
+
+- **Global range bound** (`result ∈ {0,1,2,3,4}` for all `b`). Derived — every byte falls in exactly one of the six ranges above and is pinned to a specific value, so the bound follows automatically. A test asserting only this bound would also be satisfied by any wrong-but-in-range implementation, so it doesn't earn its place.
+- **"Width 0 iff byte is not a valid leader" / "Width 1 iff byte is ASCII"** bi-implications. These are exactly the union of the per-range tests, so stating them separately would duplicate coverage.
+- **Tightness of the upper bound** ("width ≤ 4 and width = 4 is reachable"). Both halves are already implied by the four-byte-leader test plus the partition.
+- **Properties of the result number** (parity, ordering across ranges, etc.). These are derived facts about `{0,1,2,3,4}` rather than independent claims about the function, exactly the kind of derived properties the guidance asks to avoid.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+Looking at the source, this is an exact match for the archived `large_const_lookup_table_to_branches.rs` pattern — a 256-byte lookup table that will trip `lake build` with "maximum recursion depth has been reached". The archived `// after` shape is literally for this UTF-8 char width function. I'll apply it.
+
+Let me first inspect the working crate to confirm structure and the file path.
+[tool] Glob({"pattern": "**/Cargo.toml"})
+[tool] Glob({"pattern": "**/src/lib.rs"})
+[tool] Read({"file_path": "src/lib.rs"})
+The working crate matches the archive pattern's example exactly — UTF-8 char width with a 256-byte lookup table. The tests in the working crate are more exhaustive but cover the same range partition that the branch chain reproduces:
+
+- ASCII `0x00..=0x7F` → width 1 ✓ (`b < 0x80`)
+- `0x80..=0xC1` → width 0 ✓ (`b < 0xC2`)
+- `0xC2..=0xDF` → width 2 ✓ (`b < 0xE0`)
+- `0xE0..=0xEF` → width 3 ✓ (`b < 0xF0`)
+- `0xF0..=0xF4` → width 4 ✓ (`b < 0xF5`)
+- `0xF5..=0xFF` → width 0 ✓ (else)
+
+Let me first establish the baseline with `cargo test`, then apply the archived rewrite.
+[tool] run_cargo_test({})
+Baseline tests pass. Now let me confirm the failure mode by running extraction + lake build first (so I have a documented stderr to report).
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+Exact match for the archive pattern's stderr: `maximum recursion depth has been reached` at the 256-element literal, plus the cascading `Unknown identifier 'UTF8_CHAR_WIDTH'` and `declaration uses 'sorry'`. Applying the archived `// after` rewrite now.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n//! Extracted from `core::str::validations::utf8_char_width`.\n//!\n//! Given a first byte, determines how many byt... [+3222 chars])
+Now run the gating sequence: `cargo test` → `cargo hax into lean` → `lake build`.
+[tool] run_cargo_test({})
+All 6 tests pass after the rewrite. Proceed to extraction + build.
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+All three stages green. Let me check the extracted Lean for Hax-degenerate patterns (eager `do`-block traps, `sorry`s, oversized measures, etc.).
+[tool] Read({"file_path": "proofs/lean/extraction/utf8_char_width_u8.lean"})
+The extracted Lean is clean — six `if`/`else` branches over total `u8` comparisons returning pure `usize` literals. No `sorry`, no eager-`do`-block traps, no `while_loop_return`, no unmodeled identifiers, no `loop_invariant!` / `loop_decreases!` issues. Nothing for the proof stage to work around.
+
+## Summary
+
+**Final state**: `cargo test` ✓ (6/6), `cargo hax into lean` ✓, `lake build` ✓. No Hax-degenerate patterns in the extracted Lean.
+
+### Errors that drove the change
+
+```
+lake build error: utf8_char_width_u8.lean:20:27: maximum recursion depth has been reached
+                  use `set_option maxRecDepth <num>` to increase limit
+error: utf8_char_width_u8.lean:281:7: Unknown identifier `UTF8_CHAR_WIDTH`
+warning: utf8_char_width_u8.lean:278:2: declaration uses `sorry`
+```
+
+Cause: Hax elaborates the 256-element `&[u8; 256]` literal as a Lean `#v[...]` vector. Elaboration recurses once per element, blowing past the default `maxRecDepth`. Every use site of `UTF8_CHAR_WIDTH` then fails to resolve, and the `def` is silently filled with `sorry`.
+
+### Pattern applied
+
+`rewrite_patterns/large_const_lookup_table_to_branches.rs` — exact match (the archive entry's example is literally `utf8_char_width`). Replaced the 256-byte constant table with a 6-branch `if`/`else` chain over the contiguous byte ranges that carry distinct values:
+
+| Range | Width | Reason |
+|---|---|---|
+| `0x00..=0x7F` | 1 | ASCII |
+| `0x80..=0xC1` | 0 | continuation bytes + overlong 2-byte leaders |
+| `0xC2..=0xDF` | 2 | 2-byte sequence leaders |
+| `0xE0..=0xEF` | 3 | 3-byte sequence leaders |
+| `0xF0..=0xF4` | 4 | 4-byte sequence leaders |
+| `0xF5..=0xFF` | 0 | beyond U+10FFFF |
+
+The function is semantically identical to the original on every `u8` input. All six exhaustive-range tests cover this partition byte-by-byte and continue to pass.
+
+### Library calls inlined
+
+None — no methods like `.abs()` / `.pow()` / `.is_power_of_two()` were involved.
+
+### Patterns considered but not changed
+
+- **Short-circuit `&&` / `||` over partial ops**: not present (no `&&`/`||` in the function body at all).
+- **`while`-loop → tail recursion**: no loops to rewrite.
+- **`loop_invariant!` / `loop_decreases!`**: not used; no auto-spec generated since there's no `#[hax_lib::requires(...)]`.
+- **Lean keyword collisions**: `utf8_char_width` and `utf8_char_width_u8` are not Lean keywords.
+
+### Suspected semantic changes
+
+None. The branch chain is a faithful range-decomposition of the original table. Tests `ascii_range_has_width_1`, `continuation_and_overlong_have_width_0`, `two_byte_leaders_have_width_2`, `three_byte_leaders_have_width_3`, `four_byte_leaders_have_width_4`, and `high_invalid_have_width_0` each iterate exhaustively over their respective sub-range of `0x00..=0xFF` and would catch any single-byte mismatch — all pass.
+
+### Hax-degenerate patterns not fixable at source
+
+None — the extracted Lean (shown above) is fully concrete with no `sorry`s, no `RustM.fail` traps under guards, and no proof-blocking shapes.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_char_width_u8/attempted_changes/20260525-021220/*stage2_rust_hax_lean*"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_char_width_u8/attempted_changes/20260525-021220/*"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_char_width_u8/attempted_changes/20260525-021220/0002_stage2_rust_hax_lean_patched/m... [+14 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_char_width_u8/attempted_changes/20260525-021220/0002_stage2_rust_hax_lean_patched/e... [+18 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_char_width_u8/attempted_changes/20260525-021220/0002_stage2_rust_hax_lean_patched/s... [+19 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/rewrite_patterns/large_const_lookup_table_to_branches.rs"})
+The single rewrite-stage patch in this log is an exact instance of an already-archived pattern.
+
+## Final report
+
+**Patterns written:** none.
+
+**Attempts inspected:**
+
+- `0002_stage2_rust_hax_lean_patched/` — Replaced a 256-element `const UTF8_CHAR_WIDTH: &[u8; 256]` lookup table with a 6-branch `if/else` chain over contiguous byte ranges. Triggered by `lake build` failing with `maximum recursion depth has been reached` plus cascading `Unknown identifier 'UTF8_CHAR_WIDTH'` / `declaration uses 'sorry'`. **Skipped: already covered by `rewrite_patterns/large_const_lookup_table_to_branches.rs`** — in fact the existing pattern's `before` block is literally an abbreviated version of this same table and its `after` block is the same 6-branch rewrite. The rewrite agent's `trigger_error` even cites the existing pattern by name.
+
+(Attempt `0001_stage1_make_pbt_patched/` is a stage-1 attempt and out of scope per the skill rules.)
+
+**Confusing / flag-for-human:** nothing.
+
+harvest_rewrite_patterns
+## Summary of changes
+
+The rewrite replaces a 256-element constant lookup table `UTF8_CHAR_WIDTH` (indexed by `b as usize`) with an explicit branch chain over the 6 contiguous byte ranges that carry distinct values. The function signature, `#[must_use]`, `#[inline]`, and `const` qualifiers are unchanged. The test module is identical.
+
+## Range-by-range correspondence
+
+| Input range | Original table value | Rewritten branch | Result |
+|-------------|---------------------|------------------|--------|
+| `0x00..=0x7F` | 1 | `b < 0x80` → 1 | match |
+| `0x80..=0xBF` | 0 | `b < 0xC2` → 0 | match |
+| `0xC0..=0xC1` | 0 | `b < 0xC2` → 0 | match |
+| `0xC2..=0xDF` | 2 | `b < 0xE0` → 2 | match |
+| `0xE0..=0xEF` | 3 | `b < 0xF0` → 3 | match |
+| `0xF0..=0xF4` | 4 | `b < 0xF5` → 4 | match |
+| `0xF5..=0xFF` | 0 | else → 0 | match |
+
+The branch boundaries (`0x80, 0xC2, 0xE0, 0xF0, 0xF5`) exactly partition the table into its constant-value blocks. The chain is ordered ascending and each cutoff equals the first byte of the next block, so each `b` falls into exactly one arm with the same value as the table lookup.
+
+## Panic semantics
+
+The original lookup `UTF8_CHAR_WIDTH[b as usize]` cannot panic: the table has 256 elements and `b as usize` ranges over `0..=255`. The rewritten branch chain trivially cannot panic either. Both functions are total on `u8`.
+
+## Conclusion
+
+For every `b: u8` the two implementations produce identical `usize` outputs and neither panics. The included tests (which exhaustively cover all 256 bytes) would pass equally for both.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target: `utf8_char_width` is a **total** function on `u8` that returns a `usize` via a chain of 5 nested `if b < <literal> then <const> else …` branches. No arithmetic, no recursion, no loops, no partial operators — every Rust operator in sight is unsigned `<` between a `u8` variable and a `u8` literal, which is total. The proof obstacles are therefore narrow: (a) showing the function is total (no `fail`), and (b) pinning down the output for each of the 6 byte ranges that the tests enumerate.
+
+I'll inspect the two strongest tag-matches before committing.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clamp_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clamp_modified/proofs/lean/extraction/ClampObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/proofs/lean/extraction/SliceGetU64Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/proofs/lean/extraction/*Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/*Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/min_modified/proofs/lean/extraction/*Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/saturating_subObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/proofs/lean/extraction/Slice_get_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/min_modified/proofs/lean/extraction/MinObligations.lean"})
+Read the matched files. The pattern is clear — the target is a non-recursive, no-arithmetic, no-loops total `u8 → usize` function whose proof shape is "one postcondition lemma per byte range + a totality theorem via `by_cases` dispatch." Five examples cover this exactly.
+
+---
+
+**Selected examples:**
+
+```
+proof_patterns/saturating_sub_modified
+proof_patterns/clamp_modified
+proof_patterns/slice_get_u64_modified
+proof_patterns/min_modified
+proof_patterns/is_zero_modified
+```
+
+**Per-pick rationale:**
+
+- `proof_patterns/saturating_sub_modified` — **closest match overall.** Same extraction style (`if (← b <? c) then pure v else …`) with the `saturating_sub a b = pure v` postcondition shape, branch-split-totality via `by_cases`, and the canonical `UInt8.lt_iff_toNat_lt` / `UInt8.le_iff_toNat_le` bridges for deriving `¬ (a > b)` from a `≤` hypothesis — exactly what's needed to chain past each `b <? <lit>` in the target.
+- `proof_patterns/clamp_modified` — only library example with **nested-if + inequality-comparison + u8 + total**; demonstrates the alternative `mvcgen [clamp]; all_goals grind` one-liner per range, which may close each of the 6 utf8 ranges in a single tactic line.
+- `proof_patterns/slice_get_u64_modified` — canonical **branch-split totality** template: pairs per-branch postcondition lemmas with a `∃ v, f x = RustM.ok v` totality theorem that `by_cases` on the guard and dispatches to whichever clause applies. The target needs the same totality theorem over 6 ranges instead of 2.
+- `proof_patterns/min_modified` — `total-function + inequality-comparison + functional-correctness` on u8 via `hax_mvcgen [...] <;> bv_decide` — useful fallback tactic if `grind` doesn't close the nested-if cases. Also shows `disjunctive-postcondition` projection, relevant for the "high_invalid_have_width_0" + "continuation_and_overlong_have_width_0" two-disjoint-ranges-share-a-value case.
+- `proof_patterns/is_zero_modified` — minimal `total-function + rfl-proof` template, useful as a sanity check on the simplest do-block shape after all `<?` bindings collapse.
+
+**Gaps (not covered by any example):**
+
+- **5+ level nested if/else chain over a single scalar** — clamp tops out at 2 levels; the target has 5. No example demonstrates this depth, so the proof agent will have to extrapolate (the per-range `mvcgen [utf8_char_width]; grind` pattern should still work, but no precedent exists in the library).
+- **Per-range byte-classification postcondition** (`b < 0x80 → r = 1`, `0x80 ≤ b < 0xC2 → r = 0`, …) — the closest analogue is `slice_get_u64`'s 2-branch range split. A 6-branch byte-classifier would be a useful library addition (UTF-8 / character-category / opcode-decode tables all share this shape).
+- **`u8 → usize` shape** — every total function in the library returns the same type as its input. Returning a usize from a u8 introduces no extra obstacle (the `usize` literals come from `pure`, no cast), but no example demonstrates it explicitly.
+
+**Rejections (considered, dropped):**
+
+- `truncate_number_modified` — partial `%?` discharge, target has no arithmetic.
+- `utf8_acc_cont_byte_u32_modified` — same domain name (UTF-8), but the obstacle is bitfield + `bv_decide`, not range classification.
+- `add_one_modified`, `square_modified`, `factorial_modified`, `sum_to_n_modified`, `abs_diff_i64_modified` — overflow / `if-branch-on-overflow`; target has no arithmetic.
+- `gcd_while_modified`, `while_example`, `max_odd_part_modified`, `trailing_zeros_u64_modified` — loop-invariant proofs; target is straight-line.
+- `binomial_u64_modified`, `gcd_recursive_modified`, `contains_u64_modified`, `is_prime_modified`, `sqrt_u64_modified`, `sum_product_modified`, `clever_*`, `below_zero_modified`, `largest_divisor_modified`, `recursion_example`, `000_has_close_elements_modified` — recursion / strong-induction; target is non-recursive.
+- `average_ceil_u64_modified`, `average_floor_u64_modified`, `is_size_align_valid_usize_modified`, `padding_needed_for_usize_modified`, `repeat_usize_modified`, `repeat_packed_usize_modified`, `gcd_stein_u64_modified` — bit-manip / `bv_decide` / helper composition; wrong obstacle class.
+- `map_next_u64_modified`, `map_rfold_u64_modified`, `map_try_rfold_u64_modified` — higher-order iterator adapters; target has no closures.
+- `clever_044_triangle_area_modified` — signed mul + static div; target has no arithmetic.
+- `rescale_to_unit_modified` — Vec construction + composed helpers; target returns a scalar.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Utf8_char_width_u8Obligations.lean
+[scaffold] registered Utf8_char_width_u8Obligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/saturating_subObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clamp_modified/proofs/lean/extraction/ClampObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/proofs/lean/extraction/Slice_get_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/min_modified/proofs/lean/extraction/MinObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_zero_modified/proofs/lean/extraction/Is_zeroObligations.lean"})
+Now I have a clear picture of the pattern. The closest match is `saturating_sub_modified` (equational form with preconditions as hypotheses). Let me draft the obligations file with theorem statements using `sorry` proofs.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "patch": "<<< SEARCH\nnamespace Utf8_char_width_u8Obligations\n\n-- Add `theorem` declarat... [+2716 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_char_width_u8Obligations.lean"})
+All seven theorem statements are well-typed. Only `sorry` warnings remain (expected at this stage). Let's confirm with a `lake build`:
+[tool] run_lake_build({})
+Build succeeds with only the expected `sorry` warnings. Done.
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Utf8_char_width_u8Obligations.lean`
+
+**Theorems added (7 total — one per contract clause):**
+
+| Theorem | Contract clause |
+|---|---|
+| `utf8_char_width_ascii` | `b < 0x80 → width = 1` (test `ascii_range_has_width_1`) |
+| `utf8_char_width_continuation_and_overlong` | `0x80 ≤ b < 0xC2 → width = 0` (test `continuation_and_overlong_have_width_0`) |
+| `utf8_char_width_two_byte_leader` | `0xC2 ≤ b < 0xE0 → width = 2` (test `two_byte_leaders_have_width_2`) |
+| `utf8_char_width_three_byte_leader` | `0xE0 ≤ b < 0xF0 → width = 3` (test `three_byte_leaders_have_width_3`) |
+| `utf8_char_width_four_byte_leader` | `0xF0 ≤ b < 0xF5 → width = 4` (test `four_byte_leaders_have_width_4`) |
+| `utf8_char_width_high_invalid` | `0xF5 ≤ b → width = 0` (test `high_invalid_have_width_0`) |
+| `utf8_char_width_total` | totality / no-panic on every `u8` (implicit in every exhaustive test) |
+
+**Property tests classified as derived facts (skipped):** None. Every property test in `src/lib.rs` corresponds to a per-range postcondition theorem above.
+
+**Feasibility check:** The function takes a `u8` (no overflow possible), uses only total unsigned `<` comparisons against literals, and returns a `usize` via `pure` in every branch. The universal statements are all genuinely true in the Lean model — no preconditions needed beyond the per-range guards that select the branch, and totality holds for *every* `u8`.
+
+**Framing choices:** Followed the `saturating_sub` reference shape (equational `f x = pure v` with preconditions as hypotheses) rather than Hoare triples, since each precondition is just a constraint that selects a branch — not a non-trivial invariant. Totality is stated as `∃ v, f b = pure v` in the `slice_get` style, dispatchable by `by_cases` on the six guards.
+
+**Uncertainties:** None — all seven statements type-check cleanly under both the LSP and `lake build`, the per-range form matches the tests exactly, and the totality theorem is the canonical no-panic obligation for a function whose every branch ends in `pure`.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 7 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/saturating_subObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clamp_modified/proofs/lean/extraction/ClampObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/proofs/lean/extraction/Slice_get_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/min_modified/proofs/lean/extraction/MinObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_zero_modified/proofs/lean/extraction/Is_zeroObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/saturating_sub.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/**/*.lean"})
+[tool] Glob({"pattern": "**/proof-libs/lean/**/*.lean"})
+[tool] Grep({"pattern": "def.*\\?|<\\?|>\\?|cmp\\.lt|cmp\\.gt", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "o... [+42 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 60, "limit": 120})
+[tool] Read({"file_path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "Trying first proof attempt for utf8_char_width_ascii \u2014 saturating_s... [+453 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_char_width_u8Obligations.lean"})
+The ASCII proof works. Let me apply the same pattern to the remaining branches.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "Apply same pattern to continuation_and_overlong case: first cond false, ... [+739 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_char_width_u8Obligations.lean", "severity": "error"})
+No errors. Now let me do the remaining branches.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "Apply pattern for two_byte_leader: first two conds false, third true.", ... [+906 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "Apply pattern for three_byte_leader.", "patch": "<<< SEARCH\ntheorem utf... [+1079 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "Apply pattern for four_byte_leader.", "patch": "<<< SEARCH\ntheorem utf8... [+1278 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "Apply pattern for high_invalid: all conds false.", "patch": "<<< SEARCH\... [+1337 chars])
+Now totality — dispatch by `by_cases` to whichever range applies.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "Totality via by_cases on each range guard, dispatching to the appropriat... [+2139 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_char_width_u8Obligations.lean"})
+[tool] mcp__lean__lean_multi_attempt({"file_path": "Utf8_char_width_u8Obligations.lean", "line": "38", "tactics": "[\"have hcond1 : decide (b < (128 : u8)) = false := by exact decide_eq_false (not_... [+198 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "offset": 50, "limit": 100})
+The omega isn't normalizing `UInt8.toNat 128`. Let me try a simpler approach — `omega` on `UInt8` directly.
+[tool] write_working_file({"path": "/tmp/test_omega.lean", "content": "import Hax\nopen Std.Do\nopen Std.Tactic\n\nexample (b : UInt8) (h1 : 194 \u2264 b) (hlt : b < 128) : False := by\n... [+188 chars])
+[tool] Grep({"pattern": "UInt8.toNat_ofNat|UInt8.toNat.*= [0-9]|omega.*UInt8", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "... [+27 chars])
+[tool] Grep({"pattern": "UInt8.toNat_ofNat", "output_mode": "files_with_matches", "head_limit": 10})
+[tool] mcp__lean__lean_hover_info({"file_path": "Utf8_char_width_u8Obligations.lean", "line": 57, "column": 5})
+[tool] Grep({"pattern": "not_lt_of_ge|not_lt_of_le|Nat.not_lt", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "head... [+12 chars])
+[tool] mcp__lean__lean_multi_attempt({"file_path": "Utf8_char_width_u8Obligations.lean", "line": "57", "tactics": "[\"exact absurd h1 (not_le_of_lt (lt_of_lt_of_le hlt (by decide : (128:u8) \u2264 ... [+224 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "omega doesn't normalize (n:u8).toNat constants. Add explicit decide-eval... [+1713 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_char_width_u8Obligations.lean", "severity": "error", "start_line": 45, "end_line": 75})
+Let me extract a helper and apply it to all remaining cases.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "Introduce a private helper that derives `decide (b < n) = false` from `m... [+696 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_char_width_u8Obligations.lean", "severity": "error", "start_line": 15, "end_line": 35})
+[tool] mcp__lean__lean_completions({"file_path": "Utf8_char_width_u8Obligations.lean", "line": 29, "column": 25})
+[tool] mcp__lean__lean_completions({"file_path": "Utf8_char_width_u8Obligations.lean", "line": 29, "column": 23})
+[tool] Grep({"pattern": "UInt8\\.(lt_of|le_of|not_lt|not_le)", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "head_... [+11 chars])
+[tool] mcp__lean__lean_completions({"file_path": "Utf8_char_width_u8Obligations.lean", "line": 29, "column": 23})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "lt_of_lt_of_le / not_lt_of_ge unavailable for u8. Route through toNat + ... [+1181 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_char_width_u8Obligations.lean", "severity": "error", "start_line": 15, "end_line": 40})
+Helper works. Now let me simplify all the branches using this helper.
+[tool] Read({"file_path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean"})
+Now let me rewrite the file using the helper consistently:
+[tool] write_working_file({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "overwrite": true, "error_message": "Clean rewrite: use a single helper `decide_lt_false_o... [+7643 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_char_width_u8Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_char_width_u8Obligations.lean", "error_message": "le_refl missing; replace with explicit `by decide` for the trivial concr... [+3366 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_char_width_u8Obligations.lean"})
+No errors, no warnings. Now confirm with `lake build`:
+[tool] run_lake_build({})
+Build succeeds — no `sorry`, no errors, no warnings. 
+
+## Final output
+
+**File edited:** `proofs/lean/extraction/Utf8_char_width_u8Obligations.lean`
+
+**Theorems closed (7/7):**
+- `utf8_char_width_ascii` — single-branch case: condition holds via `decide_eq_true`.
+- `utf8_char_width_continuation_and_overlong` — one false branch (cond #1) + one true branch (cond #2).
+- `utf8_char_width_two_byte_leader` — two false + one true.
+- `utf8_char_width_three_byte_leader` — three false + one true.
+- `utf8_char_width_four_byte_leader` — four false + one true.
+- `utf8_char_width_high_invalid` — all five conditions false.
+- `utf8_char_width_total` — nested `by_cases` ladder dispatching to whichever postcondition applies.
+
+**Helper lemmas (private):**
+- `decide_lt_false_of_le_of_le {b n m : u8} (hb : m ≤ b) (hnm : n ≤ m) : decide (b < n) = false` — discharges every "false" branch of the if-chain. Routes through `UInt8.lt_iff_toNat_lt` and `UInt8.le_iff_toNat_le` so `omega` sees plain `Nat`s.
+- `le_of_not_lt {b n : u8} (h : ¬ b < n) : n ≤ b` — saves repeating the toNat round-trip in the totality dispatch.
+
+**Sub-goals that were difficult and how resolved:**
+
+1. **`omega` couldn't normalize `(constant : u8).toNat`.** The first naive attempt mixed `UInt8.lt_iff_toNat_lt` / `UInt8.le_iff_toNat_le` and called `omega` on hypotheses containing `↑(UInt8.toNat 128)`, `↑(UInt8.toNat 194)`, etc. Omega treated these as opaque atoms and produced spurious counterexamples (`a := UInt8.toNat 128`, `d := UInt8.toNat 194`, no fact that `a < d`). **Fix:** extract the structural reasoning into a single helper that takes `m ≤ b` and `n ≤ m` separately — both inequalities then route through `toNat` to plain `Nat` variables, so omega only sees `n.toNat ≤ m.toNat ≤ b.toNat` and `b.toNat < n.toNat`, which is immediately contradictory.
+
+2. **`lt_of_lt_of_le` / `not_lt_of_ge` unavailable for `u8`** in the prelude (Mathlib isn't imported, and core doesn't ship a `UInt8`-specialised version). Replaced by the `toNat`-+-`omega` chain in `decide_lt_false_of_le_of_le`.
+
+3. **`le_refl` unavailable** as a bare identifier in this environment. Replaced trivial `(n : u8) ≤ n` instances with `by decide`.
+
+**No `sorry`s remain.** `lake build` succeeds: `Built Utf8_char_width_u8Obligations (896ms)`, `Build completed successfully (95 jobs)`.
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+Looking at the target proof:
+
+**Proof obstacles identified:**
+1. A 6-way piecewise-constant function defined by a nested if/else cascade over `u8` constants — the proof organizes into per-range postcondition theorems
+2. The core helper `decide_lt_false_of_le_of_le` bridges `u8` comparisons to `Nat` through `toNat` + `omega` to discharge the false branches of each cascade case
+3. A `le_of_not_lt` helper enabling a nested `by_cases` cascade for the totality theorem (6-deep ladder dispatching to whichever per-range lemma applies)
+
+**Comparison to library:**
+- `clamp_modified` has `nested-if` but only 3-way and proven as a single theorem (no per-range + dispatch organization)
+- `slice_get_u64_modified` has `branch-split-totality` but it's a 2-way (in-bounds/out-of-bounds) split, not an N-way cascade
+- `is_zero_modified`, `min_modified`, `saturating_sub_modified` are 1-2 branch trivial structures
+- No existing entry exhibits the "piecewise-constant cascade over an integer type with per-range postcondition + nested by_cases ladder for totality" template
+
+This is the canonical shape for any Rust function that's effectively a small lookup table compressed to ranges (and the rewrite_patterns file documents that this pattern arises whenever Hax can't extract a large const lookup table). It's worth keeping as a structural exemplar.
+[tool] add_proof_pattern({"name": "utf8_char_width_u8_modified", "features": ["piecewise-constant-cascade", "nested-if", "branch-split-totality", "bv-nat-bridge", "decide-false-via-le-c... [+1317 chars])
+ADDED `utf8_char_width_u8_modified`.
+
+Features: `piecewise-constant-cascade`, `nested-if`, `branch-split-totality`, `bv-nat-bridge`, `decide-false-via-le-chain`, `inequality-comparison`, `total-function`, `functional-correctness`.
+
+Summary: piecewise-constant 6-way `u8 → usize` cascade (range-compressed from a 256-entry lookup table that Hax can't extract), proved via six per-range postcondition theorems plus a private `decide_lt_false_of_le_of_le` toNat-bridge helper to discharge all false `decide (b < n)` branches under "lower bound" hypotheses; totality closed by a 6-deep `by_cases` ladder using a `le_of_not_lt` helper to extract each lower bound and dispatch to the matching per-range lemma. Introduces two new tags (`piecewise-constant-cascade`, `decide-false-via-le-chain`) that no existing entry covers — the proof template extends `branch-split-totality` from the 2-way case (`slice_get_u64_modified`) to an N-way cascade and is the structural exemplar for any Rust function reduced from a small-integer lookup table to a nested if-chain on constants.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260525-021220_utf8_char_width_u8_stage_notes.json
+[cleanup] freed 341.9MB from benchmarks/claude-opus-4-7/validations/utf8_char_width_u8_modified

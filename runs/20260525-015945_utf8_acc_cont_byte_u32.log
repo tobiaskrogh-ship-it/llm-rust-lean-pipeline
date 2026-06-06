@@ -1,0 +1,298 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260525-015945_utf8_acc_cont_byte_u32.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_acc_cont_byte_u32/attempted_changes/20260525-015945
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Read({"file_path": "src/lib.rs"})
+Now I have a clear picture. The function `utf8_acc_cont_byte(ch, byte)` returns `(ch << 6) | (byte & 0x3F)` — a total function with no preconditions, no panic/Err/None paths. The contract is fully captured by two independent postconditions:
+
+1. **Low 6 bits of the result come from `byte`** (and only from `byte`).
+2. **The bits above position 6 come from `ch`** (specifically, the surviving low 26 bits of `ch` after `<< 6`).
+
+There's no `proptest`/`quickcheck` dependency, so I'll use deterministic enumeration loops — iterating over all 256 `byte` values and a curated set of `u32` values covering 0, 1, MAX, alternating bit patterns, powers of two, and values exercising both the upper-6 lost bits and the surviving low 26 bits.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n#[cfg(test)]\nmod tests {\n    use super::utf8_acc_cont_byte;\n\n    #[test]\n    fn shifts_accumulator_and_ors_low... [+4875 chars])
+[tool] run_cargo_test({})
+All 4 tests pass.
+
+## Summary
+
+The function `utf8_acc_cont_byte(ch: u32, byte: u8) -> u32` returns `(ch << 6) | (byte & 0x3F)`. It is **total**: no preconditions, no panics, no `Option`/`Result`, no overflow paths. So the contract is fully captured by two independent postconditions plus a no-panic statement.
+
+### Tests added and what each captures
+
+| Test | Contract clause |
+| --- | --- |
+| `low_six_bits_of_result_match_low_six_bits_of_byte` | **Postcondition 1.** `result & 0x3F == (byte & 0x3F) as u32` — the bottom 6 bits of the result come from `byte` and only from `byte`. Catches a wrong continuation mask (e.g. `0x1F`, `0x7F`) or a wrong shift width that would let `ch`'s bits leak into the low 6 positions. |
+| `high_bits_of_result_match_ch_shifted` | **Postcondition 2.** `result >> 6 == ch & 0x03FF_FFFF` — the bits at positions 6..32 come from the surviving low 26 bits of `ch`, and the top 6 bits of `ch` are discarded. Catches a wrong shift amount or a corrupted accumulator path. |
+| `total_function_never_panics_on_extremes` | **Failure condition (vacuous).** Documents that the function is total by exercising `(0,0)`, `(MAX,0)`, `(0,MAX)`, `(MAX,MAX)`. |
+| `concrete_vectors` | Two anchor vectors that pin the absolute value of the function on distinguished inputs, catching e.g. argument-swap regressions before the property checks fire. |
+
+Each property runs over a curated set of `u32` accumulators (zero, one, all-ones, alternating patterns, the `<<6` boundary values `0x03FF_FFFF` / `0x0400_0000`, the "only top-6 bits set" value `0xFC00_0000`, and `u32::MAX`) crossed with all 256 byte values.
+
+### Properties considered but **not** included, and why
+
+- **`f(ch, byte) == f(ch, byte & 0x3F)`** and **`f(ch, byte) == f(ch, byte | 0xC0)`** — both directly follow from Postcondition 1 (low 6 bits come only from `byte`'s low 6 bits). Adding them would create extra proof obligations downstream without ruling out any new buggy implementation.
+- **`f(ch, byte) == f(ch & 0x03FF_FFFF, byte)`** — directly follows from Postcondition 2.
+- **OR/XOR/ADD equivalence** (the high and low halves don't overlap, so `|`, `^`, `+` all yield the same value here) — derived from the two postconditions; not an independent claim about the contract.
+- **Iterating the function builds a 6-bits-at-a-time accumulator** (`f(f(f(0, b1), b2), b3) == (b1 & 0x3F) << 12 | (b2 & 0x3F) << 6 | (b3 & 0x3F)`) — a pure consequence of the two postconditions; testing it would add a derived theorem without exercising any independent behaviour.
+- **Algebraic identities of OR/shift on the result** (monotonicity, idempotence of repeated masking, etc.) — derived facts about bit operations, not part of this function's contract.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] Glob({"pattern": "**/*.toml"})
+[tool] Glob({"pattern": "**/*.rs"})
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+All three stages already pass cleanly on the current source. Let me verify there are no Hax-degenerate patterns in the extracted Lean.
+[tool] Read({"file_path": "proofs/lean/extraction/utf8_acc_cont_byte_u32.lean"})
+All three pipeline stages pass cleanly on the existing source — no rewrite is required.
+
+## Summary
+
+**Stage results (unchanged source):**
+- `cargo test` ✓ — 4 tests pass
+- `cargo hax into lean` ✓ — extracted `proofs/lean/extraction/utf8_acc_cont_byte_u32.lean`
+- `lake build` ✓ — all 93 jobs built successfully
+
+**Hax / `lake build` errors that drove changes:** none.
+
+**Library calls inlined:** none.
+
+**Patterns considered but not changed:**
+- `as u32` cast on `(byte & CONT_MASK)`: this is a `u8 -> u32` widening cast, which Hax models via `rust_primitives.hax.cast_op` (not the missing `Cast Bool <int>` instance from `bool_to_int_cast.rs`). Extracted cleanly.
+- `ch << 6` shift: Hax extracts as `<<<?` partial op. The shift amount `6 : i32` is a constant well below `u32`'s width, so the partial-op obligation is trivially discharged downstream. Not a candidate for the short-circuit-`&&` rewrite (no logical guard involved).
+- `const CONT_MASK: u8`: a 1-byte literal — not the large-table case from `large_const_lookup_table_to_branches.rs`. Extracts as `def CONT_MASK : u8 := (63 : u8)`.
+- No `while` loop, no recursion, no closure / iterator / `Range` use, no `&&` / `||` over a partial op, no signed-integer `.abs()`, no `f64`, no string ops, no `unsafe`, no Lean-keyword identifier, no associated-const reference (`u32::MAX` etc.).
+
+**Changes suspected of altering semantics:** none (no edits made).
+
+**Hax-degenerate patterns that I couldn't fix at the source level:** none. The extracted Lean (shown above) is a pure expression in `RustM` with three partial-op binds (`<<<?`, `&&&?`, `|||?`) and a cast — no `sorry`, no `RustM.fail`, no `partial_fixpoint`, no `while_loop` combinator, no constant-`0` termination measure, no `loop_invariant!` synthesis failure. The proof stage should be able to discharge the (trivial) shift-bound obligation and prove both postconditions (`result & 0x3F == byte & 0x3F` and `result >> 6 == ch & 0x03FF_FFFF`) directly by `bv_decide` or `simp`.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_acc_cont_byte_u32/attempted_changes/20260525-015945/*stage2_rust_hax_lean*"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_acc_cont_byte_u32/attempted_changes/20260525-015945/*"})
+The log contains only a `stage1_make_pbt_patched` attempt — no `stage2_rust_hax_lean_*` directories. Per the skill rules, only stage 2 attempts are relevant for harvesting `rewrite_patterns/`.
+
+## Final report
+
+**Patterns written:** none.
+
+**Attempts inspected but skipped:**
+- `0001_stage1_make_pbt_patched/` — skipped: not a `stage2_rust_hax_lean` attempt (this is the property-based-test stage, not the Hax/Lean rewrite stage).
+
+**Notes for a human:** This run's log directory contains no rewrite-stage attempts at all, so there is nothing to harvest. Either the Hax/lake build succeeded without any rewrite patches, or the pipeline never reached stage 2. Worth checking only if you expected this crate to need rewrites.
+
+harvest_rewrite_patterns
+The original and Hax-rewritten sources are byte-identical. The function `utf8_acc_cont_byte`, the `CONT_MASK` constant, all test vectors, and all test logic match exactly. There are no inlinings, structural rewrites, or annotations to review — the rewrite stage produced the input unchanged.
+
+Since there are no differences, runtime behavior is trivially preserved on every input.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target: pure bit-manipulation on `u32` and `u8` — a constant left shift (`<<<? (6 : i32)`), bitwise AND with constant mask, bitwise OR, and a `u8 → u32` cast. The function is total (no overflow possible) and the two postconditions are pure BitVec identities:
+- `result &&& 0x3F = (byte &&& 0x3F).cast`
+- `result >>> 6 = ch &&& 0x03FF_FFFF`
+
+So the proof obstacles are: discharge partial bitwise/shift operators on safe inputs, close BV identities (likely via `bv_decide`), and the standard BV↔Nat plumbing. No recursion, no loops, no overflow branching.
+
+## Selected examples
+
+```
+proof_patterns/average_floor_u64_modified
+proof_patterns/average_ceil_u64_modified
+proof_patterns/padding_needed_for_usize_modified
+proof_patterns/is_size_align_valid_usize_modified
+proof_patterns/truncate_number_modified
+```
+
+**Rationale per pick:**
+
+- `proof_patterns/average_floor_u64_modified` — pure bitwise straight-line code combining AND, XOR, and right-shift on an unsigned integer; total via a half-adder identity. Same shape: a single closed-form expression where every postcondition is a BV/Nat identity. **Tags matched:** `bit-manip`, `bv-nat-bridge`, `overflow-avoidance` (the totality argument).
+
+- `proof_patterns/average_ceil_u64_modified` — companion to the above using OR + XOR + shift; demonstrates `bv-width-extension-lift` which may be the right idiom for the `u8 → u32` cast in the byte argument. **Tags matched:** `bit-manip`, `bv-nat-bridge`, OR/shift primitives.
+
+- `proof_patterns/padding_needed_for_usize_modified` — carries `bv-and-mask-eq-mod` (`x &&& (a-1) = x % a` for power-of-two `a`), which is *exactly* the identity behind the target's "low 6 bits of result = low 6 bits of byte" postcondition (since `CONT_MASK = 0x3F = 2^6 - 1`). Also shows the `bv_decide`-as-workhorse style for closing alignment/mask identities. **Tags matched:** `bit-manip`, `bv-decide-proof`, `bv-and-mask-eq-mod`, `bv-nat-bridge`, `partial-operator-discharge`.
+
+- `proof_patterns/is_size_align_valid_usize_modified` — sibling to padding above; same `bv_decide` + `BitVec`-lifting pattern for purely bit-level facts, with `partial-operator-discharge` for `&&&` / `-?`. Useful template for the totality clause (existential `∃ r, f ch byte = ok r`). **Tags matched:** `bit-manip`, `bv-decide-proof`, `bv-nat-bridge`, `partial-operator-discharge`, `totality-by-helper-case-split`.
+
+- `proof_patterns/truncate_number_modified` — closest analogue for the *static-constant operand* discharge style: the target's `<<<? (6 : i32)` and `&&&? CONT_MASK` have constant RHS just like `n %? 1000`, so the same `if_neg (by decide)` / static-discharge moves should apply to the shift-amount-in-range check and any guard `truncate_number` uses for its modulus. **Tags matched:** `partial-operator-discharge`, `bv-nat-bridge`, `euclidean-div-mod`, `functional-correctness` on a total straight-line function.
+
+## Gaps
+
+- **No example does a constant left shift `<<<?` by an `i32` literal.** Closest is the right-shifts in `average_*_u64_modified` and `trailing_zeros_u64_modified`; the proof agent will need to derive the no-overflow side condition for `<<< 6` from scratch (likely `decide` on `6 < 32`).
+- **No example casts `u8 → u32` via `rust_primitives.hax.cast_op`.** None of the manifests tag `cast` or width-lift between distinct integer widths. The `bv-width-extension-lift` tag in `average_ceil_u64_modified` is the nearest hint but operates within one type.
+- **No `u32` example at all.** Library is dominated by `u64` / `usize` / `i64`. The Lean BV lemma names should still apply (just at width 32) but no template confirms this.
+
+## Rejections
+
+- All recursive / loop examples (`below_zero`, `binomial_u64`, `gcd_*`, `is_prime`, `sqrt_u64`, `contains_u64`, `clever_*`, `factorial`, `sum_to_n`, `count_down`, `trailing_zeros_u64`, `max_odd_part`, `gcd_while`, `while_example`, `map_*`, `rescale_to_unit`, `clever_*`, `has_close_elements`, `largest_divisor`, `abs_diff`, etc.) — target is straight-line, no induction needed.
+- `add_one_modified`, `square_modified`, `saturating_sub_modified`, `factorial_modified`, `sum_to_n_modified`, `clever_044_triangle_area_modified` — overflow-failure contracts; target is total.
+- `is_zero_modified` — too trivial, single equality with no BV reasoning.
+- `clamp_modified`, `min_modified` — comparison-based totality; no bit-manipulation primitives.
+- `slice_get_u64_modified` — slice indexing branching, not bit-manip.
+- `repeat_packed_usize_modified`, `repeat_usize_modified` — multi-helper Layout composition with `checked_mul`-style guards; target is single straight-line expression.
+- `map_next_u64_modified` and other iterator adapters — higher-order function fields, irrelevant.
+- `gcd_stein_u64_modified` — bit-manip tag, but dominated by partial-fixpoint and Stein loop structure.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean
+[scaffold] registered Utf8_acc_cont_byte_u32Obligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/average_floor_u64_modified/proofs/lean/extraction/Average_floor_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/padding_needed_for_usize_modified/proofs/lean/extraction/Padding_needed_for_usizeObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/average_ceil_u64_modified/proofs/lean/extraction/Average_ceil_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_size_align_valid_usize_modified/proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/truncate_number_modified/proofs/lean/extraction/Clever_002_truncate_numberObligations.lean"})
+[tool] Glob({"pattern": "**/Hax/**/*.lean", "path": "/home/tobias/uni/pipeline_v6"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/**/Hax/rust_primitives/ops.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean"})
+[tool] Grep({"pattern": "cast_op", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "files_with_matches"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/Cast.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/RustM.lean"})
+Now I have enough context to write the theorems. Let me check what's currently in the obligations file and write the theorems.
+[tool] Read({"file_path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean", "patch": "<<< SEARCH\nnamespace Utf8_acc_cont_byte_u32Obligations\n\n-- Add `theorem` ... [+3702 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean"})
+All theorem statements type-check cleanly (only `sorry` warnings). Let me confirm with the full build.
+[tool] run_lake_build({})
+Build is green; only `sorry` warnings remain.
+
+## Final Output
+
+**File edited:** `proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean`
+
+**Theorems added (one line per clause):**
+
+| Theorem | Contract clause captured |
+|---|---|
+| `utf8_acc_cont_byte_postcondition` | Foundational closed-form equation `f ch byte = ok ((ch <<< 6) ||| (byte &&& CONT_MASK).toUInt32)` — total + value definition in one. Not a literal Rust test but the equational scaffold from which the per-clause theorems derive (style of `truncate_number_postcondition`, `average_floor_postcondition`). |
+| `utf8_acc_cont_byte_total` | "No failure conditions" / totality — covers Rust test `total_function_never_panics_on_extremes`. |
+| `utf8_acc_cont_byte_low_six_bits` | Postcondition 1: `result & 0x3F = (byte & 0x3F) as u32` — Rust test `low_six_bits_of_result_match_low_six_bits_of_byte`. |
+| `utf8_acc_cont_byte_high_bits` | Postcondition 2: `result >> 6 = ch & 0x03FF_FFFF` — Rust test `high_bits_of_result_match_ch_shifted`. |
+| `utf8_acc_cont_byte_concrete_basic` | Concrete vector `f 2 170 = 170` — first half of `concrete_vectors`. |
+| `utf8_acc_cont_byte_concrete_copyright` | Concrete vector `f 0x02 0xA9 = 0xA9` (UTF-8 `U+00A9 ©` accumulator step) — second half of `concrete_vectors`. |
+
+**Property tests classified as derived facts (skipped):** None. All four Rust contract tests are represented.
+
+**Feasibility check:** the function is total in the Lean model — `(6 : i32)` satisfies `0 ≤ 6 ∧ 6 < 32` so `<<<?` cannot fail; `&&&?`/`|||?` have no failure mode; the `u8 → u32` cast is `pure`. So both postconditions and totality are universally true with no precondition; the equational `RustM.ok …` framing is sound.
+
+**Uncertain framings:** None. All statements use the equational-form style (since the precondition is `True`) consistent with the reference examples, and `lake build` confirms well-typedness.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 6 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/average_floor_u64_modified/proofs/lean/extraction/Average_floor_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/padding_needed_for_usize_modified/proofs/lean/extraction/Padding_needed_for_usizeObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/truncate_number_modified/proofs/lean/extraction/Clever_002_truncate_numberObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_size_align_valid_usize_modified/proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/average_ceil_u64_modified/proofs/lean/extraction/Average_ceil_u64Obligations.lean"})
+Now let me look at the prelude to understand the partial operators.
+[tool] Glob({"pattern": "**/proof-libs/lean/**/*.lean", "path": "/home/tobias/uni/pipeline_v6"})
+[tool] Glob({"pattern": "proofs/lean/extraction/**/*.lean"})
+[tool] Grep({"pattern": "cast_op|Cast\\.cast|class.*Cast", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/Cast.lean", "outpu... [+19 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/Cast.lean"})
+[tool] Grep({"pattern": "&lt;&lt;&lt;\\?|\\|\\|\\|\\?|&amp;&amp;&amp;\\?", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/op... [+34 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean"})
+Let me check the current state of the obligations file via the LSP:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean"})
+[tool] mcp__lean__lean_goal({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean", "line": 31, "column": 3})
+[tool] mcp__lean__lean_goal({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean", "line": 30})
+[tool] mcp__lean__lean_goal({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean", "line": 32, "column": 7})
+Let me look at how the function unfolds. Let me try unfolding:
+[tool] mcp__lean__lean_hover_info({"file_path": "utf8_acc_cont_byte_u32.lean", "line": 21, "column": 5})
+Now let me try writing the postcondition proof. Let me draft and test:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_acc_cont_byte_postcondition (ch : u32) (byte : u8) ... [+1418 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_acc_cont_byte_postcondition (ch : u32) (byte : u8) ... [+1429 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean"})
+Postcondition works! Now let me prove the other obligations. Let me look at the current state:
+[tool] Read({"file_path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean"})
+Now let me try to discharge the BitVec proofs. First, let me test the approach with `lean_multi_attempt`:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_acc_cont_byte_low_six_bits (ch : u32) (byte : u8) :... [+650 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_acc_cont_byte_low_six_bits (ch : u32) (byte : u8) :... [+862 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean"})
+Low six bits closed! Now the high bits:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_acc_cont_byte_high_bits (ch : u32) (byte : u8) :\n ... [+649 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean"})
+Now the concrete vectors:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_acc_cont_byte_concrete_basic :\n    utf8_acc_cont_b... [+330 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_acc_cont_byte_concrete_copyright :\n    utf8_acc_co... [+348 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_acc_cont_byte_u32Obligations.lean"})
+All theorems closed in the LSP. Let me confirm with the ground-truth build:
+[tool] run_lake_build({})
+Build green, no `sorry` warnings. Let me show the final file:
+[tool] Read({"file_path": "proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean"})
+All six obligations close cleanly. `lake build` succeeds with no `sorry` warnings.
+
+## Final Output
+
+**File edited:** `proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean`
+
+**All six obligations closed (no `sorry` survives):**
+
+| Theorem | How closed |
+|---|---|
+| `utf8_acc_cont_byte_postcondition` | Unfold the `do`-block to expose the static shift guard `0 ≤ 6 && 6 < 32`, discharge with two nested `show` lemmas + `simp only [show ... = true from rfl, ↓reduceIte, pure_bind]`, then `rfl`. |
+| `utf8_acc_cont_byte_total` | Already inhabited via `⟨_, utf8_acc_cont_byte_postcondition ch byte⟩` (no change needed). |
+| `utf8_acc_cont_byte_low_six_bits` | `refine ⟨_, postcondition, ?_⟩`; reduce to the bare BV identity `((ch <<< 6) ||| (byte &&& CONT_MASK).toUInt32) &&& 0x3F = (byte &&& 0x3F).toUInt32`; `unfold CONT_MASK; bv_decide`. |
+| `utf8_acc_cont_byte_high_bits` | Same recipe: `refine ⟨_, postcondition, ?_⟩` + `unfold CONT_MASK; bv_decide` on `((ch <<< 6) ||| (byte &&& CONT_MASK).toUInt32) >>> 6 = ch &&& 0x03FFFFFF`. |
+| `utf8_acc_cont_byte_concrete_basic` | `rw [postcondition]; native_decide`. |
+| `utf8_acc_cont_byte_concrete_copyright` | `rw [postcondition]; native_decide`. |
+
+**Sub-goals that needed care:**
+
+1. **Static shift guard discharge** — `<<<? (6 : i32)` on a `UInt32` expands to `if 0 ≤ 6 && 6 < 32 then pure (x <<< (6 : Int32).toNatClampNeg.toUInt32) else fail`. The `(6 : Int32).toNatClampNeg.toUInt32` is *definitionally* `(6 : UInt32)`, so after collapsing the `if` with the static-`true` boolean and the `pure_bind`s, the equation closes by `rfl`. Copied the `simp only [show ... = true from rfl, ↓reduceIte, pure_bind]` shape from `average_floor_postcondition`.
+
+2. **`bv_decide` opacity of `CONT_MASK`** — the first attempt at the low-six-bits proof failed with "abstracted the following unsupported expressions as opaque variables: [CONT_MASK]". `unfold CONT_MASK` before `bv_decide` fixes it, since the BV solver then sees the literal `63 : u8` and can do the case-finite reasoning at width 32 (the `(byte &&& 63).toUInt32` cast included).
+
+3. **`u8 → u32` cast** — `rust_primitives.hax.cast_op` unfolds via the macro-generated `Cast UInt8 UInt32` instance to `pure (UInt8.toUInt32 x)`, written in dot notation as `(...).toUInt32`. This matches the spec exactly, so the foundational equation falls out by `rfl` after the binds collapse.
+
+**Obligations left as `sorry`:** None.
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+I'll analyze this proof to decide whether it adds a new pattern to the library.
+
+**Function & proof shape:**
+- `utf8_acc_cont_byte(ch: u32, byte: u8) -> u32 = (ch << 6) | (byte & CONT_MASK)` — pure bitfield composition.
+- Five theorems projected from one foundational equation:
+  1. `_postcondition`: closed-form `(ch <<< 6) ||| (byte &&& CONT_MASK).toUInt32` — discharges the partial shift `<<<? 6` via `decide` reducing `(0 ≤ 6 && 6 < 32) = true`, then `rfl`.
+  2. `_total`: trivial existential corollary.
+  3. `_low_six_bits` and `_high_bits`: cross-width `bv_decide` bridging u8→u32 via `.toUInt32` inside the BitVec goal.
+  4. Two concrete anchors via `rw [_postcondition]; native_decide`.
+
+**Comparison with existing library:**
+- `clever_044_triangle_area_modified` has `signed-div-static-discharge` (the close cousin: discharging a static divisor's panic branches). The shift analog — static *shift amount* in [0, width) discharge — is not present in any manifest.
+- `min_modified` / `is_size_align_valid_usize_modified` / `padding_needed_for_usize_modified` use `bv_decide`, but all on uniform widths. The cross-width `bv_decide` bridging two integer widths via `.toUInt32` is structurally distinct.
+- `average_*_u64_modified`, `trailing_zeros_u64_modified` are bit-manip but loop-based with multiplicative invariants — different shape.
+- No existing entry shows the "extract low N / high (W−N) bits as separate contract clauses, both closed by cross-width `bv_decide`" template.
+
+This is a small, clean canonical shape worth keeping as a template for bitfield-composition extractions (UTF-8 decoding helpers, packed-record getters, etc.). Adding it.
+[tool] add_proof_pattern({"name": "utf8_acc_cont_byte_u32_modified", "features": ["bit-manip", "bv-decide-proof", "partial-operator-discharge", "static-shift-bounds-discharge", "cross-w... [+1231 chars])
+ADDED `utf8_acc_cont_byte_u32_modified`.
+
+**Features:** `bit-manip`, `bv-decide-proof`, `partial-operator-discharge`, `static-shift-bounds-discharge`, `cross-width-bv-decide`, `u8-to-u32-cast-bridge`, `bundled-postcondition-projection`, `native-decide-unit-pin`, `multi-clause-contract`, `total-function`, `functional-correctness`.
+
+**Summary:** UTF-8 accumulator step `(ch << 6) | (byte & CONT_MASK)` on (u32, u8) → u32; pairs a foundational closed-form `_postcondition` (static shift bounds `0 ≤ 6 && 6 < 32 = true` discharged via `decide` + `↓reduceIte`, then `rfl`) with two bitfield contract clauses (`_low_six_bits`, `_high_bits`) closed by a single `unfold CONT_MASK; bv_decide` operating *cross-width* via the u8→u32 `.toUInt32` cast; totality and two concrete anchors project from the same postcondition. The static-shift analog of `clever_044_triangle_area_modified`'s static-div discharge, plus a cleaner cross-width `bv_decide` than any existing entry.
+
+**Observation for human readers:** the cross-width `bv_decide` here is notable — it handles `byte : u8` and `ch : u32` in the same BitVec decision procedure call via the `.toUInt32` zero-extension, avoiding the need for an explicit width-lift bridge lemma (compare `average_ceil_u64_modified`'s `bv-width-extension-lift` tag, which names this work as an obstacle when `bv_decide` *doesn't* handle it directly). Template-quality for bitfield-projection contracts after a static-amount shift+OR.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260525-015945_utf8_acc_cont_byte_u32_stage_notes.json
+[cleanup] freed 341.9MB from benchmarks/claude-opus-4-7/validations/utf8_acc_cont_byte_u32_modified

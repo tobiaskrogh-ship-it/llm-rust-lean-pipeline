@@ -1,0 +1,308 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260530-020349_153_even_odd_count.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/153_even_odd_count/attempted_changes/20260530-020349
+Stages: all 8 (1-8), in order
+[setup] Crate not yet set up — running setup_crate.bash on /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/153_even_odd_count
+[setup] Done.
+
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Bash({"command": "ls", "description": "Inspect crate layout"})
+Let me look at the project structure to understand the test conventions.
+[tool] Bash({"command": "ls proofs/ 2>/dev/null && echo \"---\" && find . -name \"*.rs\" -not -path \"./target/*\" | head -20", "description": "Inspect proofs dir and rust ... [+14 chars])
+Now I'll design the property test suite. The function's contract:
+
+**Postcondition** (no preconditions — `u64` is total):
+- Returns `(even_count, odd_count)` of the decimal digits of `num`.
+- Edge case: `num == 0` → `(1, 0)`.
+
+**Independent semantic claims:**
+1. The even count equals the number of even decimal digits.
+2. The odd count equals the number of odd decimal digits.
+3. `num == 0` is treated as having one digit `0`.
+
+A single property test against an **independent** reference (string-based digit extraction) captures (1) and (2) simultaneously. The existing `known` test already pins down (3) and several small cases.
+
+I'll add the proptest and a string-based reference helper.
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n#[cfg(test)]\nmod tests {\n    use super::*;\n    #[test]\n    fn known() {\n        assert_eq!(even_odd_count(0), ... [+1795 chars])
+[tool] run_cargo_test({})
+Both tests pass. Summary of the test suite:
+
+### Tests added
+
+**`matches_reference` (proptest)** — captures the **postcondition** for all of `u64`: the returned `(even, odd)` pair equals the counts of even and odd decimal digits. Checked against a string-based reference (`num.to_string()` → `char::to_digit`), an entirely different decomposition from the implementation's arithmetic recursion on `num % 10` and `num / 10`. A buggy implementation that miscounts, swaps buckets, off-by-ones at the last digit, or mishandles non-zero values would be caught.
+
+### Existing tests retained
+
+**`known`** — pins down the `num == 0` edge case (`(1, 0)`) and several concrete examples (single odd digit, mixed, all-even). The zero case is part of the documented contract and the proptest's random `u64` generation rarely hits 0, so the explicit assertion earns its place.
+
+### Properties considered but excluded
+
+- **`sum_equals_digit_count`** (even + odd = number of decimal digits): implied by `matches_reference`; would be a redundant proof obligation downstream.
+- **Separate `even_count_correct` / `odd_count_correct`**: splits a single postcondition into two near-identical theorems for no extra coverage.
+- **Recursion-based reference** (the last-digit `n % 10` / `n / 10` formulation): too close to the implementation — a shared arithmetic mistake would not be detected. The string-based reference is genuinely independent.
+- **Monotonicity, parity-of-sum identities, or other derived facts** about even/odd digit counts: follow from properties of digits and would not catch implementation bugs.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Bash({"command": "find . -maxdepth 3 -type f \\( -name \"Cargo.toml\" -o -name \"*.rs\" \\) | head -30", "description": "Find Cargo.toml and Rust source files"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/153_even_odd_count_modified/src/lib.rs"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+All three pipeline stages pass cleanly on the first attempt. Let me verify there are no Hax-degenerate patterns lurking in the extraction.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/153_even_odd_count_modified/proofs/lean/extraction/clever_153_even_odd_count.lea... [+3 chars])
+All three stages pass cleanly without any rewrites:
+
+- `cargo test` ✓ (2 tests: `known` + `matches_reference` proptest)
+- `cargo hax into lean` ✓
+- `lake build` ✓
+
+## Summary
+
+**No rewrites were required.** The source was already in a Hax-compatible and proof-friendly shape on the first attempt.
+
+**Patterns verified clean** (none needed to change):
+
+- **Recursion over `while`** — `count_at` is already tail-recursive with a clear decreasing measure (`n / 10`). Extracts as `partial_fixpoint`, which the proof stage discharges via `Nat.strongRecOn` on `n.toNat` (per `proof_patterns/recursion_example`). This is the preferred shape over a `while` loop.
+- **No short-circuit `&&` / `||` over partial ops** — control flow uses `if`/`else if`/`else`, which Hax preserves through extraction.
+- **No partial-op hazard** — `n % 10` and `n / 10` use the literal `10` as divisor, so neither can fail in `RustM`. No `RustM.fail` divergence in the extracted model.
+- **No unmodeled identifiers** — no `f64`, no `.abs()` / `.pow()` / `.trailing_zeros()` / `.is_power_of_two()`, no iterator chains, no `Vec::push`, no `unsafe`, no string processing, no `core::array::from_ref`, no `Range`-iterator methods.
+- **No Lean keyword collisions** — `count_at`, `even_odd_count`, `clever_153_even_odd_count` are all clean.
+- **No `loop_invariant!` / `loop_decreases!` / `#[requires]`** — no auto-spec is generated, so there's nothing for `bv_decide` to fail on at the auto-spec stage. The proof stage will write the contract directly against the `partial_fixpoint` extraction.
+
+**Extracted Lean** (`proofs/lean/extraction/clever_153_even_odd_count.lean`) shows the canonical clean `partial_fixpoint` shape with `%?` / `/?` / `+?` / `==?` over `u64`, no `(pure sorry)`, no degenerate placeholders. Ready for the proof stage.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/153_even_odd_count/attempted_changes/20260530-020349/", "description": "List rewrite attem... [+16 chars])
+[tool] Bash({"command": "ls -la /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/153_even_odd_count/attempted_changes/20260530-020349/0001_stage1_make_pbt_patched/", "... [+53 chars])
+The only attempt in this log is `stage1_make_pbt`, not `stage2_rust_hax_lean`. Per the skill instructions, I must ignore non-stage2 attempts.
+
+## Final Report
+
+**Patterns written:** none.
+
+**Attempts inspected but skipped:**
+- `0001_stage1_make_pbt_patched/` — skipped: not a `stage2_rust_hax_lean` attempt (this is the PBT-generation stage, not the Hax/lake rewrite stage).
+
+**Confusing / flag-for-human:** The run log for `153_even_odd_count` contains only a single stage1 attempt and no stage2 rewrite attempts at all. Either the Hax → Lean → lake pipeline succeeded on the first try (no patches needed) or it never reached stage2. Nothing to harvest here.
+
+harvest_rewrite_patterns
+The original and Hax-rewritten `src/lib.rs` are byte-identical. There are no changes to the function bodies, no inlining of methods, no structural rewrites, and no verification annotations added or removed. Since nothing changed, runtime behavior is trivially preserved on every input.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target, the key features I need to match against are:
+
+- `partial_fixpoint` recursive helper descending on `n/10` (decimal digit decomposition)
+- Two u64 counter accumulators (e, o) advanced disjointly per branch
+- Tuple-return `Tuple2 u64 u64`
+- Wrapper with `n == 0` short-circuit producing a constant tuple
+- Partial-operator discharge for static divisors (10, 2)
+- u64 add-overflow on tiny counters (bounded by digit count ~20)
+- Bool-conditioned arm dispatch based on `n % 10 % 2 == 0`
+
+Let me peek at a couple of the most promising candidates to confirm the match.
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/proof_patterns/clever_106_even_odd_palindrome_modified/ /home/tobias/uni/pipeline_v6/proof_patterns/clever_035_fizz... [+213 chars])
+[tool] Bash({"command": "head -60 /home/tobias/uni/pipeline_v6/proof_patterns/clever_106_even_odd_palindrome_modified/src/lib.rs", "description": "Inspect clever_106 source... [+2 chars])
+Confirmed — clever_106 has the paired `(e, o)` u64 counter mechanics AND a `rev_at` helper that descends via `n/10`. Both shapes the target needs.
+
+## Selected examples
+
+```
+proof_patterns/clever_106_even_odd_palindrome_modified
+proof_patterns/clever_035_fizz_buzz_modified
+proof_patterns/clever_130_digits_modified
+proof_patterns/clever_103_unique_digits_modified
+proof_patterns/gcd_recursive_modified
+```
+
+## Per-pick rationale
+
+- **clever_106_even_odd_palindrome_modified** — Strongest match. Paired u64 counters `(e, o)` advanced disjointly per branch, `Tuple2 u64 u64` return, wrapper short-circuit on `n == 0`, `partial_fixpoint`, AND a `rev_at` helper that descends via `n/10` (the exact recursion shape of target's `count_at`). The proof carries two parallel counter invariants via a Nat oracle parameterised by parity — directly the shape needed here. Differences: clever_106's outer scan ascends `k` from 1 to n (target descends `n` via `n/10`), and clever_106 needs a polynomial digit-reversal bound (target doesn't).
+
+- **clever_035_fizz_buzz_modified** — Best match for the digit-decomposition-recursion shape itself: `count_sevens` recursing on `n/10` with a u64 counter, partial `%?` / `/?` / `+?` discharged via `i64.minValue && d=-1` casework (target's u64 version is simpler — only the `if_neg` arm on static-nonzero divisor 10), plus the `log10-digit-bound` (`count ≤ k` when `n < 10^k`) which is exactly how target's counter-no-overflow precondition is discharged from `e + o ≤ 20`.
+
+- **clever_130_digits_modified** — Best match for `n/10` `partial_fixpoint` with a running accumulator and a Nat-level recursive oracle (`walk_at_nat`) bridged Rust↔Nat by induction on a bounding measure `m ≥ n.toNat`. Uses `u64_mod_ok` / `u64_div_ok` / `add_pure` partial-operator discharges via `if_neg` on static-nonzero divisors — directly transferable to target's `n %? 10` / `n /? 10` / `e +? 1` chain.
+
+- **clever_103_unique_digits_modified** — `has_even_digit_at` is a structurally near-identical `n/10` recursion deciding even/odd digit parity via `(n % 10) % 2 = 0`, exactly target's branch condition. The `has_even_digit_at_nat` oracle + Rust↔Nat correctness via strong induction on a bounding measure is reusable verbatim (insertion-sort machinery is irrelevant — ignore that half).
+
+- **gcd_recursive_modified** — Minimal `partial_fixpoint` u64 template descending via `a %? b` proved by strong induction on `b.toNat` under partial_fixpoint, with `if_neg` discharge of the partial mod and `Nat.mod_lt` for the measure step. Closest existing reference for the structural skeleton (target descends on `n.toNat` via `n /? 10`, using `Nat.div_lt_self` instead of `Nat.mod_lt`).
+
+## Gaps
+
+- No existing entry combines **paired counters + n/10 descent in the SAME helper** (clever_106 puts paired counters in `count_at` and digit recursion in `rev_at`, separately). Target fuses them.
+- The wrapper's `n == 0 → (1, 0)` (count digit "0" as one even digit) is a one-line special case but no existing entry has the same exact `(constant tuple) vs (recurse)` boundary on a Tuple2 u64 u64 return — the closest is clever_106's `count_at n 1 0 0` initial call (no constant pair short-circuit).
+
+## Rejections
+
+- **clever_107_count_nums_modified** — signed digit sum + first-digit two-helper composition; far heavier than needed.
+- **clever_048_modp_modified** — ascending counter with running residue invariant; descent direction wrong and modular invariant absent in target.
+- **clever_106's siblings** like sum_product / prod_signs — paired accumulators but over slices, not digit recursion.
+- **clever_047_sum_to_n_modified** — closed-form Gauss accumulator on i64 ascending counter, no digit recursion.
+- **clever_038_prime_fib / clever_045_fib4** — `partial_fixpoint` + native_decide unit pins, but recurrence shape and overflow concerns unrelated.
+- **recursion_example** — too trivial (count_down returns 0); skeleton already captured by gcd_recursive.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Clever_153_even_odd_countObligations.lean
+[scaffold] registered Clever_153_even_odd_countObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_106_even_odd_palindrome_modified/proofs/lean/extraction/Clever_106_even_odd_palindromeObligati... [+10 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_130_digits_modified/proofs/lean/extraction/Clever_130_digitsObligations.lean"})
+Now let me look at a simpler reference for the Tuple2 patterns and the file outline to understand the function structure.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_035_fizz_buzz_modified/proofs/lean/extraction/Clever_035_fizz_buzzObligations.lean", "limit": ... [+4 chars])
+Now I have enough reference material. Let me check the working crate structure and the extracted file outline.
+[tool] Bash({"command": "ls -la proofs/lean/extraction/ 2>&1 | head -20", "description": "List extraction directory"})
+[tool] mcp__lean__lean_file_outline({"file_path": "clever_153_even_odd_count.lean"})
+Now I have enough context to write the obligations file. Let me plan:
+
+**Contract clauses from Rust source:**
+- 5 unit pins from `known()`: `even_odd_count(0/7/12/123/246)` returning fixed tuples
+- 1 main postcondition `matches_reference` proptest: for every `u64 num`, output equals digit-by-digit even/odd counts
+
+**Feasibility check for the universal statement:** a `u64` has at most 20 decimal digits (since `2^64 < 10^20`), so the counters `e + o ≤ 20 ≪ 2^64` — no overflow possible. Universal statement holds without precondition. ✓
+
+Let me write the file:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_153_even_odd_countObligations.lean", "error_message": "Initial draft \u2014 adding Nat-level oracle and all 6 contract c... [+3604 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_153_even_odd_countObligations.lean"})
+Diagnostics are clean — only the expected `sorry` warning for the main postcondition. The 5 unit pins all close via `native_decide`. Let me confirm with a `lake build` to be safe.
+[tool] run_lake_build({})
+`lake build` confirms: build succeeds with the single expected `sorry` warning on the main postcondition.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Clever_153_even_odd_countObligations.lean`
+
+**Helper definitions (private):**
+- `count_at_nat : Nat → Nat → Nat → Nat × Nat` — Nat-level mirror of the recursive Rust `count_at`, descending via `n / 10`.
+- `even_odd_count_nat : Nat → Nat × Nat` — Nat-level mirror of the wrapper, encoding the `n = 0 ↦ (1, 0)` special case.
+
+**Theorems added — one per contract clause:**
+
+| Theorem | Clause captured | Proof |
+|---|---|---|
+| `even_odd_count_at_0` | `known()` pin: `even_odd_count(0) = (1, 0)` | `native_decide` |
+| `even_odd_count_at_7` | `known()` pin: `even_odd_count(7) = (0, 1)` | `native_decide` |
+| `even_odd_count_at_12` | `known()` pin: `even_odd_count(12) = (1, 1)` | `native_decide` |
+| `even_odd_count_at_123` | `known()` pin: `even_odd_count(123) = (1, 2)` | `native_decide` |
+| `even_odd_count_at_246` | `known()` pin: `even_odd_count(246) = (3, 0)` | `native_decide` |
+| `even_odd_count_matches_reference` | proptest `matches_reference` — main postcondition over every `u64 num` | `sorry` |
+
+**Property tests skipped as derived facts:** none. The Rust source has exactly one proptest (`matches_reference`) and it is the main contract clause, not a derived fact.
+
+**Feasibility note (universal statement justified):** any `u64` has at most 20 decimal digits (`2^64 < 10^20`), so the accumulators satisfy `e + o ≤ 20 ≪ 2^64`. The Rust `+ 1` steps never overflow, so the universal `∀ num : u64, …` form is true in the Lean model with no precondition needed.
+
+**Uncertainty:** none. The framing (equational `even_odd_count num = RustM.ok (Tuple2.mk … …)` with `UInt64.ofNat` lifting the Nat oracle's components) follows the `clever_130_digits` precedent for total, overflow-free functions.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 6 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_106_even_odd_palindrome_modified/proofs/lean/extraction/Clever_106_even_odd_palindromeObligati... [+10 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean"})
+[tool] Grep({"pattern": "has_even_digit", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_di... [+60 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_103_unique_digits_modified/proofs/lean/extraction/Clever_103_unique_digitsObligations.lean", "... [+27 chars])
+Now let me check the prelude to understand the Tuple2 and RustM internals:
+[tool] Bash({"command": "find /home/tobias/uni/pipeline_v6 -name \"Hax.lean\" -not -path \"*/target/*\" 2>/dev/null | head -5", "description": "Find Hax prelude root"})
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/153_even_odd_count_modified/proofs/lean/extraction/", "description": "List targ... [+19 chars])
+[tool] Bash({"command": "pwd && ls", "description": "Find working crate"})
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/153_even_odd_count_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib/p... [+64 chars])
+[tool] Bash({"command": "ls /home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/153_even_odd_count_modified/proofs/lean/extraction/.lake/packages/Hax/hax-lib/p... [+71 chars])
+[tool] TodoWrite({"todos": [{"content": "Read reference patterns (clever_106, clever_103, clever_130)", "activeForm": "Reading reference patterns", "status": "in_progress"}, {"c... [+677 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_130_digits_modified/proofs/lean/extraction/Clever_130_digitsObligations.lean"})
+Now let me check the gcd_recursive pattern for partial_fixpoint induction:
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/gcd_recursive_modified/proofs/lean/extraction/Clever_013_greatest_common_divisorObligations.lean"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_153_even_odd_countObligations.lean"})
+[tool] mcp__lean__lean_file_outline({"file_path": "clever_153_even_odd_count.lean"})
+Let me check the Rust extracted function bind structure to be precise:
+[tool] mcp__lean__lean_hover_info({"file_path": "clever_153_even_odd_count.lean", "line": 21, "column": 5})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/153_even_odd_count_modified/proofs/lean/extraction/clever_153_even_odd_count.lea... [+3 chars])
+Now I have a complete picture. Let me update todos and write the full proof:
+[tool] TodoWrite({"todos": [{"content": "Read reference patterns (clever_106, clever_103, clever_130)", "activeForm": "Reading reference patterns", "status": "completed"}, {"con... [+681 chars])
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_153_even_odd_countObligations.lean", "overwrite": true, "error_message": "Closing the sorry on even_odd_count_matches_re... [+18769 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_153_even_odd_countObligations.lean"})
+The zero case is tripping up because `decide ((0:u64) = (0:u64))` evaluates to `decide True` which isn't being reduced by simp. Let me follow clever_103's pattern with a direct `RustM.ok true` lemma:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_153_even_odd_countObligations.lean", "error_message": "simp only [pure_bind, h_dec_zero, \u2193reduceIte] doesn't reduce... [+3964 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_153_even_odd_countObligations.lean", "error_message": "Same issue in the main wrapper proof: the `num = 0` branch uses `... [+2325 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_153_even_odd_countObligations.lean"})
+No errors. Let me confirm with the full build:
+[tool] run_lake_build({})
+Build succeeds with no warnings or sorries. Let me verify no `sorry` remains and update todos:
+[tool] Grep({"pattern": "sorry", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/153_even_odd_count_modified/proofs/lean/extraction/Clever_153_eve... [+55 chars])
+[tool] TodoWrite({"todos": [{"content": "Read reference patterns (clever_106, clever_103, clever_130)", "activeForm": "Reading reference patterns", "status": "completed"}, {"con... [+685 chars])
+## Final output
+
+**File changed:** `proofs/lean/extraction/Clever_153_even_odd_countObligations.lean`
+
+**What was added:**
+
+1. **Helper lemmas** (transcribed from clever_130/clever_103 patterns, all `private theorem`):
+   - `RustM_ok_bind`, `u64_{zero,one,two,ten}_toNat`, `u64_ofNat_toNat_of_lt`, `u64_eq_test`, `u64_toNat_pos_of_ne_zero`
+   - `mod_pure`, `div_pure`, `add_pure` — discharge partial Rust operators when their preconditions hold.
+
+2. **Equations for `count_at_nat`:**
+   - `count_at_nat_zero` — `count_at_nat 0 e o = (e, o)`
+   - `count_at_nat_succ_even` / `count_at_nat_succ_odd` — step equations under `0 < n`.
+
+3. **Bound lemma `count_at_nat_le`** (and convenience corollaries `count_at_nat_fst_lt` / `_snd_lt`): for `n < 10^k`, `(count_at_nat n e o).1 ≤ e + k` and `.2 ≤ o + k`. Proven by induction on `k`.
+
+4. **`u64_toNat_lt_pow20`** — every `u64` has fewer than 20 decimal digits.
+
+5. **Main correctness lemma `count_at_correct`** (strong induction on `m` with `n.toNat ≤ m`, carrying digit-count `k` and overflow invariant `e.toNat + o.toNat + k < 2^64`).
+
+6. **Closed proof of `even_odd_count_matches_reference`** via `count_at_correct` at `k = 20, e = 0, o = 0`.
+
+**Sub-goals that required care:**
+
+- **Overflow invariant on `+? 1`.** The key insight: at every step `(e, o, k) → (e+1, o, k-1)` or `(e, o+1, k-1)`, so `e + o + k` is invariant. Since `n > 0` forces `k ≥ 1`, we get `e + 1 ≤ e + o + k < 2^64` for free, so the intermediate `e +? 1` and `o +? 1` always succeed.
+- **Zero-case `if`-reduction.** The first write used `rw [u64_eq_test]` then `decide_eq_true rfl` + `simp ↓reduceIte`, but `decide ((0:u64) = (0:u64))` collapses to `decide True` and the linter showed the hypothesis went unused — the `if` survived. Switched to the clever_103 pattern: `((0:u64) ==? (0:u64) : RustM Bool) = RustM.ok true := rfl`, after which `simp [h_eq_zero, RustM_ok_bind, ↓reduceIte]` resolves cleanly.
+
+**Sorries left:** none. `lake build` succeeds with no warnings.
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+Looking at this proof, I need to analyze what verification obstacles it presents and whether they're covered by existing library entries.
+
+**Key features of this proof:**
+- Tail-recursive `count_at` over decimal digits via `n/10` recursion
+- **Paired counters** (e, o) for even and odd digit counts simultaneously
+- Per-digit parity dispatch: increment `e` or `o` based on `(n%10) % 2`
+- Tuple return type `(u64, u64)` with the n=0 special case `(1, 0)`
+- Log10-style bound: `n.toNat < 10^20` for any u64
+- Per-component count bound `(count_at_nat n e o).{1,2} ≤ {e,o} + k` for `n < 10^k`
+- Five `native_decide` unit pins + one universal proptest theorem
+
+**Comparison with closest existing entries:**
+
+1. **clever_035_fizz_buzz_modified**: digit-decomposition via n/10 with `log10-digit-bound`, BUT single counter (digit-7s) and divisibility dispatch on OUTER counter (not on digit)
+2. **clever_106_even_odd_palindrome_modified**: `paired-parity-counter-scan` with `parity-conditional-counter-increment`, BUT the parity is on the OUTER iteration index k (range scan from 1 to n), uses `digit-reversal-with-accumulator` for the palindrome predicate — NOT digit-decomposition iteration
+3. **clever_130_digits_modified**: digit-decomposition via n/10 with `9^k` polynomial bound for multiplicative product, single accumulator + `any_odd` Bool flag — multiplicative not paired-counter
+4. **clever_103_unique_digits_modified**: digit-decomposition as Boolean predicate `has_even_digit` feeding a filter — predicate not counter
+5. **clever_107_count_nums_modified**: digit-sum + first-digit composition, additive at every level — different shape
+
+**Judgment:** The combination of digit-decomposition iteration + paired classification counter (where each digit's parity dispatches which of two counters to increment) is structurally novel. clever_035 has digit-decomposition + single counter; clever_106 has paired counters but on outer range iteration with parity-on-k (not parity-of-current-iteration-VALUE). The "n=0 special case at wrapper returning a specific tuple" + per-component digit-budget bound are also new specializations.
+
+However, the techniques are largely additive combinations of existing patterns, and the proof doesn't introduce a fundamentally new tactical shape — it's a clean composition of well-covered ingredients (digit-decomposition recursion + log10 bound + paired-counter-update + tuple postcondition projection). A future target needing this exact combination would still find sufficient guidance in clever_035 (digit mechanics) + clever_106 (paired counter pattern).
+[tool] add_proof_pattern({"features": ["recursion", "strong-induction", "recursive-equation-unfold", "bv-nat-bridge", "partial-operator-discharge", "division-by-zero", "digit-decomposit... [+6270 chars])
+[tool] add_proof_pattern({"features": ["recursion", "strong-induction", "recursive-equation-unfold", "bv-nat-bridge", "partial-operator-discharge", "division-by-zero", "digit-decomposit... [+6277 chars])
+ADDED `clever_153_even_odd_count_modified` with features: recursion, strong-induction, recursive-equation-unfold, bv-nat-bridge, partial-operator-discharge, division-by-zero, digit-decomposition-recursion, u64-add-no-overflow, existential-postcondition, multi-clause-contract, shared-aux-lemma, bundled-postcondition-projection, recursive-oracle-spec, running-accumulator-invariant, native-decide-unit-pin, boundary-case-projection, log10-digit-bound, tuple-return-postcondition, **paired-classification-counter** (new), **per-digit-parity-dispatch** (new), **n-zero-special-case-wrapper** (new), **counter-bound-via-digit-budget** (new).
+
+Summary: paired even/odd digit counter via tail-recursive digit-decomposition returning a (u64, u64) tuple with the n=0 special case at the wrapper returning (1, 0).
+
+Observation: This entry occupies a structural gap between `clever_106_even_odd_palindrome_modified` (paired counters on OUTER range iteration with parity-of-k dispatch) and `clever_035_fizz_buzz_modified` / `clever_130_digits_modified` (digit-decomposition with SINGLE counter / multiplicative aggregator) — the novelty is combining digit-decomposition iteration with per-digit-value classification dispatching between paired counters. The `counter-bound-via-digit-budget` lemma `(count_at_nat n e o).i ≤ e + k for n < 10^k` is the additive per-component analog of clever_130's `9^k` multiplicative bound, and the proof shows that even with PAIRED accumulator state the bound can be stated and propagated cleanly. The proof is short and largely scaffolding-driven — a future target needing this pattern would benefit primarily from the bound lemma shape and the tuple-return discharge.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260530-020349_153_even_odd_count_stage_notes.json
+[cleanup] freed 521.6MB from benchmarks/claude-opus-4-7/clever_3/153_even_odd_count_modified

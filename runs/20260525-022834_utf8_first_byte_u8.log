@@ -1,0 +1,327 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260525-022834_utf8_first_byte_u8.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_first_byte_u8/attempted_changes/20260525-022834
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Read({"file_path": "src/lib.rs"})
+I'll generate property-based tests for `utf8_first_byte`. Let me analyze the function's contract first.
+
+**Function:** `(byte & (0x7F >> width)) as u32`
+
+Here `0x7F` is inferred as `u8` (since it's ANDed with `byte: u8`), so shifting `0x7F_u8` by `width: u32` panics in debug builds when `width >= 8`.
+
+**Contract:**
+- **Precondition:** `width < 8` (otherwise shift overflow panic on `u8`)
+- **Postcondition:** `result == (byte & (0x7F_u8 >> width)) as u32` — extracts the low `(7 - width)` codepoint payload bits
+
+Let me add proptest as a dev-dependency and add the tests.
+[tool] apply_file_patch_tool({"path": "Cargo.toml", "patch": "<<< SEARCH\n[dependencies]\nhax-lib = \"0.3.6\"\n===\n[dependencies]\nhax-lib = \"0.3.6\"\n\n[dev-dependencies]\nproptest = \"1... [+142 chars])
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n#[cfg(test)]\nmod tests {\n    use super::utf8_first_byte;\n\n    #[test]\n    fn ascii_width_passes_byte_low_bits(... [+2722 chars])
+[tool] run_cargo_test({})
+All 4 tests pass.
+
+## Summary
+
+**Tests added (2 new, alongside the 2 existing unit tests):**
+
+1. **`matches_payload_mask` (proptest, postcondition)** — For arbitrary `byte: u8` and every valid `width in 0..=7`, asserts `utf8_first_byte(byte, width) == (byte as u32) & ((0x7F_u32) >> width)`. This is the complete functional contract: a buggy implementation that uses the wrong mask, drops the AND, returns the raw byte, ORs instead of ANDs, or shifts in the wrong direction would all be caught.
+
+2. **`panics_when_width_reaches_byte_width` (`#[should_panic]`, precondition)** — Pins down that `width = 8` panics. The implementation evaluates `0x7F_u8 >> width`, and shifting a `u8` by ≥ 8 is a shift overflow in debug builds. This makes the precondition `width < 8` explicit so downstream proofs must establish it.
+
+**Properties considered but deliberately not included (derived):**
+
+- **`result <= 0x7F` (top bit always cleared).** Follows directly from `result = byte & (0x7F >> width)` since the mask is at most `0x7F`. No independent information.
+- **`result < (1 << (7 - width))` (width-specific bound).** Equivalent to the masking equation — for any `width in 0..=7`, `(0x7F >> width) == (1 << (7 - width)) - 1`. Restating it as a bound doesn't catch any bug the main test misses.
+- **`utf8_first_byte(byte, 7) == 0`.** A single instance of the postcondition (`0x7F >> 7 == 0`) — already covered by the proptest's `width in 0..=7` range.
+- **Algebraic identities** like `utf8_first_byte(b1 ^ b2, w) == utf8_first_byte(b1, w) ^ utf8_first_byte(b2, w)` (distribution of AND over XOR). Pure bitwise algebra, no new information about this function.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] run_cargo_test({})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+[tool] Read({"file_path": "proofs/lean/extraction/utf8_first_byte_u8.lean"})
+[tool] Grep({"pattern": "from_machine \\(0 : u32\\)|failed to synthesize.*Cast Bool|unexpected token 'partial_fixpoint'|sorry", "path": "proofs/lean/extraction"})
+All three pipeline stages pass cleanly and the extracted Lean has no degenerate patterns. No rewrites were needed.
+
+## Final output
+
+**Pipeline status: clean, no rewrites applied.**
+
+- `cargo test`: ✅ 4 passed (2 unit + 1 proptest + 1 should_panic)
+- `cargo hax into lean`: ✅ wrote `proofs/lean/extraction/utf8_first_byte_u8.lean`
+- `lake build`: ✅ 93/93 jobs built
+
+**Hax / `lake build` errors that drove a change:** none.
+
+**Library calls inlined:** none. The body is a single expression `(byte & (0x7F >> width)) as u32` using only primitive `&`, `>>`, and an `as u32` cast (`u8 -> u32`, an upcast — no `Cast Bool <int>` gap).
+
+**Patterns considered but not changed:**
+
+- **Partial-op `0x7F >> width`** — at `width >= 8` this is an oversize shift that extracts to `RustM.fail .integerOverflow`. **This is correct**, not degenerate: the test `panics_when_width_reaches_byte_width` explicitly pins `width < 8` as the function's precondition, exactly mirroring the extracted Lean's `RustM` failure. There is no short-circuit `&&`/`||` guard above the shift that Hax's eager `do`-block extraction would silently break — the shift is the function's only operation, so the proof stage will see a `requires width < 8`-shaped obligation directly, which matches the test contract. No rewrite needed (and the `short_circuit_and_with_partial_op.rs` archive pattern does not apply — there is no `&&`/`||` here).
+- **No `while` / recursion / `loop_invariant!` / `loop_decreases!`** — the function is a pure one-liner, so the recursion-vs-while preference, auto-spec failure modes, and constant-`0` measure concerns are all inapplicable.
+- **No iterator chains, `for`, `Vec::push`, `unsafe`, `f64`, `.abs()`, `.pow()`, `.trailing_zeros()`, `.is_power_of_two()`, `u32::MAX` reference, `impl Fn*`, Lean keyword identifiers, large const tables, or `.checked_*`/`.wrapping_*`** — none present.
+
+**Suspected semantics changes:** none — the source is unmodified.
+
+**Hax-degenerate patterns unfixable at source:** none. The extracted Lean (single `def utf8_first_byte`) is well-formed and proof-ready.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_first_byte_u8/attempted_changes/20260525-022834/*_stage2_rust_hax_lean_*"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/validations/utf8_first_byte_u8/attempted_changes/20260525-022834/*"})
+The attempt log contains only `stage1_make_pbt_*` entries — no `stage2_rust_hax_lean_*` subdirectories exist. Per the skill rules, only stage2 attempts are pattern-worthy; stage1 entries are out of scope.
+
+## Final Report
+
+**Patterns written:** 0
+
+**Attempts inspected but skipped:**
+- `0001_stage1_make_pbt_patched/` — wrong stage (stage1, not stage2_rust_hax_lean)
+- `0002_stage1_make_pbt_patched/` — wrong stage (stage1, not stage2_rust_hax_lean)
+
+**Notes for human attention:**
+- The rewrite stage (`stage2_rust_hax_lean`) produced no logged attempts in this run. This means either (a) the rewrite agent had nothing to fix because Hax + lake build passed on the first try, or (b) the rewrite stage didn't execute for this validation. No new patterns can be derived from a log that contains no rewrite attempts.
+
+harvest_rewrite_patterns
+The two files are byte-identical. The `utf8_first_byte` function body, all unit tests, the proptest, and the `#[should_panic]` test are unchanged. There are no inlinings, structural rewrites, or even verification annotations to evaluate.
+
+Since no changes were made, runtime behavior is trivially preserved on every input.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/utf8_acc_cont_byte_u32_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/utf8_acc_cont_byte_u32_modified/proofs/lean/extraction/Utf8AccContByteU32Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/utf8_acc_cont_byte_u32_modified/proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/utf8_acc_cont_byte_u32_modified/proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/Clever_044_triangle_areaObligations.lean"})
+[tool] Grep({"pattern": ">>>\\?|<<<\\?", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "glob": "*.lean", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": ">>>\\?", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/max_odd_part_modified/proofs/lean/extraction/Max_odd_partObligations.lean", "output_m... [+35 chars])
+Based on my analysis of the target `utf8_first_byte_u8` extraction, the key proof obstacles are:
+
+- **Partial `>>>?` on u8 with a *dynamic* shift amount (`width : u32`)** — needs a `width < 8` precondition to discharge the bounds check
+- **Partial `&&&?` on u8** — total under unsigned, needs simp-style unfolding
+- **u8 → u32 cast (`rust_primitives.hax.cast_op`)** — needs a `.toUInt32` bridge
+- **Paired `_ok` (under `width < 8`) + `_panic` (when `width ≥ 8`)** theorem shape
+- Minor functional-correctness clause matching the property test `(byte as u32) & (0x7F >> width)`
+
+### Selected paths
+
+```
+proof_patterns/utf8_acc_cont_byte_u32_modified
+proof_patterns/clever_044_triangle_area_modified
+proof_patterns/max_odd_part_modified
+proof_patterns/utf8_char_width_u8_modified
+proof_patterns/add_one_modified
+```
+
+### Rationale per pick
+
+- **`proof_patterns/utf8_acc_cont_byte_u32_modified`** — Closest sibling in the same UTF-8 helper family. Demonstrates exactly the same idioms: partial shift discharge inside a `do`-block, `&&&? CONT_MASK` unfolding, u8→u32 cast via `.toUInt32`, foundational `_postcondition` equational form from which the bit-mask clauses derive. Tags `static-shift-bounds-discharge`, `u8-to-u32-cast-bridge`, `partial-operator-discharge`, `bundled-postcondition-projection` all line up — the only delta is static vs dynamic shift.
+- **`proof_patterns/clever_044_triangle_area_modified`** — Canonical paired `_ok` (under precondition) + `_overflow` (when precondition fails) theorem shape, with static-decide collapse of the partial-operator condition. Drop-in template for the target's `_ok` (`width < 8`) / `_panic` (`width ≥ 8`) pairing — substitute `mulOverflow` discharge with shift-bounds discharge.
+- **`proof_patterns/max_odd_part_modified`** — The *only* library example doing a *dynamic* `>>>?` discharge under a bounds hypothesis (`r < 64` on a u64). The `h_shr` lemma (lines ~344–352) — reducing `i >>>? r` to `RustM.ok (i >>> r.toNat.toUInt64)` once `0 ≤ r ∧ r < 64` is established — transfers almost verbatim to discharging `(127:u8) >>>? width` under `width < 8`. The surrounding loop machinery is not relevant; only the `h_shr` pattern is.
+- **`proof_patterns/utf8_char_width_u8_modified`** — Same UTF-8 module family and same input type (`u8`). Demonstrates `branch-split-totality` + `UInt8.lt_iff_toNat_lt`/`UInt8.le_iff_toNat_le` + `omega` for discharging `decide (b < n)` comparisons over u8 constants — exactly the style needed to dispatch the `width ≥ 8` panic branch and the `width < 8` ok branch.
+- **`proof_patterns/add_one_modified`** — Minimal `overflow-u8` / `if-branch-on-overflow` / `single-binop` shape; included as the lightest possible reference for the panic theorem's `RustM.fail .integerOverflow` discharge once the shift-bounds Boolean is shown to be `false`.
+
+### Gaps (no example covers cleanly)
+
+- **u8 partial shift (`>>>?`) with dynamic shift amount** specifically — `max_odd_part` does u64 shifts; the bit width and the underlying `rust_primitives.ops.bit.Shr.shr` instance on u8 differ. The proof agent will need to adapt the u64 pattern to u8 (bound becomes `width < 8` and the cast lands in `.toUInt8` rather than `.toUInt64`).
+- **u8 → u32 cast composed with a partial bit operation on the byte side** — `utf8_acc_cont` does the inverse direction (cast comes after the AND); here the structure is `(byte &&& (127 >>> width)).cast_op`, which Hax emits with the cast at the outer position. No example has exactly this composition order — minor risk of mis-aligned `simp only`.
+
+Adding a u8-shift counterpart to `max_odd_part`'s `h_shr` (extracted as a standalone lemma `u8_shr_ok_of_lt_8 : w < 8 → (b >>>? w) = RustM.ok (b >>> w.toNat.toUInt8)`) would close this gap and serve future u8-shift extractions.
+
+### Rejections
+
+- `trailing_zeros_u64_modified` — has shift discharge but inside a `while` loop with multiplicative invariant; the proof shape is dominated by loop reasoning the target does not need.
+- `sqrt_u64_modified` — has `shift-overflow-discharge`, but buried in an enormous Babylonian-iteration proof; signal-to-noise too low for a single-shot target.
+- `is_size_align_valid_usize_modified` / `padding_needed_for_usize_modified` — `bv_decide` bit-trick reasoning, but the trick (power-of-two characterisation, alignment rounding) is unrelated to UTF-8 mask shifting.
+- `average_floor_u64_modified` / `average_ceil_u64_modified` — bit-manip but no partial-operator discharge to learn from.
+- `min_modified` / `is_zero_modified` / `clamp_modified` — total u8 functions; no shift, no panic branch.
+- `square_modified` — overflow-u8 pair, but on `*`, not shift; `add_one` already covers the minimal-pair role.
+- All recursion/strong-induction examples (`contains_u64_modified`, `gcd_*`, `factorial_modified`, `below_zero_modified`, `clever_*`, etc.) — target is non-recursive, single straight-line expression.
+- `truncate_number_modified` — partial `%?` discharge, not shift; different operator family.
+- `slice_get_u64_modified` — partial slice indexing, not shift.
+- All `map_*`, iterator adapters, `binomial_u64`, `repeat_*` — far too heavy (higher-order, monadic specs, multi-helper composition) for a single-shift, single-mask function.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean
+[scaffold] registered Utf8_first_byte_u8Obligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/utf8_acc_cont_byte_u32_modified/proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/Clever_044_triangle_areaObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/max_odd_part_modified/proofs/lean/extraction/Max_odd_partObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/utf8_char_width_u8_modified/proofs/lean/extraction/Utf8_char_width_u8Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/add_one_modified/proofs/lean/extraction/Add_oneObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/utf8_acc_cont_byte_u32_modified/proofs/lean/extraction/utf8_acc_cont_byte_u32.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/utf8_first_byte_u8.lean"})
+[tool] Glob({"pattern": "**/Hax.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax.lean"})
+[tool] Glob({"pattern": "**/rust_primitives/**/*.lean"})
+[tool] Grep({"pattern": "Shr|>>>?|shr", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "output_mode": "content"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 300, "limit": 220})
+[tool] Grep({"pattern": "cast_op|BitAnd|&&&?", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "output_mode": "con... [+6 chars])
+[tool] Grep({"pattern": "cast_op", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/Cast.lean"})
+Let me check the relevant parts of the Hax prelude for cast and shift behavior, then check what helpers exist.
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 40, "limit": 80})
+Now I have enough context. Let me write the obligations file.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "patch": "<<< SEARCH\nnamespace Utf8_first_byte_u8Obligations\n\n-- Add `theorem` declarat... [+5544 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean"})
+All theorems are well-typed — only `sorry` warnings, no errors. Let me confirm with `lake build`.
+[tool] run_lake_build({})
+`lake build` succeeded — every theorem statement is well-typed; only the expected `sorry` warnings remain.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean`
+
+**Theorems added (10 total)** — one line per theorem, naming the contract clause it captures:
+
+- `utf8_first_byte_postcondition` — foundational closed-form: for `width < 8`, the function returns `(byte &&& (0x7F >>> width.toUInt8)).toUInt32`. (Reduction shape.)
+- `utf8_first_byte_matches_payload_mask` — proptest `matches_payload_mask`: for `width < 8`, result equals `byte.toUInt32 &&& ((0x7F : u32) >>> width)`. (Contract surface.)
+- `utf8_first_byte_total_when_width_lt_8` — totality: for `width < 8`, a successful result exists. (Derived from postcondition; useful downstream.)
+- `utf8_first_byte_panics_when_width_ge_8` — failure mode: for `width ≥ 8`, the function panics with `Error.integerOverflow`. (Universalises the `should_panic` test `panics_when_width_reaches_byte_width`, which probes only `width = 8`.)
+- `utf8_first_byte_concrete_C2_w2` — unit-test vector `(0xC2, 2) ↦ 0x02`.
+- `utf8_first_byte_concrete_E0_w3` — unit-test vector `(0xE0, 3) ↦ 0x00`.
+- `utf8_first_byte_concrete_EF_w3` — unit-test vector `(0xEF, 3) ↦ 0x0F`.
+- `utf8_first_byte_concrete_F0_w4` — unit-test vector `(0xF0, 4) ↦ 0x00`.
+- `utf8_first_byte_concrete_F4_w4` — unit-test vector `(0xF4, 4) ↦ 0x04`.
+- `utf8_first_byte_concrete_7F_w0` — unit-test vector `(0x7F, 0) ↦ 0x7F`.
+- `utf8_first_byte_concrete_FF_w0` — unit-test vector `(0xFF, 0) ↦ 0x7F` (high-bit-drop anchor).
+
+**Property tests classified as derived facts (skipped):** None. Every Rust test contributes at least one theorem.
+
+**Feasibility analysis:**
+- `width < 8` precondition matches the shift's guard `0 ≤ width ∧ width < 8`; since `width : u32` makes `0 ≤ width` vacuous, the bound is literally what the partial shift requires. The natural universal-on-precondition statement holds in the Lean model.
+- `width ≥ 8` panic theorem is stated universally (not just for `width = 8` as in the test); this is the strongest honest contract since the shift's failure branch fires identically for every out-of-range value.
+
+**Uncertainty flags:**
+- `utf8_first_byte_matches_payload_mask` uses the proptest's exact u32-side shape (`byte.toUInt32 &&& ((127 : u32) >>> width)`). This is provably equal to `utf8_first_byte_postcondition`'s u8-side shape via standard `BitVec` identities, but the proof stage may want to derive one from the other rather than reproving the reduction from scratch. Both forms are well-typed and both correctly state the contract — the redundancy is intentional (the postcondition tracks the function's literal reduction; the `_matches_payload_mask` form tracks the test's surface).
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 11 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/utf8_acc_cont_byte_u32_modified/proofs/lean/extraction/Utf8_acc_cont_byte_u32Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/max_odd_part_modified/proofs/lean/extraction/Max_odd_partObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_044_triangle_area_modified/proofs/lean/extraction/Clever_044_triangle_areaObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/utf8_char_width_u8_modified/proofs/lean/extraction/Utf8_char_width_u8Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/add_one_modified/proofs/lean/extraction/Add_oneObligations.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/proof-libs/lean/**/*.lean"})
+[tool] Glob({"pattern": "**/proof-libs/lean/**/*.lean"})
+[tool] Grep({"pattern": "Shr.shr", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives", "output_mode": "content"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 150, "limit": 100})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 250, "limit": 200})
+[tool] Grep({"pattern": "&amp;&amp;&amp;\\?|BitAnd\\.and|class.*BitAnd", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives", "o... [+23 chars])
+[tool] Grep({"pattern": "&&&\\?", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 1, "limit": 100})
+[tool] Grep({"pattern": "cast_op", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "content"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/Cast.lean"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean"})
+Let me check whether the inner shift expression simplifies as expected by querying the LSP:
+[tool] mcp__lean__lean_hover_info({"file_path": "utf8_first_byte_u8.lean", "line": 17, "column": 10})
+[tool] Read({"file_path": "proofs/lean/extraction/utf8_first_byte_u8.lean"})
+Let me try a draft proof for the foundational postcondition using `lean_multi_attempt`:
+[tool] mcp__lean__lean_goal({"file_path": "Utf8_first_byte_u8Obligations.lean", "line": 30})
+[tool] mcp__lean__lean_goal({"file_path": "Utf8_first_byte_u8Obligations.lean", "line": 34, "column": 3})
+[tool] mcp__lean__lean_goal({"file_path": "Utf8_first_byte_u8Obligations.lean", "line": 33, "column": 3})
+Now I'll write a draft of the foundational postcondition. Let me first patch in a candidate proof and check:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_first_byte_postcondition (byte : u8) (width : u32) (h :... [+1584 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_first_byte_postcondition (byte : u8) (width : u32) (h :... [+1553 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean", "start_line": 21, "end_line": 60})
+The postcondition proof works. Let me check all diagnostics:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "offset": 60, "limit": 100})
+[tool] Grep({"pattern": "RustM|def fail|def ok", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/RustM.lean", "output_mode": ... [+28 chars])
+Now let me work on the panic theorem:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_first_byte_panics_when_width_ge_8\n    (byte : u8) (wid... [+1481 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean", "severity": "error"})
+Let me check whether `bv_decide` can close the bridge lemma. First, let me look at relevant lemmas:
+[tool] Grep({"pattern": "toUInt32_and|toUInt32.*and", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content"})
+[tool] Grep({"pattern": "UInt8\\.toUInt32_and|toUInt32_and_eq", "path": "proofs/lean/extraction/.lake/packages/Hax", "output_mode": "files_with_matches"})
+Let me test some proof attempts for the bridge:
+[tool] mcp__lean__lean_multi_attempt({"file_path": "Utf8_first_byte_u8Obligations.lean", "line": "93", "snippets": "[\"have h_eq : (byte &&& ((127 : u8) >>> width.toNat.toUInt8)).toUInt32 = byte.to... [+249 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_first_byte_matches_payload_mask\n    (byte : u8) (width... [+663 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean", "severity": "error"})
+Let me explore relevant lemmas in Lean for the shift/cast bridge:
+[tool] Grep({"pattern": "UInt8.toNat_toUInt32|toUInt32_shiftRight|UInt8\\.toUInt32_and|UInt8\\.toUInt32.*and", "path": "proofs/lean/extraction/.lake/packages", "output_mode... [+31 chars])
+[tool] Grep({"pattern": "UInt8.toNat_toUInt32|toUInt32_and|toNat_toUInt8", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "content", "head_limit": 30})
+[tool] Grep({"pattern": "toUInt32_and|toBitVec_and|toUInt32_eq", "path": "proofs/lean/extraction/.lake/packages", "output_mode": "files_with_matches", "head_limit": 15})
+Let me try a case-split approach on the 8 possible values of width:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_first_byte_matches_payload_mask\n    (byte : u8) (width... [+2126 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "patch": "<<< SEARCH\n  -- Case-split on the 8 possible values of width.toNat\n  have h_ca... [+2615 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "patch": "<<< SEARCH\n  rcases h_cases with rfl | rfl | rfl | rfl | rfl | rfl | rfl | rfl ... [+1283 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean", "severity": "error"})
+Now let me handle the concrete cases:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean", "patch": "<<< SEARCH\ntheorem utf8_first_byte_concrete_C2_w2 :\n    utf8_first_byte (0xC2 ... [+2593 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Utf8_first_byte_u8Obligations.lean"})
+All proofs closed. Let me confirm with `lake build`:
+[tool] run_lake_build({})
+`lake build` succeeded with no `sorry` warnings. Let me view the final file:
+[tool] Read({"file_path": "proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean"})
+All 10 obligations are closed. The build is clean.
+
+## Final Output
+
+**File changed:** `proofs/lean/extraction/Utf8_first_byte_u8Obligations.lean`
+
+**Proofs added (10 total):**
+
+1. **`utf8_first_byte_postcondition`** — The foundational equation. Unfolded `utf8_first_byte`, reformulated the do-block via `show`, discharged the shift's `0 ≤ width && width < 8` Boolean guard using `UInt32.le_iff_toNat_le` + the hypothesis `h`, then `rw` on the condition and `rfl`. Same shape as `utf8_acc_cont_byte_postcondition` from the reference, adapted from static (constant) to dynamic shift amount.
+
+2. **`utf8_first_byte_matches_payload_mask`** — Bridges the u8-side AND/shift to the u32-side AND/shift. Reduced through the postcondition, then case-split on the 8 possible values of `width.toNat`. `bv_decide` couldn't see through `(UInt32.toNat width).toUInt8`, so the case-split (built from `omega` + a small `h_inj` helper using `UInt32.toNat_inj` and `UInt32.toNat_ofNat_of_lt'`) substitutes each concrete `width`, the `simp only` block evaluates `UInt32.toNat k` and `Nat.toUInt8 k` to their numeric forms, and `bv_decide` finishes each instance.
+
+3. **`utf8_first_byte_total_when_width_lt_8`** — Already a one-liner (`⟨_, postcondition⟩`).
+
+4. **`utf8_first_byte_panics_when_width_ge_8`** — Symmetric to the postcondition: showed `width < 8` is false from `8 ≤ width` (via `UInt32.le_iff_toNat_le` + `omega`), got the cond to `false`, then `rfl` (the `RustM.fail >>= _` chain reduces definitionally).
+
+5. **`utf8_first_byte_concrete_{C2_w2, E0_w3, EF_w3, F0_w4, F4_w4, 7F_w0, FF_w0}`** (7 vectors) — Each one is `rw [utf8_first_byte_postcondition _ _ (by decide)]; native_decide`. The `by decide` discharges the `width < 8` precondition at the concrete `width` value.
+
+**Sub-goals that were difficult and how resolved:**
+
+- **`matches_payload_mask` bridge**: `bv_decide` failed straight-up because `(UInt32.toNat width).toUInt8` was abstracted as an opaque variable. Resolved by case-splitting on the 8 valid `width` values, then having `simp` evaluate the `UInt32.toNat k` / `Nat.toUInt8 k` projections to concrete literals so `bv_decide` could finish each branch.
+- **Constructing `width = (UInt32.ofNat k)` from `width.toNat = k`**: needed a small `h_inj` helper using `UInt32.toNat_inj.mp` together with `UInt32.toNat_ofNat_of_lt'` — `interval_cases` is unavailable (Mathlib not imported), so the case-split is built manually via `omega` + `rcases`.
+
+**`sorry`s left:** None.
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+Looking at the proof structure, the key obstacles are:
+
+1. **Dynamic** shift `>>>? width` where `width` is a `u32` runtime input — partial-operator discharge requires the precondition `width < 8` (not static)
+2. **Paired success/panic theorems**: postcondition under `width < 8` AND `RustM.fail Error.integerOverflow` under `width ≥ 8`
+3. **Cross-width bitfield identity** `(byte &&& ((127:u8) >>> w.toUInt8)).toUInt32 = byte.toUInt32 &&& ((127:u32) >>> w)` — proved NOT by a single `bv_decide` (dynamic 32-bit width is out of reach) but by **enumerating the 8 possible values of `width`** via a `UInt32.ofNat_eq_of_toNat_eq` injection lemma + `rcases` + per-arm `bv_decide`
+4. Concrete anchors closed by `rw [_postcondition] ; native_decide`
+
+Comparison with the closest neighbour `utf8_acc_cont_byte_u32_modified`:
+- That entry uses a **static** shift `<<<? 6` discharged by `decide` on `(0 ≤ 6 && 6 < 32) = true` — no precondition, totally proved.
+- It uses a single `bv_decide` across widths for its bitfield clauses.
+
+The new entry is structurally distinct on three axes: (i) the shift amount is a runtime variable bounded by a precondition rather than a static literal; (ii) there's a paired panic theorem covering the complementary range; (iii) the cross-width identity is bridged by *finite-domain enumeration* (8-way `width.toNat < 8` case-split into `UInt32` constants, parallel to `clever_038_prime_fib_modified`'s `n_eq_of_toNat_le_N` idea) precisely because direct `bv_decide` on the cross-width statement is intractable. None of the existing UTF-8/bitfield entries combine these. Adding.
+[tool] add_proof_pattern({"name": "utf8_first_byte_u8_modified", "features": ["bit-manip", "partial-operator-discharge", "dynamic-shift-bounded-by-precondition", "integer-overflow-failu... [+2343 chars])
+ADDED `utf8_first_byte_u8_modified`.
+
+Features: `bit-manip`, `partial-operator-discharge`, `dynamic-shift-bounded-by-precondition`, `integer-overflow-failure`, `paired-success-panic-theorems`, `cross-width-bv-decide`, `u8-to-u32-cast-bridge`, `bv-nat-bridge`, `case-split-by-toNat-bound`, `finite-domain-enumeration-per-arm-bv-decide`, `bundled-postcondition-projection`, `native-decide-unit-pin`, `multi-clause-contract`, `functional-correctness`.
+
+Summary (one line): Runtime-bounded partial shift `(byte & (0x7F >>> width))` on (u8, u32)→u32 with paired success/panic theorems over the complementary `width < 8` / `8 ≤ width` ranges; the cross-width bitfield identity is bridged by enumerating the 8 possible u32 width values via a `UInt32.ofNat_eq_of_toNat_eq` injection + `rcases` + per-arm `bv_decide`, replacing the single cross-width `bv_decide` of `utf8_acc_cont_byte_u32_modified` (which only works for static shift amounts).
+
+Observations for human readers: the proof's most reusable mechanism is the `h_inj` ladder — when a `u32`/`u64` variable has a small `toNat` bound, you can convert "Nat disjunction over k ∈ {0..N}" into "u32 disjunction over `UInt32.ofNat k`" and then `rcases` to expose concrete unsigned literals to downstream tactics. This is the same shape as `clever_038_prime_fib_modified`'s `n_eq_of_toNat_le_N` but used here to unblock `bv_decide` on a cross-width identity rather than to enable `native_decide` unit pins.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260525-022834_utf8_first_byte_u8_stage_notes.json
+[cleanup] freed 529.0MB from benchmarks/claude-opus-4-7/validations/utf8_first_byte_u8_modified

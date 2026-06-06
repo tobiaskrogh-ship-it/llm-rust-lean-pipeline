@@ -1,0 +1,298 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260519-032625_from_mut_u64.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/array/from_mut_u64/attempted_changes/20260519-032625
+Stages: all 8 (1-8), in order
+[setup] Crate not yet set up — running setup_crate.bash on /home/tobias/uni/pipeline_v6/benchmarks/code/array/from_mut_u64
+[setup] Done.
+
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n    // Transferred from core's `tests/array.rs::array_from_mut`,\n    // monomorphized to `u64`. The original mutat... [+2814 chars])
+[tool] run_cargo_test({})
+All tests pass (3 passed, 0 failed).
+
+## Summary
+
+`from_mut(s: &mut u64) -> &mut [u64; 1]` is a total function that reinterprets the same memory (no copy). The contract has no preconditions and no failure modes, so the suite focuses on the two **independent** postcondition halves.
+
+### Tests added
+
+| Test | Contract clause | What it pins down |
+|---|---|---|
+| `prop_element_reads_original` | Postcondition (read aliasing) | `from_mut(&mut x)[0] == x` before any mutation — the array element *is* the input, not a constant/zeroed/unrelated value. |
+| `prop_write_propagates_to_original` | Postcondition (write aliasing, "without copying") | After `arr[0] = v`, the original `u64` equals `v` — the no-copy aliasing guarantee. |
+
+Both run over a `SAMPLES` set covering boundary and interior values (`0`, `1`, `2`, `42`, `u64::MAX/2`, `u64::MAX-1`, `u64::MAX`, a bit-pattern constant). The pre-existing `array_from_mut` test is retained as a concrete witness (`+= 1` mutation).
+
+**Why these two are both needed (independence):** A buggy implementation that copies the input into freshly allocated array storage would still satisfy `prop_element_reads_original` (the copied value reads back correctly) but fail `prop_write_propagates_to_original` (the write would not reach the original). Conversely, an implementation returning a reference to unrelated storage fails the read test. Neither property implies the other, so each earns its place.
+
+### Properties considered but excluded
+
+- **Precondition test:** none — the function is total over all `&mut u64`; there is no input to select or reject.
+- **Failure-condition test:** none — the function never panics and returns no `Option`/`Result`; no overflow path exists.
+- **Array length (`arr.len() == 1`):** this is a static type-level guarantee of the return type `&mut [u64; 1]`, not a runtime property; a dynamic check would be vacuous and would not catch any bug the type system already rejects.
+- **Derived facts** (e.g. idempotence of repeated `from_mut` calls, round-trip identities, algebraic relations between successive writes): these follow from the two postconditions plus basic properties of assignment and add nothing about the implementation, so they were omitted to keep downstream proof obligations minimal.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/as_mut_slice_u64_modified/src/lib.rs"})
+[tool] run_cargo_test({})
+[tool] Glob({"pattern": "src/**/*.rs"})
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] run_cargo_hax_into_lean({})
+[tool] Read({"file_path": "./proofs/lean/extraction/from_mut_u64.lean"})
+[tool] run_lake_build({})
+## Summary
+
+This crate is a textbook instance of the archived **`return_mut_borrow_unfixable.rs`** pattern. No source changes were made — and none can be made — so I'm stopping after diagnosis.
+
+### Pipeline state (all three commands run, no edits)
+
+| Stage | Result |
+|---|---|
+| `cargo test` | ✅ 3/3 pass (`array_from_mut`, `prop_element_reads_original`, `prop_write_propagates_to_original`) |
+| `cargo hax into lean` | ✅ exits 0, but **degenerate extraction** |
+| `lake build` | ✅ "Build completed successfully" but emits **2× `declaration uses sorry`** |
+
+### The Hax-degenerate pattern (cannot be fixed at source level)
+
+The function returns a **mutable borrow of its input**:
+
+```rust
+pub const fn from_mut(s: &mut u64) -> &mut [u64; 1] {
+    unsafe { &mut *(s as *mut u64).cast::<[u64; 1]>() }
+}
+```
+
+Extraction degenerates exactly as `return_mut_borrow_unfixable.rs` documents — the return type itself becomes `sorry` and the body becomes `(pure sorry)`:
+
+```lean
+@[spec]
+def from_mut (s : u64) : RustM sorry := do (pure sorry)
+```
+
+`lake build` then completes but with two `sorry` warnings (`from_mut_u64.lean:18:2` = return type, `:19:4` = body) — i.e. there is no usable extracted definition.
+
+**Why the `unsafe` raw-pointer cast is *not* the blocker:** this is an aliasing cast (`&mut u64` → `&mut [u64; 1]`, identical bytes), not a byte reinterpretation, so `unsafe_transmute_to_bits.rs` (`to_bits`/`from_bits`) does not apply. The `&mut` in **return position** is the blocker — Hax's pure `RustM` erases lifetimes/aliasing and has no representation for a mutable alias handed back to the caller. Rewriting the unsafe block to any safe equivalent leaves the `&mut [u64; 1]` return type, hence the identical degenerate extraction.
+
+**Why no source-level rewrite preserves the test contract:**
+- All 3 tests require write-through aliasing: `arr[0] += 1` / `arr[0] = v` must be observable in `value`, and `arr[0] == x` must read the original.
+- Returning `[u64; 1]` **by value** → copy → `prop_write_propagates_to_original` fails.
+- Returning `&[u64; 1]` (immutable) → does not compile (`arr[0] += 1` needs `IndexMut`).
+- No Hax-modelable Rust type aliases the input mutably. Tests must not be modified, so the signature cannot be relaxed.
+
+### Library calls inlined
+None.
+
+### Patterns considered but not changed
+- `unsafe_transmute_to_bits.rs` — considered; **not applicable** (aliasing cast, not bit reinterpretation; the `to_bits`/`from_bits` rewrite cannot produce a `&mut` alias).
+- `return_mut_borrow_unfixable.rs` — **matched exactly** (verified sibling: `as_mut_slice_u64`). Recommended handling is "leave source unchanged, flag, stop."
+
+### Changes suspected of altering semantics
+None — source is unchanged and faithful to `core::array::from_mut`.
+
+### Hax-degenerate pattern for the proof stage to plan around
+
+`from_mut` has **no usable extracted definition** (`RustM sorry` return type + `(pure sorry)` body; `lake build` `declaration uses sorry` ×2). This is upstream of Hax's lack of a returned-mutable-borrow model — not fixable in Rust.
+
+Recommended proof-stage workaround: model `from_mut` in Lean directly as the identity wrapping the input into a length-1 array (`fun (s : u64) => pure (a : RustArray u64 1 with a[0] = s)`, i.e. the returned mutable view *is* the array), then state the contract against that hand model:
+- returned length = 1,
+- `result[0] = s` (read aliasing — `prop_element_reads_original`),
+- write-through: writing `v` at index 0 yields final input value `v` (`prop_write_propagates_to_original` / `array_from_mut`).
+
+No `add_proof_pattern` / `write_rewrite_pattern` call made — this pattern is already in the archive (`return_mut_borrow_unfixable.rs`) and the working crate was not promoted (degenerate extraction).
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "attempted_changes/20260519-032625/*", "path": "/home/tobias/uni/pipeline_v6/benchmarks/code/array/from_mut_u64"})
+[tool] Glob({"pattern": "rewrite_patterns/*.rs", "path": "/home/tobias/uni/pipeline_v6"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/array/from_mut_u64/attempted_changes/20260519-032625/*"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/rewrite_patterns/*.rs"})
+The only attempt directory in this log is `0001_stage1_make_pbt_patched/` — a `stage1_make_pbt` attempt. The skill scope is strictly `*_stage2_rust_hax_lean_*/` attempts; all other stages are out of scope.
+
+Let me confirm there are no nested or additional directories I'm missing:
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/array/from_mut_u64/attempted_changes/20260519-032625/**/metadata.json"})
+Confirmed: the log contains exactly one attempt directory, `0001_stage1_make_pbt_patched/`, which is a `stage1_make_pbt` attempt — out of scope for this skill (only `stage2_rust_hax_lean` attempts qualify).
+
+## Final report
+
+**Patterns written:** None.
+
+**Attempts inspected but skipped:**
+- `0001_stage1_make_pbt_patched/` — skipped: not a `stage2_rust_hax_lean` attempt (it's `stage1_make_pbt`, which is out of scope; the rewrite/Hax-incompatibility harvest only considers stage-2 patches).
+
+**No `*_stage2_rust_hax_lean_*/` directories exist in this run's log** (`attempted_changes/20260519-032625`), so there were no Hax / `lake build` incompatibility patches to mine. The `rewrite_patterns/` archive is unchanged.
+
+**Flagged for attention:** Nothing confusing. This run simply produced no rewrite-stage patches — only a stage-1 PBT patch — so there is nothing to harvest.
+
+harvest_rewrite_patterns
+The original and Hax-rewritten `src/lib.rs` are byte-identical. Every line — the `from_mut` function body, the `unsafe` pointer cast, the doc comments, the `SAMPLES` constant, and all three tests — matches exactly between the two versions.
+
+**Summary of changes:** None. The rewrite stage produced output identical to its input, which is consistent with the stage's default behavior of keeping Rust source minimal and pushing proof work to Lean obligations.
+
+**Reasoning:** Since there is no difference between the two sources, there is no input on which they could diverge. The `from_mut` function — an `unsafe` pointer cast from `&mut u64` to `&mut [u64; 1]` — is unchanged, so its runtime behavior (aliasing the original storage without copying) is trivially preserved. No inlinings, structural rewrites, or annotation changes were introduced.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/as_mut_slice_u64_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/as_slice_u64_modified/src/lib.rs"})
+[tool] Glob({"pattern": "proof_patterns/as_mut_slice_u64_modified/proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "proof_patterns/as_slice_u64_modified/proofs/lean/extraction/*.lean"})
+[tool] Glob({"pattern": "proof_patterns/as_mut_slice_u64_modified/**/*.lean"})
+[tool] Glob({"pattern": "proof_patterns/as_slice_u64_modified/**/*.lean"})
+[tool] Glob({"pattern": "proof_patterns/as_mut_slice_u64_modified/**/*"})
+[tool] Glob({"pattern": "proof_patterns/as_mut_slice_u64_modified/*"})
+[tool] Glob({"pattern": "proof_patterns/*/proofs/lean/extraction/*Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/as_mut_slice_u64_modified/**/*.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/as_slice_u64_modified/**/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/as_mut_slice_u64_modified/proofs/lean/extraction/as_mut_slice_u64.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/as_mut_slice_u64_modified/proofs/lean/extraction/As_mut_slice_u64Obligations.lean"})
+## Selected examples
+
+```
+proof_patterns/as_mut_slice_u64_modified
+proof_patterns/as_slice_u64_modified
+```
+
+Only **2** examples are genuinely relevant. The target's entire verification difficulty is the *degenerate extraction*, not arithmetic/recursion/loops — so the rest of the library would mislead the proof stage rather than help.
+
+### Per-pick rationale
+
+- **`proof_patterns/as_mut_slice_u64_modified`** — near-exact 1:1 template. The target extracts as `def from_mut (s : u64) : RustM sorry := do (pure sorry)`, structurally *identical* to this example's `def as_mut_slice (N) (a) : RustM sorry := do (pure sorry)`: same degenerate `RustM sorry` return type, same `pure sorry` body that drops the input, same kind of contract (a **mutable reborrow** / "without copying" aliasing function). The proof ports almost verbatim: the sole well-typed obligation is totality `∃ v, from_mut s = RustM.ok v`, discharged by the generic sorry-free `rustM_isOk_exists` helper applied with `by rfl` on `.isOk`; the read/write-aliasing postconditions (`prop_element_reads_original`, `prop_write_propagates_to_original`) are exactly the kind documented here as **unstateable against `RustM sorry`**, and the residual `declaration uses 'sorry'` is the same **transitive type-level artifact**. Features matched: `degenerate-extraction`, `rustm-isok-totality`, `transitive-sorry-artifact`, `unstateable-postcondition`, mutable array reborrow.
+
+- **`proof_patterns/as_slice_u64_modified`** — the documented *non-degenerate counterpart* of the pick above (same `core::array` coercion family, `array-to-slice-reborrow`). Included as a contrast reference: it shows the concrete-extraction path (explicit slice witness `⟨…, _⟩` + `Seq.size_lt_usizeSize`) so the proof stage can positively confirm the target is in the **degenerate** regime (`RustM sorry`, not `RustM (RustSlice …)`) and must *not* attempt a concrete witness here. Secondary/lower weight — useful for the regime decision, not for tactics.
+
+### Gaps (signals for library additions)
+
+- The target's two real contract clauses — **read aliasing** (`from_mut(&mut x)[0] == x`) and **write aliasing / "without copying"** (`prop_write_propagates_to_original`) — are unstateable against the `RustM sorry` extraction, exactly as in `as_mut_slice`. No library example can *verify* aliasing through a degenerate extraction; this is the same upstream "no array→slice aliasing model / broken extraction" defect, not a proof-tactic gap.
+- No example covers an **unsafe raw-pointer `cast` reborrow** (`&mut *(s as *mut u64).cast::<[u64;1]>()`) with a concrete extraction — relevant only if Hax is ever fixed to extract this non-degenerately (`&mut u64 -> &mut [u64;1]`). Until then it collapses to the degenerate case the primary pick already handles.
+
+### Rejections
+
+- `slice_get_u64_modified`, `contains_u64_modified` — slice indexing but **concrete** extraction; target is degenerate `RustM sorry`, different obstacle entirely.
+- `add_one_modified`, `square_modified`, `abs_diff_i64_modified`, `clamp_modified`, `truncate_number_modified` — overflow/arithmetic/branching; target has no arithmetic and no fallible operation.
+- All recursion/loop/strong-induction entries (`is_prime_modified`, `gcd_*`, `below_zero_modified`, `clever_*`, `factorial_modified`, etc.) — target is a non-recursive, non-iterative pure coercion; induction machinery is irrelevant.
+- `min_modified`, `is_zero_modified` — total functions with concrete extraction and `rfl`/`bv_decide` proofs; do not exercise the degenerate-extraction totality trick.
+
+select_examples
+[scaffold] created proofs/lean/extraction/From_mut_u64Obligations.lean
+[scaffold] registered From_mut_u64Obligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/as_mut_slice_u64_modified/proofs/lean/extraction/As_mut_slice_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/as_slice_u64_modified/proofs/lean/extraction/As_slice_u64Obligations.lean"})
+This is the near-exact degenerate-extraction template. The target `from_mut` extracts as `def from_mut (s : u64) : RustM sorry := do (pure sorry)` — structurally identical to `as_mut_slice_u64`. I'll port that template, adapting names and the contract narrative.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/From_mut_u64Obligations.lean", "patch": "<<< SEARCH\nnamespace From_mut_u64Obligations\n\n-- Add `theorem` declarations below.\... [+6359 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "proofs/lean/extraction/From_mut_u64Obligations.lean"})
+[tool] Glob({"pattern": "**/From_mut_u64Obligations.lean"})
+[tool] Glob({"pattern": "**/lean-toolchain"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "From_mut_u64Obligations.lean"})
+Only the expected transitive `declaration uses 'sorry'` warning on `from_mut_total` (line 91) — no type errors. Confirming with the ground-truth build:
+[tool] run_lake_build({})
+Build succeeds. The only warnings are the structural `declaration uses 'sorry'` artifacts: two from the off-limits extracted module `from_mut_u64.lean` (the degenerate `RustM sorry` def itself), and one on `From_mut_u64Obligations.lean:91` (`from_mut_total`), inherited transitively through the `RustM sorry` return type — exactly as documented in the file.
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/From_mut_u64Obligations.lean`
+
+This is a **degenerate extraction**: Hax produced `def from_mut (s : u64) : RustM sorry := do (pure sorry)` — both the return type and body are opaque `sorry`, with the body not even referencing the input `s`. This is the near-exact 1:1 analogue of the `as_mut_slice_u64` reference template, so I ported its structure verbatim.
+
+**Theorems added (1):**
+
+- `from_mut_total` — *Totality / no-panic* contract clause: `∃ v, from_mut s = RustM.ok v`. `from_mut` is a `const fn` pointer reborrow with no fallible operation, so it always succeeds. Discharged by the generic, sorry-free `rustM_isOk_exists` helper with `by rfl` on `.isOk`. This is the shared dependency of all three Rust tests (each calls `from_mut(&mut value)` and then uses the result) and the strongest statement the degenerate extraction admits.
+
+(`rustM_isOk_exists` is a `private` generic `RustM` helper, not a contract clause.)
+
+**Property tests NOT given a theorem — and why (uncovered by construction, not derived facts):**
+
+- `prop_element_reads_original` — "read aliasing": `from_mut(&mut x)[0] == x`. A genuine contract clause, **not** a derived fact, but unstateable: it requires equating `from_mut s` with a concrete `RustM (RustArray u64 1)` value, which does not unify with the extraction's `RustM sorry` (`lake build` rejects the type mismatch).
+- `prop_write_propagates_to_original` / `array_from_mut` — "write aliasing / without copying": a write through the returned reference is observable on the original `u64`. Also a genuine contract clause; doubly unstateable because the degenerate extraction has no model of mutation-through-reborrow and `pure sorry` retains no link back to `s`.
+
+Both are documented in a `NOTE` block in the file as the upstream "broken extraction / no aliasing model" defect the selector flagged — left uncovered by construction, not omitted by choice.
+
+**Uncertainty / framing note:** The residual `declaration uses 'sorry'` on `from_mut_total` is a *structural* artifact (the `sorryAx Type` node is inherited from the off-limits extracted module's `RustM sorry` signature, not a proof gap). No proof-side change can remove it without a non-degenerate Hax re-extraction; the proof itself is total and sorry-free. This matches the documented behavior of the `as_mut_slice_u64` template exactly.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+
+make_lean_obligations
+
+[make_proof] attempt 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/as_mut_slice_u64_modified/proofs/lean/extraction/As_mut_slice_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/as_slice_u64_modified/proofs/lean/extraction/As_slice_u64Obligations.lean"})
+Both reference examples confirm the template. The current obligations file is a near-exact port of `as_mut_slice_u64`. Let me verify the ground-truth state with the build and LSP diagnostics.
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "proofs/lean/extraction/From_mut_u64Obligations.lean"})
+[tool] run_lake_build({})
+Build succeeds. Let me get the LSP diagnostics with the correct absolute path to confirm the nature of the residual warning.
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "/home/tobias/uni/pipeline_v6/proofs/lean/extraction/From_mut_u64Obligations.lean"})
+[tool] Glob({"pattern": "**/From_mut_u64Obligations.lean"})
+[tool] Grep({"pattern": "from_mut_total", "path": "proofs/lean/extraction/From_mut_u64Obligations.lean", "output_mode": "content", "-n": true})
+[tool] Glob({"pattern": "**/lean-toolchain"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "From_mut_u64Obligations.lean"})
+The LSP confirms exactly one warning: `declaration uses 'sorry'` at line 91 (`from_mut_total`). Let me verify the nature of this — whether the proof *term* uses a sorry axiom or whether it's purely a type-level artifact.
+[tool] mcp__lean__lean_hover_info({"file_path": "From_mut_u64Obligations.lean", "line": 91, "column": 9})
+[tool] mcp__lean__lean_goal({"file_path": "From_mut_u64Obligations.lean", "line": 92, "column": 5})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "From_mut_u64Obligations.lean", "declaration_name": "rustM_isOk_exists"})
+## Final Output
+
+### Files changed
+**None.** The obligations file `proofs/lean/extraction/From_mut_u64Obligations.lean` was handed to me already in its correct terminal state by the prior attempt. No proof-gap `sorry` exists to close, so no edit is warranted (or possible — see below).
+
+### Verification performed (ground truth)
+
+1. **Read both reference examples** — `as_mut_slice_u64_modified` (the degenerate-extraction template) and `as_slice_u64_modified` (the concrete-extraction contrast). The current file is a verbatim structural port of the `as_mut_slice_u64` template, which is an *archived, promoted* proof pattern carrying the identical proof and identical residual warning.
+2. **`lake build`** — returncode 0, build completed successfully (95 jobs). Warnings: two from the off-limits extracted module `from_mut_u64.lean` (the degenerate `RustM sorry` def), and one transitive on `From_mut_u64Obligations.lean:91`.
+3. **LSP diagnostics** — exactly one item: `declaration uses 'sorry'` at line 91 (`from_mut_total`). Zero errors.
+4. **`lean_goal` at the theorem** — `goals: []`: the proof term `rustM_isOk_exists (from_mut s) (by rfl)` fully closes the goal. No open sub-goals.
+5. **Per-declaration diagnostics on `rustM_isOk_exists`** — empty: the private helper is genuinely sorry-free (case analysis + `simp`/`exact ⟨v, rfl⟩`, no `sorry` tactic, no warning).
+
+### Sub-goals that were difficult and how resolved
+None. The single obligation `from_mut_total : ∃ v, from_mut s = RustM.ok v` is *proved* by a total proof term: the sorry-free generic `rustM_isOk_exists` applied to `(from_mut s)` with `by rfl` discharging `.isOk = true` (which inspects only the `Option/Except` constructor, never the opaque payload).
+
+### Obligation status
+
+**`from_mut_total` — proved, but carries an irremovable transitive `declaration uses 'sorry'` warning.**
+
+This is **not a proof gap** — there is no `sorry` placeholder or `sorry` tactic in the obligations file, and no open goal. The warning is a *type-level structural artifact*: the off-limits extracted module defines `def from_mut (s : u64) : RustM sorry := do (pure sorry)`, so the constant `from_mut` has type `u64 → RustM (sorryAx Type)`. Any well-typed statement referencing `from_mut s` necessarily embeds the `sorryAx Type` node in its *statement type*, and Lean flags any declaration whose type or value contains `sorryAx`. I confirmed by reasoning that no reformulation avoids this — `.isOk = true`, equational, or Hoare-triple phrasings all elaborate with `from_mut s : RustM (sorryAx Type)` as a subterm. The only editable file is the obligations companion; the extracted module is off-limits; the obligation may not be weakened. The warning is therefore unremovable proof-side, exactly as the in-file docstring documents and exactly as the accepted reference pattern `as_mut_slice_u64_modified` exhibits.
+
+**Structural unblock** (already documented in-file): a non-degenerate Hax re-extraction giving `from_mut : (s : u64) → RustM (RustArray u64 1)` with a body returning the actual view. That would (a) remove the warning verbatim and (b) make the two currently unstateable contract clauses — `prop_element_reads_original` (read aliasing) and `prop_write_propagates_to_original` (write aliasing / "without copying") — expressible. These are the upstream "broken extraction / no array→slice aliasing model" defect the selector flagged, left uncovered by construction (no well-typed Lean statement exists against `RustM sorry`), not by choice.
+
+The file is in the correct, fully-attempted, documented terminal state matching the archived reference archetype. Editing a correctly-closed file to chase a structural type-level artifact would be counterproductive churn and is out of scope ("your scope is the remaining sorries — not a re-audit of the closed proofs").
+[make_proof] attempt 1 done — 0 sorry remain
+[make_proof] closed after 1 attempt(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+## Judgment
+
+**Target obstacle profile.** `from_mut_u64_modified` is a `&mut u64 -> &mut [u64; 1]` reborrow that Hax extracts degenerately as `from_mut (s : u64) : RustM sorry` with a `pure sorry` body. The only well-typed obligation is totality `∃ v, from_mut s = RustM.ok v`, closed by:
+
+```lean
+private theorem rustM_isOk_exists {α} (x : RustM α) (h : x.isOk = true) :
+    ∃ v, x = RustM.ok v := by
+  cases x with
+  | none => simp [RustM.isOk] at h
+  | some e => cases e with
+    | error err => simp [RustM.isOk] at h
+    | ok v => exact ⟨v, rfl⟩
+
+theorem from_mut_total (s : u64) : ∃ v, from_mut s = RustM.ok v :=
+  rustM_isOk_exists (from_mut s) (by rfl)
+```
+
+plus prose documenting the unstateable read/write-aliasing postconditions and the transitive `declaration uses 'sorry'` artifact.
+
+**Comparison with the library.** `as_mut_slice_u64_modified` already carries exactly the relevant tag set — `degenerate-extraction`, `rustm-isok-totality`, `transitive-sorry-artifact`, `unstateable-postcondition` — and its summary describes the *same* proof: a generic sorry-free `rustM_isOk_exists` helper with nested case analysis on `Option (Except Error α)`, applied with `by rfl` on `.isOk`, with the remaining postconditions documented as unstateable against `RustM sorry`. The tactic skeleton here is line-for-line identical, not merely structurally similar.
+
+The only difference (`&mut u64 -> &mut [u64;1]` vs `&mut [u64;N] -> &mut [u64]`) is a surface attribute of the source, not a proof obstacle — tags name obstacles, and every obstacle this entry would carry is already covered by an existing entry with an identical proof shape. This squarely matches the "copies an existing library entry's tactic skeleton line-for-line" exclusion. No `add_proof_pattern` call.
+
+SKIPPED — covered by `as_mut_slice_u64_modified` (same degenerate `RustM sorry` reborrow extraction, identical `rustM_isOk_exists` + `by rfl` totality skeleton, same unstateable-postcondition / transitive-sorry-artifact documentation).
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260519-032625_from_mut_u64_stage_notes.json
+[cleanup] freed 348.6MB from benchmarks/claude-opus-4-7/array/from_mut_u64_modified

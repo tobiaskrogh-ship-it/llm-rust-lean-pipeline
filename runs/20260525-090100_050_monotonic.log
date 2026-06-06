@@ -1,0 +1,380 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260525-090100_050_monotonic.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/050_monotonic/attempted_changes/20260525-090100
+Stages: all 8 (1-8), in order
+[setup] Crate not yet set up — running setup_crate.bash on /home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/050_monotonic
+[setup] Done.
+
+I'll analyze the contract of `monotonic` and slim down the test suite per the rules, then verify with `cargo test`.
+
+**Contract analysis:**
+- **Precondition**: none — total function on any `&[i64]`
+- **Postcondition**: returns `true` iff the list is non-decreasing OR non-increasing
+- **Edge case**: lists of length ≤ 1 are vacuously monotonic
+- **Subtle semantic point**: comparison is `>`/`<`, not `≥`/`≤` — so plateaus (equal adjacent elements) are allowed. This is an *independent* claim from the oracle property (a buggy `≥`/`≤` impl would still match the oracle on strictly-varying lists).
+
+**Tests to remove** (derived from the oracle test):
+- `strictly_ascending_is_monotonic` — follows from `matches_brute_force` + monotonicity of integer addition
+- `strictly_descending_is_monotonic` — same
+
+Let me first read the current state of the file to make sure I patch accurately:
+[tool] Read({"file_path": "src/lib.rs"})
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "patch": "<<< SEARCH\n    proptest! {\n        /// Postcondition (agrees with brute-force oracle on bounded random lists).\n        #[tes... [+2060 chars])
+[tool] run_cargo_test({})
+All 3 tests pass.
+
+## Summary
+
+### Tests in the final suite
+
+| Test | Contract clause |
+|---|---|
+| `small_lists_are_monotonic` | **Vacuous postcondition** — lists of length 0 and 1 return `true`. Pins down the boundary as an explicit ground assertion, independent of the oracle. |
+| `matches_brute_force` (proptest) | **Main postcondition** — for any list, `monotonic(l)` equals the brute-force "all pairs non-decreasing OR all pairs non-increasing". This is the central property. |
+| `constant_list_is_monotonic` (proptest) | **Independent semantic claim** — non-strict monotonicity: plateaus are allowed. A buggy implementation using `≥`/`≤` instead of `>`/`<` would still satisfy `matches_brute_force` on random lists (which are almost never constant), so this catches a real contract bug. |
+
+No failure conditions to test — `monotonic` is total and infallible (no panic / `Option` / `Result`).
+
+### Properties considered but excluded
+
+- **`strictly_ascending_is_monotonic` / `strictly_descending_is_monotonic`** (in the original suite): derived from `matches_brute_force` plus the trivial fact that `seed + k` (resp. `seed - k`) is non-decreasing (resp. non-increasing) in `k`. Removed.
+- **Reversal invariance** `monotonic(l) == monotonic(reverse(l))`: derived from the symmetry of the oracle definition. Not added.
+- **Suffix / subsequence properties** (`monotonic(l) ⇒ monotonic(&l[1..])`): derived from the recursive structure of the oracle. Not added.
+- **Negative anchor** (e.g. `monotonic(&[1,3,2]) == false`): `matches_brute_force` already catches an "always true" implementation reliably, because random length-≥2 lists in `-100..=100` are non-monotonic the vast majority of the time. Not added — would be redundant.
+- **Algebraic identities** (e.g. about shifts, scaling): derived facts about the result, not part of the contract.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] run_cargo_test({})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/050_monotonic_modified/src/lib.rs"})
+[tool] run_cargo_hax_into_lean({})
+[tool] run_lake_build({})
+All three stages pass. Let me verify the extracted Lean is well-formed (no sorry, no degenerate body) and that no short-circuit issues are hiding.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/clever_3/050_monotonic_modified/proofs/lean/extraction/clever_050_monotonic.lean"})
+All three stages pass cleanly. Let me do a final audit for Hax-degenerate patterns:
+
+**Source structure review:**
+- The two helpers `is_nondecreasing_from` / `is_nonincreasing_from` are tail-recursive with a single decreasing measure (`n - i`), extracted as `partial_fixpoint` — the preferred proof-friendly shape per the recursion-preference rule.
+- `monotonic` uses `if/else` (NOT `||`), so there is no short-circuit-over-partial-op issue (the doc-comment mentions `||`, but the actual code form is `if`/`else` — which is the safe shape).
+- Slice indices `l[i as usize]` and `l[(i+1) as usize]` are only evaluated in the branch where `i + 1 < n` was just established, so the partial indexing operations stay under their guard.
+- The `i + 1` arithmetic in the condition is the only thing that could theoretically `RustM.fail` (`u64` overflow at `i = u64::MAX`); but recursion only continues from `i = 0` and only when `i + 1 < n ≤ usize::MAX`, so it's structurally bounded — the proof stage can discharge this via `Nat.strongRecOn` on `n - i`.
+
+**Extracted Lean review:**
+- No `sorry` in any body.
+- No `RustM.fail` short-circuits hidden by `&&?` / `||?`.
+- Both helpers compile as `partial_fixpoint`; `monotonic` is a plain if/else.
+- No unknown identifiers, no `Unsupported equality constraints`, no degenerate placeholders.
+
+**Pipeline status:** `cargo test` ✓ (3/3) → `cargo hax into lean` ✓ → `lake build` ✓.
+
+## Final report
+
+| Item | Status |
+|---|---|
+| Hax / `lake build` errors that drove changes | **None** — source was already Hax-compatible on first run. |
+| Library calls inlined | **None** — source uses only `&[i64]`, primitive arithmetic, slice indexing, and `Vec` in tests. No `.abs()`, `.pow()`, `.checked_*`, iterator chains, `f64`, etc. |
+| Patterns considered but not changed | **`while`-loop / `for`-loop → recursion** — already recursive. **Short-circuit `&&` / `||` over partial op** — code uses `if`/`else` form (matches the canonical safe rewrite in `short_circuit_and_with_partial_op.rs`); doc-comment mentions `||` but the code never uses it. **`int_abs_to_conditional`** — no `.abs()` in source. **`u64_trailing_zeros_method`** — no bit-count methods. **`loop_invariant_partial_op`** — no annotations present (correct default). |
+| Changes suspected of altering semantics | **None** — no edits made. |
+| Hax-degenerate patterns the proof stage must work around | **None** — extracted Lean has no `sorry`, no `RustM.fail` traps, no missing identifiers, and the `partial_fixpoint` extraction matches the canonical `proof_patterns/recursion_example` shape. The only proof obligation that needs care is the `i + 1` overflow check in each helper's recursive call; this is safely bounded by `i < n ≤ usize::MAX < u64::MAX`. |
+
+The crate is ready for the proof stage as-is.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/050_monotonic/attempted_changes/20260525-090100/*stage2_rust_hax_lean*"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/clever_3/050_monotonic/attempted_changes/20260525-090100/*"})
+The attempt log contains only one entry: `0001_stage1_make_pbt_patched/`. The harvest skill is scoped strictly to `*_stage2_rust_hax_lean_*/` directories — there are none in this run.
+
+## Final report
+
+**Patterns written:** none.
+
+**Attempts inspected but skipped:**
+- `0001_stage1_make_pbt_patched/` — not a `stage2_rust_hax_lean` attempt (stage1 PBT generation); out of scope per the skill rules.
+
+**Flagged for human attention:** none. The log simply contains no rewrite-stage attempts — likely the Hax/lean stage either passed on the first try or never ran during this pipeline invocation.
+
+harvest_rewrite_patterns
+The original and Hax-rewritten sources are byte-identical. There are no inlinings, no structural rewrites, no annotation changes — nothing at all has changed between the two versions. Behavior is trivially preserved.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+Looking at the target, the structural fingerprint is:
+
+- Two `partial_fixpoint` tail-recursive helpers (`is_nondecreasing_from`, `is_nonincreasing_from`) returning `Bool`
+- Each scans an `i64` slice comparing adjacent elements `l[i]` vs `l[i+1]`
+- Top-level `monotonic` composes them via `||` short-circuit (if-then-else)
+- No arithmetic on values — pure ordering comparisons (no value-level overflow)
+- Indexing uses `u64 → usize` casts plus `i +? 1` (partial u64 add)
+- Contract is "matches brute-force oracle" → iff/equivalence with a universal-over-adjacent-pairs property, plus a constant-list special-case clause and empty/singleton vacuous truth
+
+The dominant proof obstacles: **bool-returning tail-recursive slice scan, iff-decomposition vs an adjacent-pair / pairwise-index oracle, strong induction on `size − i.toNat`, signed `i64` slice indexing, `usize+1` no-overflow, partial_fixpoint unfold**.
+
+---
+
+**Selected:**
+
+```
+proof_patterns/contains_u64_modified
+proof_patterns/below_zero_modified
+proof_patterns/clever_039_triples_sum_to_zero_modified
+proof_patterns/clever_009_rolling_max_modified
+proof_patterns/is_prime_modified
+```
+
+**Rationale per pick:**
+
+1. **`contains_u64_modified`** — closest direct shape: tail-recursive bool slice scan with `iff-decomposed` soundness/completeness, three step lemmas (oob / found / recurse), strong induction on `arr.val.size − i.toNat`, `usize-add-no-overflow` via `BitVec.uaddOverflow`. Each of `is_nondecreasing_from` / `is_nonincreasing_from` will follow this exact skeleton (oob arm at `i+1 ≥ n`, "violation found" arm at `l[i] > l[i+1]`, recurse arm).
+
+2. **`below_zero_modified`** — same iff-decomposed bool scan but over an **i64** slice with `signed-int-toInt-bridge`, `slice-indexing` on i64, `partial_fixpoint`, and the same three-step (oob/found/recurse) discharge pattern. Direct template for the i64-specific indexing bridges the target needs that contains_u64 omits.
+
+3. **`clever_039_triples_sum_to_zero_modified`** — `iff-decomposition` paired with **multi-index ascending-witness quantification** (`∃ i < j < k` style). The target's oracle (`naive_monotonic`) is universally quantified over adjacent pairs `(i, i+1)`, and the forward/backward ladder pattern (counter ≥ k ↔ ∃ k witnesses) is the analog the proof will need to bridge "∀ j ≥ i, ¬(l[j] > l[j+1])" to the recursive scan's return value.
+
+4. **`clever_009_rolling_max_modified`** — i64 slice tail-recursive scan with the `first-iteration-special-case` / vacuous-truth handling at the empty/singleton boundary (target's `i+1 ≥ n` arm answers `true` for length ≤ 1), plus usize-cast-from-u64 indexing exactly mirroring the target's `(rust_primitives.hax.cast_op i : RustM usize)` shape. No Vec construction needed in the target, but the slice-traversal scaffolding lemmas transfer.
+
+5. **`is_prime_modified`** — `iff-decomposition` between a recursive scan and a universally-quantified property (`¬∃ divisor`), with **sound+complete dual-direction** projection from a bundled aux. Architecturally parallel to the target's `monotonic l = true ↔ (∀ adj pair, ≤) ∨ (∀ adj pair, ≥)`, where the disjunction at the top wrapper mirrors the dual-arm contract projection.
+
+---
+
+**Gaps in the library for this target:**
+
+- **Disjunctive composition of two structurally-identical bool scanners at the wrapper level** (`A ∨ B` with both A and B being recursive scan results, each iff-equivalent to a universal pairwise predicate, distinct from "either succeeded" composition seen in helpers). No example currently treats a `if rec_helper_1 then true else rec_helper_2` pattern where the top-level contract is a disjunction of two universal-over-adjacent-pair claims.
+- **Universal-over-adjacent-pairs predicate as the spec oracle** (closer to a `List.Pairwise (· ≤ ·)`-style claim). Existing iff-decompositions are mostly existential (contains, below_zero, triples_sum) or about counts; the target's natural spec is the pure universal "no inversion among adjacent pairs."
+- **Constant-list special-case independent clause** projected from the same master spec (the proptest pins `monotonic [c; n] = true` as an independent claim). No clean library precedent for an "independent algebraic clause carved off the main iff."
+
+---
+
+**Rejections:**
+
+- `clever_020_find_closest_elements_modified` — pair-index scanning but with a *carried best-pair extremum* and quadratic 2D measure; target is single-pointer linear scan, no extremum tracking.
+- `clever_004_mean_absolute_deviation_modified`, `rescale_to_unit_modified` — two-pass mean/min then transform; target is two **independent** scans composed by `||`, not value-feeding two-pass.
+- `clever_025/032/033/036_*` — all build Vec output via `extend_from_slice`; target returns a bool.
+- `factorize_modified`, `largest_divisor_modified`, `gcd_*`, `sqrt_u64_modified`, `cbrt_u64_modified`, `binomial_u64_modified`, `multinomial_u64_modified` — numeric recursion, no slice scan.
+- `sum_product_modified`, `clever_047_sum_to_n_modified`, `factorial_modified`, `sum_to_n_modified`, `add_one_modified`, `square_modified`, `saturating_sub_modified`, `abs_diff_i64_modified`, `clever_044_triangle_area_modified` — arithmetic with overflow as the main obstacle; target has no value arithmetic.
+- `gcd_while_modified`, `while_example`, `max_odd_part_modified`, `trailing_zeros_u64_modified`, `map_rfold_u64_modified`, `clever_032_sort_third_modified`'s while-loop machinery — while-loop based; target uses `partial_fixpoint` recursion.
+- `is_size_align_valid_usize_modified`, `padding_needed_for_usize_modified`, `repeat_*`, `utf8_*`, `truncate_number_modified`, `average_*`, `slice_get_u64_modified`, `clamp_modified`, `min_modified`, `is_zero_modified`, `map_next_u64_modified`, `map_try_rfold_u64_modified` — bit-manipulation / layout / single-step / iterator-adapter; no shared obstacles.
+- `clever_045_fib4_modified`, `clever_038_prime_fib_modified`, `clever_035_fizz_buzz_modified` — finite-range native_decide pinning; target's slice is arbitrary length.
+- `clever_000_has_close_elements_modified` — all-pairs counting scan, target is single-pointer adjacent-pair scan.
+- `recursion_example`, `gcd_recursive_modified`, `gcd_stein_u64_modified`, `gcd_lcm_u64_modified` — recursion over numeric arguments, no slice.
+- `intersperse_modified` — Vec output with interleaved structure; target is bool result.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Clever_050_monotonicObligations.lean
+[scaffold] registered Clever_050_monotonicObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Contains_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Clever_003_below_zeroObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_039_triples_sum_to_zero_modified/proofs/lean/extraction/Clever_039_triples_sum_to_zeroObligati... [+10 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_009_rolling_max_modified/proofs/lean/extraction/Clever_009_rolling_maxObligations.lean", "limi... [+8 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_prime_modified/proofs/lean/extraction/Clever_030_is_primeObligations.lean", "limit": 100})
+[tool] Grep({"pattern": "^theorem|^/-- ## |^private theorem.*aux|^@\\[spec\\]", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_prime_modified/proofs/lean/extractio... [+77 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_prime_modified/proofs/lean/extraction/Clever_030_is_primeObligations.lean", "offset": 395, "limit"... [+6 chars])
+Now let me check what `i64` looks like in the prelude — specifically whether it has a `≤` instance for the spec predicates.
+[tool] Grep({"pattern": "abbrev i64|def i64|Int64\\.le|LE.*Int64|instance.*LE.*i64", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/below_zero_modified", "output_mode... [+42 chars])
+[tool] Grep({"pattern": "abbrev i64|Int64\\.lt_iff|Int64\\.le_iff", "path": "/home/tobias/uni/pipeline_v6", "output_mode": "files_with_matches", "head_limit": 10})
+[tool] Grep({"pattern": "abbrev i64|i64 :=|i64 =", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "-n": true, "head_... [+11 chars])
+[tool] Grep({"pattern": "Int64\\.le_iff|instance.*LE.*Int64|deriving.*LE", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "cont... [+23 chars])
+[tool] Grep({"pattern": "Int64", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "-n": true, "head_limit": 30})
+Now I have a clear picture. Let me check the actual extraction directory and write the obligations file.
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\nnamespace Clever_050_monotonicObligations\n\n-- Add `theorem` decl... [+3288 chars])
+Now let me check the diagnostics to make sure the file is well-typed:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean"})
+All theorems type-check, only `sorry` warnings remain. Let me confirm with `lake build`:
+[tool] run_lake_build({})
+Build passes with only the expected `sorry` warnings.
+
+## Final output
+
+### File edited
+`proofs/lean/extraction/Clever_050_monotonicObligations.lean`
+
+### Theorems added (one per independent contract clause)
+
+| # | Theorem | Contract clause |
+|---|---|---|
+| 1 | `monotonic_small_lists` | `small_lists_are_monotonic` — slices with `size ≤ 1` (empty/singleton) return `ok true` |
+| 2 | `monotonic_returns_true` | `matches_brute_force` (positive direction) — if every adjacent pair is `≤` *or* every adjacent pair is `≥`, returns `ok true` |
+| 3 | `monotonic_returns_false` | `matches_brute_force` (negative direction) — if neither orientation holds globally, returns `ok false` |
+| 4 | `monotonic_constant` | `constant_list_is_monotonic` — constant slices return `ok true` (pins non-strict semantics) |
+
+Supporting private definitions:
+- `is_nondec l` — universal claim that adjacent pairs are `≤`
+- `is_noninc l` — universal claim that adjacent pairs are `≥`
+
+### Property tests classified as derived facts (skipped)
+None. All three property tests in the Rust source (`small_lists_are_monotonic`, `matches_brute_force`, `constant_list_is_monotonic`) are reflected as contract theorems. The constant-list test is *derivable* from `monotonic_returns_true`, but the Rust source explicitly flags it as "an independent contract clause" that pins non-strict comparison semantics, so I included it.
+
+### Feasibility check
+The Rust implementation is total in the Lean model:
+- The slice `RustSlice i64` carries `size_lt_usizeSize : l.val.size < 2^64`, so `i + 1` in the helper never overflows (the recursion terminates at `i = n − 1` before `i + 1` could wrap, and `n ≤ size < 2^64`).
+- No arithmetic on values — pure ordering comparisons on `i64`, no overflow risk.
+- Both helpers are total `RustM Bool`-valued, so the top-level `monotonic` is total.
+
+Consequently, all four theorems are stated **universally** (no preconditions on slice size beyond what the type already guarantees), as the strongest honest contract. No clauses needed restriction.
+
+### Uncertainty
+- **Statement of `is_nondec`/`is_noninc`**: I used `i64`'s native `≤` rather than `.toInt`-bridged `Int` comparison. Either should work since `Int64` has a `LE` instance, and the proof stage can bridge via `Int64.le_iff_toInt_le` (the pattern used in `below_zero`). If the proof stage prefers `.toInt`, the spec can be rewritten there equivalently. Flagging for awareness, not as a defect — `lake build` confirms it type-checks.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 4 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/contains_u64_modified/proofs/lean/extraction/Contains_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/below_zero_modified/proofs/lean/extraction/Clever_003_below_zeroObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clever_009_rolling_max_modified/proofs/lean/extraction/Clever_009_rolling_maxObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_prime_modified/proofs/lean/extraction/Clever_030_is_primeObligations.lean"})
+[tool] Glob({"pattern": "**/proof-libs/lean/**/*.lean", "path": "/home/tobias/uni/pipeline_v6"})
+[tool] Glob({"pattern": "proofs/lean/extraction/**/*.lean"})
+[tool] Grep({"pattern": "rust_primitives.hax.cast_op", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "cast_op", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "files_with_matches"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/Cast.lean"})
+[tool] Grep({"pattern": "UInt64.toUSize64|UInt64.toUSize|USize64.toUInt64", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "fil... [+17 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/USize64.lean"})
+[tool] Grep({"pattern": "core_models.slice.Impl.len|slice_length", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "files_with_m... [+8 chars])
+[tool] Grep({"pattern": "core_models.slice.Impl.len|slice_length", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/core_models/core_models.le... [+51 chars])
+[tool] Grep({"pattern": "def slice_length|slice_length :=", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/slice.lean", "out... [+42 chars])
+[tool] Grep({"pattern": "slice_length", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/slice.lean", "output_mode": "content"... [+22 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/arithmetic.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/slice.lean"})
+[tool] Grep({"pattern": "_\\?|GetElemResult|getElem\\?", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/GetElemResult.lean",... [+38 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/GetElemResult.lean"})
+[tool] Grep({"pattern": "UInt64.toUSize64|UInt64.toNat_toUSize64|UInt64.uaddOverflow_iff|UInt64.addOverflow", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/pro... [+70 chars])
+[tool] Grep({"pattern": "UInt64.uaddOverflow|UInt64.addOverflow", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mode": "content", "-n... [+26 chars])
+[tool] Grep({"pattern": "UInt64\\.(addOverflow|uaddOverflow|toNat_add_of|lt_iff_toNat|le_iff_toNat|toNat_lt)", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/pr... [+71 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/UInt/Lemmas.lean"})
+[tool] Grep({"pattern": "UInt64\\.addOverflow_iff|UInt64\\.toNat_add_of_lt|UInt64\\.le_iff_toNat_le|UInt64\\.lt_iff_toNat_lt|declare_uint_theorems|additional_uint_decls", "... [+131 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/MissingLean/Init/Data/UInt/Basic.lean"})
+[tool] Grep({"pattern": "partial_fixpoint", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "files_with_matches"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/README.md"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean"})
+[tool] Glob({"pattern": "proof_patterns/gcd_recursive_modified/proofs/lean/extraction/*Obligations.lean", "path": "/home/tobias/uni/pipeline_v6"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/*recursion*/proofs/lean/extraction/*Obligations.lean"})
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/recursion_example/proofs/lean/extraction/Recursion_exampleObligations.lean"})
+[tool] mcp__lean__lean_run_code({"code": "import Hax\nimport Std.Tactic.Do\nimport Std.Do.Triple\nimport Std.Tactic.Do.Syntax\n\nopen Std.Do\nopen Std.Tactic\n\nset_option mvcgen.warning false... [+709 chars])
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "content": "-- Companion obligations file for the `clever_050_monotonic` extraction.\n--... [+3636 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\n/-! ## Boundary clause: lists of length 0 or 1 are vacuously monot... [+10936 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "content": "-- Companion obligations file for the `clever_050_monotonic` extraction.\n--... [+15069 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/RustM.lean"})
+[tool] mcp__lean__lean_completions({"file_path": "Clever_050_monotonicObligations.lean", "line": 266, "column": 24})
+[tool] mcp__lean__lean_leansearch({"query": "not (a \u2264 b) iff b < a"})
+[tool] Grep({"pattern": "not_le|Int64\\.not_le|Int64\\.le_iff|Int64\\.lt_iff_toInt", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "output_mo... [+45 chars])
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "content": "-- Companion obligations file for the `clever_050_monotonic` extraction.\n--... [+13946 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "content": "-- Companion obligations file for the `clever_050_monotonic` extraction.\n--... [+17121 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\nprivate theorem is_nondecreasing_from_oob (l : RustSlice i64) (i :... [+2899 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error", "start_line": 80, "end_line": 110})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\n  simp only [core_models.slice.Impl.len, rust_primitives.slice.sli... [+747 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] Read({"file_path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "offset": 100, "limit": 200})
+[tool] write_working_file({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "content": "-- Companion obligations file for the `clever_050_monotonic` extraction.\n--... [+16597 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+Now let me add the strong-induction lemmas and the top-level proofs.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\n/-! ## Top-level contract clauses. -/\n\ntheorem monotonic_small_l... [+9782 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "Int64\\.(le_iff_toInt_le|lt_iff_toInt_lt|not_le|not_lt|le_or_lt)", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean", "ou... [+52 chars])
+[tool] Grep({"pattern": "le_iff_toInt_le|lt_iff_toInt_lt", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "-n": true, "head_limit": 15})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\n/-- Backward (false) direction for `is_nondecreasing_from`: if the... [+7390 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "Int64.*LinearOrder|instance.*LinearOrder.*Int64|Int64.*Antisymm|Int64\\.lt_irrefl", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proo... [+50 chars])
+[tool] Grep({"pattern": "Int64\\.le_iff_toInt_le|Int64\\.toInt_inj|Int64\\.toInt_lt|Int64\\.toInt_le|theorem Int64\\.", "path": "proofs/lean/extraction/.lake/packages/Hax/h... [+80 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\n    \u00b7 have h_now_le : l.val[i.toNat]'(Nat.lt_of_succ_lt hi1) ... [+864 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\nprivate theorem is_nonincreasing_from_ok_true_aux (l : RustSlice i... [+5709 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] Grep({"pattern": "by_contra|byContradiction|Classical\\.byContradiction|Classical\\.not_forall", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode"... [+42 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\n/-! ## Top-level contract clauses. -/\n\ntheorem monotonic_small_l... [+7496 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\n  apply monotonic_returns_true l\n  left\n  intro j hj1\n  rw [hco... [+333 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\n  exact Int64.le_iff_toInt_le.mpr (le_refl _)\n===\n  exact Int64.... [+128 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean", "severity": "error"})
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Clever_050_monotonicObligations.lean"})
+[tool] run_lake_build({})
+Build passes! Let me clean up the two unused simp arguments to avoid the warnings.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Clever_050_monotonicObligations.lean", "patch": "<<< SEARCH\n  simp only [core_models.slice.Impl.len, rust_primitives.slice.sli... [+1349 chars])
+[tool] run_lake_build({})
+Build succeeds with no warnings, no `sorry`, and no errors. All four obligation theorems are closed.
+
+## Final output
+
+### Files changed
+- `proofs/lean/extraction/Clever_050_monotonicObligations.lean` — replaced all four `sorry`s with complete proofs.
+
+### Theorems closed
+| Theorem | Approach |
+|---|---|
+| `monotonic_small_lists` | `l.val.size ≤ 1` makes `is_nondec l` vacuously true; apply the true-direction strong-induction lemma. |
+| `monotonic_returns_true` | Case-split on `is_nondec l ∨ is_noninc l`. The `is_noninc` branch additionally case-splits on the result of `is_nondecreasing_from l 0` via a totality lemma. |
+| `monotonic_returns_false` | Classically extract witnesses from `¬ is_nondec l` and `¬ is_noninc l`, then apply the false-direction strong-induction lemmas. |
+| `monotonic_constant` | Constant lists satisfy `is_nondec`, reduce to `monotonic_returns_true`. |
+
+### Sub-goals that were difficult and how resolved
+
+1. **`(i +? 1 : RustM u64) = pure (i + 1)` reduction.** The simp set with `rust_primitives.ops.arith.Add.add` and `h_no_bv : BitVec.uaddOverflow … = false` left `if false = true then fail else pure (i+1)` un-reduced (the boolean if-condition didn't simplify). Resolved by proving a one-shot `add_one_pure_u64 : (i +? 1) = pure (i + 1)` lemma and using it as a rewrite, bypassing the boolean-if reduction entirely.
+
+2. **`≥` vs `≤` rewrite asymmetry.** The OOB-condition is stated as `(i + 1) ≥ n_val`, and `UInt64.le_iff_toNat_le` only matches `LE.le`. Resolved by `change ((USize64.ofNat l.val.size).toUInt64) ≤ (i + 1)` to flip the direction definitionally.
+
+3. **Negation of universal claim** (used in `monotonic_returns_false`). With `by_contra` unavailable and no `push_neg` outside Mathlib, I extracted the witness via `Classical.not_not.mp` together with `Int.lt_or_le` and the `Int64.{lt,le}_iff_toInt_{lt,le}` bridges.
+
+4. **Witness-at-current-index case in false-direction induction.** When the existential witness `j` from the hypothesis lands at `j = i.toNat`, the goal `l.val[j] > l.val[j+1]` after `subst heq` becomes `l.val[i.toNat] > l.val[i.toNat + 1]` (the proof of bounds aligns by proof-irrelevance). Resolved by `subst heq; rfl` to align the index expressions, then transferring the hypothesis.
+
+5. **Totality of `≤` on `Int64`.** No `not_lt`/`le_or_lt` available without Mathlib. Resolved by going through `Int.lt_or_le` on `.toInt` values, then bridging back with `Int64.{lt,le}_iff_toInt_{lt,le}`.
+
+### `sorry`s remaining
+None — `lake build` is clean.
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+Looking at this proof's structure, I need to identify what makes it distinct.
+
+**Key observations about this proof:**
+
+1. **Twin parallel mirror-image scans** — `is_nondecreasing_from` (`>` check) and `is_nonincreasing_from` (`<` check) are structurally identical helpers; every lemma is duplicated (oob/violation/recurse + ok_true_aux/ok_false_aux/total_aux × 2)
+
+2. **Disjunctive OR-composition at the wrapper** — `monotonic = if is_nondec then true else is_noninc`. This is distinct from sequential helper composition (e.g. `rescale_to_unit_modified`, `clever_004`) where the second helper *consumes* the first's value. Here the second runs only if the first returns false, requiring a `total_aux` to case-split the first helper's result inside `monotonic_returns_true`.
+
+3. **Adjacent-pair universal spec** — `is_nondec : ∀ j (hj1 : j+1 < size), l[j] ≤ l[j+1]`. Distinct from indexed-existential witness shapes in `contains_u64_modified` (single condition, iff-decomposed) and from counter-witness shapes in `clever_039_triples_sum_to_zero_modified`.
+
+4. **Classical extraction of pair witness from negated universal** — `not_is_nondec_to_exists` uses `Classical.not_not.mp` to convert `¬(∀ j, l[j] ≤ l[j+1])` into `∃ j, l[j] > l[j+1]` for use in `monotonic_returns_false`.
+
+5. **Three-aux pattern per helper** — `ok_true_aux` (forward), `ok_false_aux` (backward with witness-shrinks-via-`j ≠ i.toNat`), and `total_aux` (forward dichotomy for the case-split shape).
+
+**Comparison to library:**
+- `contains_u64_modified` — single condition, single helper, iff-decomposed. Does not cover twin-helper OR-composition.
+- `clever_039_triples_sum_to_zero_modified` — uses ladders over a counter for witness extraction, not classical negation.
+- `clever_004_mean_absolute_deviation_modified` / `rescale_to_unit_modified` — sequential helpers, value-consuming, not orthogonal OR-composition.
+- `factorize_modified` — uses pairwise-non-decreasing as output spec but is single-helper trial division.
+
+The disjunctive OR-composition with twin mirror-image scans, classical negation extraction, and the three-aux dichotomy pattern are not currently covered. Worth adding.
+[tool] add_proof_pattern({"name": "050_monotonic_modified", "features": ["recursion", "strong-induction", "recursive-equation-unfold", "slice-indexing", "signed-int-toInt-bridge", "usiz... [+4451 chars])
+The name must start with a letter. Let me adjust:
+[tool] add_proof_pattern({"name": "clever_050_monotonic_modified", "features": ["recursion", "strong-induction", "recursive-equation-unfold", "slice-indexing", "signed-int-toInt-bridge"... [+4458 chars])
+ADDED `clever_050_monotonic_modified` — covering twin-parallel-mirror-scans + disjunctive-or-helper-composition + classical-negation-to-exists-witness + three-aux-per-helper-dichotomy (ok_true / ok_false / total) on the canonical adjacent-pair universal spec shape; no existing library entry combines OR-composition of two structurally-mirror tail-recursive scans with classical negation extraction of an adjacent-pair witness.
+
+**Features**: recursion, strong-induction, recursive-equation-unfold, slice-indexing, signed-int-toInt-bridge, usize-add-no-overflow, bv-nat-bridge, existential-postcondition, multi-clause-contract, shared-aux-lemma, bundled-postcondition-projection, short-input-boundary-theorem, adjacent-pair-universal-spec, twin-parallel-mirror-scans, disjunctive-or-helper-composition, classical-negation-to-exists-witness, totality-aux-for-case-split, three-aux-per-helper-dichotomy, pairwise-non-decreasing-output, sound-complete-via-totality, witness-shrinks-via-not-here.
+
+**Summary**: Monotonic-list contract on an i64 slice via two parallel mirror-image tail-recursive adjacent-pair scans joined by a top-level OR-shaped wrapper, with each helper proved by a three-aux dichotomy (ok_true / ok_false / total) on `l.val.size - i.toNat`, classical negation extracting adjacent-pair witnesses for the soundness clause, and totality lemma enabling case-split of the first helper's result inside the disjunctive returns-true theorem.
+
+**Note for human reader**: The proof contains substantial duplication between the `is_nondecreasing` and `is_nonincreasing` branches that could potentially be abstracted over a polymorphic comparator (or via a single helper parametrised by a `cmp : i64 → i64 → Bool` argument), but the current shape is faithful to the Rust source's twin-helper structure and yields a uniform ~30-line proof per lemma. The `witness-shrinks-via-not-here` pattern in `ok_false_aux` (proving `j ≠ i.toNat` by contradicting `h_now` after `subst heq`) is reusable for any "every position before the recursion target satisfies P → recurse with new witness ≥ i+1" backward-direction argument.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260525-090100_050_monotonic_stage_notes.json
+[cleanup] freed 524.6MB from benchmarks/claude-opus-4-7/clever_3/050_monotonic_modified

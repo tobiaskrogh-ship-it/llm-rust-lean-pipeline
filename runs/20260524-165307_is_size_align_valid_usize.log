@@ -1,0 +1,422 @@
+Log: /home/tobias/uni/pipeline_v6/runs/20260524-165307_is_size_align_valid_usize.log
+Model: claude-opus-4-7
+Attempt logs: /home/tobias/uni/pipeline_v6/benchmarks/code/alloc/is_size_align_valid_usize/attempted_changes/20260524-165307
+Stages: all 8 (1-8), in order
+[tool] Read({"file_path": "src/lib.rs"})
+The file already contains a property-based test suite. Let me verify it still passes.
+[tool] run_cargo_test({})
+All 5 tests pass. The crate already has a focused property-based test suite that pins the contract of `is_size_align_valid`. Here is the summary of what the existing tests cover.
+
+## Contract clauses captured
+
+The function's contract has two independent clauses, both reflected in the test suite:
+
+1. **Alignment precondition** — `align` must be a power of two (`Alignment::new(align)` is `Some`). Otherwise the function returns `false` regardless of `size`.
+2. **Size postcondition** — given a power-of-two `align`, the function returns `true` iff `size` rounded up to the next multiple of `align` is `≤ isize::MAX`.
+
+### Tests
+
+- **`non_power_of_two_align_always_rejected`** — pins clause 1 *independently* of the size bound. Iterates a representative set of non-power-of-two aligns (including 0, small odds, mixed-bit values, and values above `isize::MAX`) crossed with a representative range of sizes including the extremes. A buggy implementation that accepted any non-power-of-two `align` for some `size` would be caught.
+
+- **`power_of_two_align_matches_round_up_contract`** — pins clause 2 against an overflow-safe `u128` oracle for "rounded-up size ≤ `isize::MAX`". Sweeps a 9-element neighbourhood around each per-`align` boundary for every power-of-two `align` (all 64 shifts on a 64-bit target), plus the size extremes `0`, `1`, `usize::MAX`. Catches off-by-one errors (`<` vs `<=`, wrong constant, wrong subtraction direction).
+
+- **`layout_round_up_to_align_edge_cases`**, **`layout_accepts_all_valid_alignments`**, **`rejects_non_power_of_two`** — pre-existing example-based tests adapted from upstream; serve as sanity checks and concrete documentation of behaviour at well-known points.
+
+### Properties considered but deliberately omitted
+
+- **Monotonicity in `size`** (if `is_size_align_valid(s, a)` then `is_size_align_valid(s', a)` for `s' ≤ s`). This is a *derived consequence* of the postcondition (the "rounded up ≤ `isize::MAX`" predicate is monotone in `size`) — it would not catch a bug that the round-up oracle does not already catch.
+- **Anti-monotonicity in `align` among powers of two** (a larger power-of-two `align` accepts fewer sizes). Same reason: derived from the subtraction `(isize::MAX + 1) − align` and the round-up oracle.
+- **`align == 1` accepts every size ≤ `isize::MAX`** / **`size == 0` accepts every power-of-two `align`**. Already covered as specific points inside `power_of_two_align_matches_round_up_contract` (the `size = 0` extreme, and `shift = 0`).
+- **Idempotence / commutativity / symmetry properties.** None apply — the two arguments play distinct roles.
+
+Each retained test would fail under a plausible buggy implementation (wrong inequality, wrong constant, swapped clauses, off-by-one), and no retained test is provable as a corollary of another.
+[verify make_pbt] running: cargo test
+[verify make_pbt] all checks passed
+
+make_pbt
+[tool] Read({"file_path": "src/lib.rs"})
+Let me check the Cargo.toml and explore patterns that handle `usize`:
+[tool] Read({"file_path": "Cargo.toml"})
+[tool] Grep({"pattern": "isize::MAX", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "usize::BITS|usize::MAX|9_223_372", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "content", "-n": true})
+Now I have a clear picture. Two known patterns apply to the library code:
+
+1. **`align.is_power_of_two()`** → matches `int_is_power_of_two_method.rs` — inline with `if`/`else` (not `&&`, per `short_circuit_and_with_partial_op.rs`).
+2. **`isize::MAX as usize`** → matches `primitive_int_assoc_const.rs` — inline the literal. `isize::MAX = 2^63 - 1` on 64-bit, so `isize::MAX as usize + 1 = 9_223_372_036_854_775_808`.
+
+Test code is under `#[cfg(test)]` and is excluded from Hax. Let me apply both rewrites:
+[tool] apply_file_patch_tool({"path": "src/lib.rs", "error_message": "Pre-emptive rewrite for two known Hax-incompatibility patterns flagged in the archive: (1) `usize::is_power_of_two` ext... [+2518 chars])
+Now run tests first (non-negotiable per the rules):
+[tool] run_cargo_test({})
+All 5 tests pass. Now run Hax extraction:
+[tool] run_cargo_hax_into_lean({})
+Extraction succeeded. Now run lake build:
+[tool] run_lake_build({})
+All three stages pass. Let me check the extracted Lean for any Hax-degenerate patterns (constant-0 decreases, `sorry`, `RustM.fail` on guard-protected inputs) since extraction can succeed in shapes that block proof:
+[tool] Read({"file_path": "proofs/lean/extraction/is_size_align_valid_usize.lean"})
+All three pipeline stages pass cleanly, and the extracted Lean is free of Hax-degenerate patterns. Summary:
+
+## Pipeline result
+
+- ✅ `cargo test` — 5/5 tests pass (unchanged)
+- ✅ `cargo hax into lean` — extracts cleanly
+- ✅ `lake build` — `Build completed successfully (93 jobs)`
+
+## Changes (driven by archive patterns)
+
+| Original (source-side) | Rewrite | Pattern |
+|---|---|---|
+| `align.is_power_of_two()` | Inlined as `is_power_of_two_usize` helper using `if x == 0 { false } else { (x & (x - 1)) == 0 }` | `int_is_power_of_two_method.rs` + `short_circuit_and_with_partial_op.rs` (used `if`/`else` instead of `x != 0 && …` so `x - 1` stays guarded under Hax's eager `do`-block extraction) |
+| `(isize::MAX as usize + 1) - align` | `9_223_372_036_854_775_808usize - align` | `primitive_int_assoc_const.rs` — `isize::MAX = 2^63 - 1`, so `+ 1 = 2^63` |
+
+## Hax-degenerate check on extracted Lean
+
+Verified against each known failure mode in the extracted `is_size_align_valid_usize.lean`:
+
+- ✅ `is_power_of_two_usize` extracts as `if … then pure false else ((← (x &&&? (← (x -? 1)))) ==? 0)` — the `x -? 1` bind sits **inside the else branch** of the extracted `if`, so it is only evaluated when `x ≠ 0`. No `RustM.fail` divergence at `x = 0`. The `if`/`else` rewrite worked as intended.
+- ✅ `max_size_for_align` extracts as `(9223372036854775808 : usize) -? align` — never underflows for callers that only pass power-of-two `align ≤ 2^63`.
+- ✅ No `loop_invariant!` / `loop_decreases!` annotations, no `partial_fixpoint`, no `while` loops, no `from_machine (0 : u32)` constant-0 measures, no `sorry` in the extracted body.
+- ✅ No `&&`/`||` over partial ops remain in the Rust source.
+
+## Library calls inlined and not changed
+
+- `usize::is_power_of_two()` → inlined helper (above)
+- `isize::MAX` → literal `9_223_372_036_854_775_808usize` (above)
+- Test code (`#[cfg(test)]`) uses `usize::BITS`, `usize::MAX`, `isize::MAX`, `next_multiple_of`, `saturating_sub`/`add` — all untouched because tests are excluded from Hax extraction. Tests are the contract and not modified per the rules.
+
+## Patterns considered but not changed
+
+- The doc-comment reference to `isize::MAX` is preserved (doc-comments are inert to Hax).
+- No `while` loops or recursion exist in the function body, so the recursion-preference rewrite (`while_loop_to_recursion.rs`) does not apply.
+
+## Semantics
+
+Both rewrites preserve byte-identical Rust semantics:
+- `is_power_of_two_usize(x) == x.is_power_of_two()` for all `usize` (including `x = 0`).
+- `9_223_372_036_854_775_808usize - align == (isize::MAX as usize + 1) - align` on 64-bit targets (which `Cargo.toml`'s test data assumes — see test comments `2^63 - 1`, `2^64 - 1`).
+Tests covering both code paths (power-of-two detection at `align ∈ {0, 3, …, usize::MAX}` and the exact edge `(isize::MAX + 1) - align` across all 64 shift positions) all pass.
+
+## Hax-degenerate patterns left for proof stage
+
+None. The extracted Lean is well-formed, free of `sorry`, free of eager-bind divergence, free of unresolved metavariables, and ready for proof.
+[verify rust_hax_lean] running: cargo test
+[verify rust_hax_lean] running: cargo hax into lean
+[verify rust_hax_lean] running: lake build
+[verify rust_hax_lean] all checks passed
+
+rust_hax_lean
+[tool] Glob({"pattern": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/is_size_align_valid_usize/attempted_changes/20260524-165307/*"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/is_size_align_valid_usize/attempted_changes/20260524-165307/0001_stage2_rust_hax_lean_patched/... [+15 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/is_size_align_valid_usize/attempted_changes/20260524-165307/0001_stage2_rust_hax_lean_patched/... [+19 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/code/alloc/is_size_align_valid_usize/attempted_changes/20260524-165307/0001_stage2_rust_hax_lean_patched/... [+20 chars])
+The single attempt in this log is a pre-emptive rewrite that uses three patterns already in the archive. No new pattern to write.
+
+## Final report
+
+**Patterns written:** 0
+
+**Attempts inspected and skipped:**
+- `0001_stage2_rust_hax_lean_patched/` — pre-emptive rewrite combining three already-archived patterns: `int_is_power_of_two_method.rs` (inlining `usize::is_power_of_two` as `(x & (x-1)) == 0`), `primitive_int_assoc_const.rs` (replacing `isize::MAX as usize` with the literal `9_223_372_036_854_775_808usize`), and `short_circuit_and_with_partial_op.rs` (using `if/else` instead of `x != 0 && …` to keep `x - 1` guarded). No new root cause to document.
+
+**Flagged for human attention:** Nothing — the log is a single, clean, pre-emptive rewrite. The `trigger_error` field is explicitly self-referential ("Pre-emptive rewrite for two known Hax-incompatibility patterns flagged in the archive…") rather than a Hax/lake stderr, which is consistent with the rewrite agent applying known patterns prophylactically rather than reactively. No anomaly.
+
+harvest_rewrite_patterns
+Looking at the diff between the two files:
+
+**Change 1**: `align.is_power_of_two()` is replaced with a local helper `is_power_of_two_usize(align)`:
+```rust
+fn is_power_of_two_usize(x: usize) -> bool {
+    if x == 0 { false } else { (x & (x - 1)) == 0 }
+}
+```
+This is the canonical bit-twiddling identity for power-of-two checks. For `x == 0`, returns `false` (matching std, since 0 is not a power of two). For `x != 0`, `(x & (x - 1)) == 0` is true iff `x` has exactly one bit set — i.e., is a power of two. The `if`/`else` form is used rather than `x != 0 && …` per the documented Hax rewrite pattern, but the runtime semantics are identical to `usize::is_power_of_two()` for every `usize` input.
+
+**Change 2**: `(isize::MAX as usize + 1) - align` is replaced with the literal `9_223_372_036_854_775_808usize - align`.
+On a 64-bit target, `isize::MAX = 2^63 - 1 = 9_223_372_036_854_775_807`, so `isize::MAX as usize + 1 = 2^63 = 9_223_372_036_854_775_808`. The literal matches exactly. The `tests` module (and the benchmark name) assume `usize == u64`, so on the test target the two expressions evaluate to the same value, and the subsequent `- align` (with `align` a power of two between 1 and 2^63) produces identical results. (On a 32-bit target the literal wouldn't even compile, so there's no behavioral divergence to worry about there — we'd fail at build time.)
+
+All other code, including the entire test suite, is unchanged.
+
+Both substitutions are faithful inlinings whose outputs match the originals on every `usize` input on the target platform.
+
+VERDICT: PASS
+
+[equivalence_check] verdict: PASS
+
+equivalence_check
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/manifest.json"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/truncate_number_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clamp_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/src/lib.rs"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/average_floor_u64_modified/src/lib.rs"})
+## Selected examples
+
+```
+proof_patterns/slice_get_u64_modified
+proof_patterns/truncate_number_modified
+proof_patterns/clamp_modified
+proof_patterns/saturating_sub_modified
+proof_patterns/is_zero_modified
+```
+
+### Rationale
+
+- **slice_get_u64_modified** — canonical `branch-split-totality` + `partial-operator-discharge`: pairs in-/out-of-branch postcondition lemmas, then combines them via `by_cases` for the no-panic totality theorem. Directly mirrors how this target needs to prove `is_size_align_valid` is total: the inner `>?` partial operator must be discharged inside one branch, while the other branch just returns `false`/`true`.
+- **truncate_number_modified** — `partial-operator-discharge` via `if_neg (by decide)` on a *static* nonzero/safe argument. This is exactly the pattern needed for `max_size_for_align`'s `9223372036854775808 -? align` once `is_power_of_two_usize align = true` gives `align ≤ 2^63`, and also for the static-decidable parts of the `usize` comparison operators. `bv-nat-bridge` matches too.
+- **clamp_modified** — `nested-if` + `total-function` + `inequality-comparison`: structurally identical to the outer `is_size_align_valid` (two-level if/else returning `false`/`false`/`true` from cascaded checks). Same multi-postcondition projection shape (one theorem per branch outcome).
+- **saturating_sub_modified** — `if-branch-on-overflow` over a subtraction guarded by a comparison. Direct analog of `is_power_of_two_usize`'s `if x == 0 { false } else { (x & (x-1)) == 0 }`, where the `x-1` partial subtraction is licensed precisely by the `x != 0` guard reaching the else branch.
+- **is_zero_modified** — `bool-result` + `equality-comparison` + `single-binop` with an `rfl`-style closure: the smallest possible analog of the `x ==? 0` and `... ==? 0` leaves inside `is_power_of_two_usize`, and of the overall `bool` return shape.
+
+### Gaps not covered by any example
+
+- **Power-of-two characterization via `x & (x-1) == 0`** — no library example proves this bit identity. The closest bit-manip examples (`average_floor/ceil_u64_modified`, `trailing_zeros_u64_modified`, `max_odd_part_modified`, `gcd_stein_u64_modified`) all prove *different* bitwise facts (Dietz averaging identity, tz-counting loop invariants, Stein binary GCD) — none give a clean lemma for "is power of two ↔ popcount = 1 ↔ `x & (x-1) = 0`". The proof will likely have to bridge via `Nat.and_pow_two_sub_one`-style reasoning or `bv_decide` on a `BitVec 64` reformulation. A small standalone `is_power_of_two_u64` example would fill this gap.
+- **Composition of two pure helpers in a *non-loop* context** — `max_odd_part_modified` and `binomial_u64_modified` cover helper composition, but both inside loops/recursion. The target's helper composition is purely sequential inside one if/else cascade; no example is a direct analog.
+
+### Considered and rejected
+
+- `average_floor_u64_modified` / `average_ceil_u64_modified` — bit-manip but proves an arithmetic averaging identity, not a 1-bit predicate; would mislead toward Dietz-style reasoning.
+- `trailing_zeros_u64_modified`, `max_odd_part_modified`, `gcd_stein_u64_modified` — bit-manip but loop-invariant / Hoare-triple shape; target has no loops.
+- `gcd_while_modified`, `while_example` — `loop-invariant` style; target has no loops.
+- `gcd_recursive_modified`, `recursion_example`, `factorial_modified`, `sum_to_n_modified`, `is_prime_modified`, `largest_divisor_modified`, `sqrt_u64_modified`, `binomial_u64_modified`, all `clever_*` — recursion / `partial_fixpoint`; target is straight-line.
+- `add_one_modified`, `square_modified`, `factorial_modified`, `sum_to_n_modified`, `abs_diff_i64_modified` — overflow-*failure* focus (pair `ok` + `overflow` theorems), but the target is *total* — overflow is statically ruled out, not exposed.
+- `min_modified` — close to `is_zero` but its `bv_decide` + disjunctive postcondition is heavier than needed; `is_zero_modified` is the cleaner bool-result template.
+- `sum_product_modified`, `below_zero_modified`, `rescale_to_unit_modified`, `contains_u64_modified` — recursive slice scans; wrong shape.
+- `clever_044_triangle_area_modified` — `signed-div-static-discharge` is tempting for the static-divisor pattern, but the rest (signed mul overflow, `RustM.ok`/overflow pairing) doesn't apply.
+
+select_examples
+[scaffold] created proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean
+[scaffold] registered Is_size_align_valid_usizeObligations in proofs/lean/extraction/lakefile.toml
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/proofs/lean/extraction/Slice_get_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/truncate_number_modified/proofs/lean/extraction/Clever_002_truncate_numberObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clamp_modified/proofs/lean/extraction/ClampObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/saturating_subObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_zero_modified/proofs/lean/extraction/Is_zeroObligations.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean"})
+[tool] Read({"file_path": "proofs/lean/extraction/is_size_align_valid_usize.lean"})
+[tool] Grep({"pattern": "usize", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/proofs/lean/extraction/Slice_get_u64Obligations.lean", "output_... [+17 chars])
+[tool] Grep({"pattern": "usize\\|USize|is_power_of_two", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "USize64", "path": "/home/tobias/uni/pipeline_v6/proof_patterns", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "usize|UInt64|UInt8|u64|RustM\\.ok|RustM\\.fail", "path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extractio... [+47 chars])
+[tool] mcp__lean__lean_hover_info({"file_path": "Is_size_align_valid_usizeObligations.lean", "line": 9, "column": 8})
+[tool] mcp__lean__lean_hover_info({"file_path": "is_size_align_valid_usize.lean", "line": 18, "column": 29})
+[tool] mcp__lean__lean_hover_info({"file_path": "is_size_align_valid_usize.lean", "line": 18, "column": 28})
+[tool] mcp__lean__lean_hover_info({"file_path": "is_size_align_valid_usize.lean", "line": 18, "column": 32})
+[tool] mcp__lean__lean_declaration_file({"file_path": "is_size_align_valid_usize.lean", "symbol": "usize"})
+[tool] Grep({"pattern": "abbrev usize|def usize|@\\[reducible\\] def usize", "output_mode": "files_with_matches"})
+[tool] Grep({"pattern": "usize|^def [a-zA-Z_]*size|isize", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "output... [+36 chars])
+[tool] Grep({"pattern": "USize64", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax", "output_mode": "files_with_matches"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/USize64.lean"})
+[tool] Grep({"pattern": "notation.*\\?|infix.*\\?|prefix.*\\?|infixr.*\\?|infixl.*\\?", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_... [+57 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 1, "limit": 220})
+[tool] Grep({"pattern": "rust_primitives.ops.arith.Sub.sub|usubOverflow|USize64.sub", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_pr... [+54 chars])
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/ops.lean", "offset": 220, "limit": 200})
+Let me check how RustM works:
+[tool] Grep({"pattern": "RustM\\|inductive RustM\\|abbrev RustM", "path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/RustM.lean"... [+45 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/**/RustM*"})
+[tool] Read({"file_path": "proofs/lean/extraction/.lake/packages/Hax/hax-lib/proof-libs/lean/Hax/rust_primitives/RustM.lean"})
+Now let me check the existing helper definitions for naming/equational form, and verify a few details with the LSP:
+[tool] mcp__lean__lean_hover_info({"file_path": "is_size_align_valid_usize.lean", "line": 18, "column": 9})
+[tool] mcp__lean__lean_hover_info({"file_path": "is_size_align_valid_usize.lean", "line": 32, "column": 9})
+Now I have enough information to write the obligations. Let me apply the patch:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\nnamespace Is_size_align_valid_usizeObligations\n\n-- Add `the... [+3987 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+All four theorems are well-typed (only `sorry` warnings, no errors). Let me verify with `lake build`:
+[tool] run_lake_build({})
+Build successful — all four theorem statements are well-typed (only the expected `sorry` warnings for placeholder proofs).
+
+## Summary
+
+**File edited:** `proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean`
+
+**Theorems added** (one line per contract clause):
+
+1. **`is_size_align_valid_rejects_non_power_of_two`** — failure-condition clause: when the helper `is_power_of_two_usize align` returns `ok false`, the function returns `ok false` regardless of `size`. Covers Rust tests `rejects_non_power_of_two` and `non_power_of_two_align_always_rejected`.
+
+2. **`is_size_align_valid_accepts`** — postcondition (accept branch): when `align` is a power of two (helper returns `ok true`) and `size.toNat + align.toNat ≤ 2^63`, the function returns `ok true`. Covers the positive branch of `power_of_two_align_matches_round_up_contract`, the low-side asserts of `layout_round_up_to_align_edge_cases`, and `layout_accepts_all_valid_alignments` (instantiation at `size = 0`).
+
+3. **`is_size_align_valid_rejects_large_size`** — postcondition (reject branch): when `align` is a power of two but `2^63 < size.toNat + align.toNat`, the function returns `ok false`. Covers the negative branch of `power_of_two_align_matches_round_up_contract` and the high-side assert of `layout_round_up_to_align_edge_cases`.
+
+4. **`is_size_align_valid_total`** — totality / no-panic: `∃ b, is_size_align_valid size align = RustM.ok b`. The `2^63 - align` subtraction is the only model-level partial operation, and it is statically guarded by the power-of-two check (every power of two is `≤ 2^63`), so the function is total on the full `usize × usize` domain.
+
+**Property tests classified as derived facts / subsumed (none skipped silently):** all Rust contract tests are covered by at least one of the four theorems. In particular, `layout_accepts_all_valid_alignments` (size=0 always accepted) is the `size = 0` instance of `is_size_align_valid_accepts` and is not given a separate theorem; per the rules, a single theorem covering multiple tests is the intended shape, not bundling.
+
+**Feasibility check:** the natural universal totality statement holds (the only partial op is statically guarded), so no precondition is added to `is_size_align_valid_total`. The two postcondition theorems use `Nat`-arithmetic preconditions (`size.toNat + align.toNat ≤ 2^63` / `> 2^63`) rather than the `usize`-arithmetic form `size ≤ 2^63 - align` to avoid having to assert non-overflow inside the precondition itself; this is the standard pattern in the reference examples.
+
+**Uncertainty:** I'm reasonably confident in the statement shapes, but flag one framing choice: I expressed the precondition "align is a power of two" via the helper `is_power_of_two_usize align = RustM.ok true` rather than a pure-`Nat` disjunction `∃ k < 64, align.toNat = 2^k`. The helper-based form matches the implementation's control flow (and avoids re-proving the bit-trick characterization at the contract layer), but the proof stage may need an auxiliary lemma bridging it to a `Nat`-shaped fact when it needs `align.toNat ≤ 2^63`.
+[verify make_lean_obligations] running: lake build
+[verify make_lean_obligations] all checks passed
+[make_lean_obligations] snapshotted 4 obligation(s) for the proof-stage preservation check
+
+make_lean_obligations
+
+[make_proof] turn 1/2
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/slice_get_u64_modified/proofs/lean/extraction/Slice_get_u64Obligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/clamp_modified/proofs/lean/extraction/ClampObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/saturating_sub_modified/proofs/lean/extraction/saturating_subObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/truncate_number_modified/proofs/lean/extraction/Clever_002_truncate_numberObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proof_patterns/is_zero_modified/proofs/lean/extraction/Is_zeroObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/proofs/lean/extraction/is_size_align_valid_usize.lean"})
+[tool] Glob({"pattern": "**/*.lean"})
+[tool] Glob({"pattern": "proofs/lean/extraction/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/is_size_align_valid_usize... [+7 chars])
+[tool] Glob({"pattern": "proofs/lean/extraction/.lake/packages/Hax/**/*.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-li... [+50 chars])
+[tool] Grep({"pattern": "==\\?|-\\?|>\\?|!\\?|&&&\\?", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean... [+97 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-li... [+48 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-li... [+52 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-li... [+59 chars])
+[tool] Grep({"pattern": "USize64.subOverflow", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extract... [+68 chars])
+[tool] Grep({"pattern": "subOverflow|sub_overflow|usubOverflow", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/p... [+86 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-li... [+88 chars])
+Let me explore some lemmas needed for the proofs.
+[tool] Grep({"pattern": "USize64.lt_iff_toNat_lt|USize64.subOverflow_iff|USize64.toNat_lt", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_a... [+113 chars])
+[tool] Grep({"pattern": "declare_uint_theorems", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extra... [+70 chars])
+[tool] Grep({"pattern": "macro.*declare_uint_theorems|lt_iff_toNat_lt|le_iff_toNat_le|toNat_inj|toNat_sub_of_le|toNat_and|toNat_ofNat_of_lt", "path": "/home/tobias/uni/pipe... [+156 chars])
+[tool] Grep({"pattern": "declare_uint_theorems", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extra... [+138 chars])
+[tool] Grep({"pattern": "declare_uint_theorems|lt_iff_toNat_lt|le_iff_toNat_le|toNat_inj", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_al... [+180 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-li... [+62 chars])
+[tool] Grep({"pattern": "declare_uint_theorems", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extra... [+92 chars])
+[tool] Grep({"pattern": "macro\\s+&quot;declare_uint_theorems&quot;|macro \\\"declare_uint_theorems\\\"|declare_uint_theorems", "path": "/home/tobias/uni/pipeline_v6/benchm... [+138 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-li... [+70 chars])
+[tool] Grep({"pattern": "declare_uint_theorems|lt_iff_toNat_lt|le_iff_toNat_le|toNat_inj|toNat_sub_of_le|toNat_and|toNat_ofNat_of_lt", "path": "/home/tobias/uni/pipeline_v6... [+232 chars])
+[tool] Grep({"pattern": "macro \\\"declare_uint_theorems\\\"", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/pro... [+73 chars])
+Let me now write a first attempt and use the LSP to iterate.
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] mcp__lean__lean_hover_info({"file_path": "is_size_align_valid_usize.lean", "line": 18, "column": 5})
+[tool] mcp__lean__lean_goal({"file_path": "Is_size_align_valid_usizeObligations.lean", "line": 28})
+[tool] mcp__lean__lean_goal({"file_path": "Is_size_align_valid_usizeObligations.lean", "line": 30})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\ntheorem is_size_align_valid_rejects_non_power_of_two (size al... [+497 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\ntheorem is_size_align_valid_rejects_non_power_of_two (size al... [+544 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+First proof done. Now for the others. Let me think about totality first.
+[tool] mcp__lean__lean_goal({"file_path": "Is_size_align_valid_usizeObligations.lean", "line": 81})
+Let me look at how bv_decide and related tools work in Hax examples.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-li... [+67 chars])
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/.lake/packages/Hax/hax-li... [+47 chars])
+Let me try unfolding to see the structure.
+[tool] write_working_file({"path": "proofs/lean/extraction/scratch_explore.lean", "content": "import Hax\nimport Std.Tactic.Do\nimport Std.Do.Triple\nimport Std.Tactic.Do.Syntax\nimport ... [+423 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\nnamespace Is_size_align_valid_usizeObligations\n\nopen is_siz... [+1756 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n/-- Helper: `is_power_of_two_usize` always returns successful... [+2552 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n/-- Helper: when `x \u2260 0` is known, the unsigned subtract... [+1873 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n/-- Helper: when `x \u2260 0` is known, the unsigned subtract... [+1748 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+Helper works. Now let me add another helper to characterize `is_power_of_two_usize`.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n  show (if BitVec.usubOverflow x.toBitVec (1#64) = true then\... [+1794 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] mcp__lean__lean_goal({"file_path": "Is_size_align_valid_usizeObligations.lean", "line": 70, "column": 5})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n/-- Characterization of `is_power_of_two_usize`: always retur... [+2578 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] mcp__lean__lean_goal({"file_path": "Is_size_align_valid_usizeObligations.lean", "line": 63, "column": 5})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n    rw [decide_eq_false hx]\n    simp only [pure_bind, Bool.f... [+926 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+Helper works. Now let me add a helper that converts `is_power_of_two_usize align = ok true` to `align ≤ 2^63`.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n    have h1 : decide (x \u2260 0) = true := decide_eq_true hx... [+1547 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+Excellent! That worked. Now let me write a helper for `max_size_for_align` and prove the remaining theorems.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n  have hb : (0x8000000000000000#64).toNat = 2 ^ 63 := by deci... [+1090 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+Now let me write the remaining proofs. First, let me also add a helper for extracting `align ≤ 2^63` from `is_power_of_two_usize align = ok true`.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n  rw [if_neg hno]\n  rfl\n===\n  rw [if_neg hno]\n  rfl\n\n/-... [+1496 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/Is_size_align_valid_usize... [+18 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n/-- From `is_power_of_two_usize align = ok true` extract `ali... [+7909 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] mcp__lean__lean_goal({"file_path": "Is_size_align_valid_usizeObligations.lean", "line": 112})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/Is_size_align_valid_usize... [+46 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n/-- From `is_power_of_two_usize align = ok true` extract `ali... [+2335 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n/-- From `is_power_of_two_usize align = ok true` extract `ali... [+2280 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+All helpers work. Now let me prove the remaining 3 theorems.
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\ntheorem is_size_align_valid_accepts (size align : usize)\n   ... [+2668 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+Now the rejects_large_size theorem:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\ntheorem is_size_align_valid_rejects_large_size (size align : ... [+2214 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+Now the totality theorem:
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\ntheorem is_size_align_valid_total (size align : usize) :\n   ... [+1258 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/Is_size_align_valid_usize... [+46 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\ntheorem is_size_align_valid_total (size align : usize) :\n   ... [+2229 chars])
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+All proofs compile. Let me verify with `lake build`:
+[tool] run_lake_build({})
+Build succeeds with no warnings. Let me verify the final file looks clean.
+[tool] Read({"file_path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/Is_size_align_valid_usize... [+47 chars])
+All four obligation theorems are closed without `sorry`. Let me also confirm none of the helper `private theorem`s remain unused or with `sorry`:
+[tool] Grep({"pattern": "sorry", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/lean/extraction/Is_size_al... [+59 chars])
+[tool] Grep({"pattern": "is_power_of_two_usize_ne_zero", "path": "/home/tobias/uni/pipeline_v6/benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified/proofs/le... [+83 chars])
+[tool] apply_file_patch_tool({"path": "proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean", "patch": "<<< SEARCH\n/-- From `is_power_of_two_usize align = ok true` we also get ... [+721 chars])
+[tool] run_lake_build({})
+Build still passes cleanly. Final check:
+[tool] mcp__lean__lean_diagnostic_messages({"file_path": "Is_size_align_valid_usizeObligations.lean"})
+All four obligations are closed without `sorry`, with no warnings or errors.
+
+## Final output
+
+### Files changed
+
+- `proofs/lean/extraction/Is_size_align_valid_usizeObligations.lean` — replaced all four `sorry` placeholders with full proofs and added five `private theorem` helpers.
+
+### Proofs added
+
+**Four obligation theorems** (all proven, no `sorry`):
+
+1. `is_size_align_valid_rejects_non_power_of_two` — straightforward unfold-and-rewrite: when the helper rejects, the outer `if` takes the failure branch.
+2. `is_size_align_valid_accepts` — uses `max_size_for_align_ok` to evaluate the inner subtraction, then proves `¬ size > (2^63 - align)` from `size + align ≤ 2^63`.
+3. `is_size_align_valid_rejects_large_size` — symmetric to (2): proves `size > (2^63 - align)` from `2^63 < size + align`.
+4. `is_size_align_valid_total` — case-split on the boolean `decide (align ≠ 0) && decide (align &&& (align - 1) = 0)` (the characteristic value of `is_power_of_two_usize`), reducing to one of the three postcondition theorems above.
+
+**Five `private theorem` scaffolds**:
+
+- `usize_sub_one_ok` — `x ≠ 0 → x -? 1 = ok (x - 1)` via `USize64.subOverflow_iff`.
+- `is_power_of_two_usize_eq` — characterizes the helper as `ok (decide (x ≠ 0) && decide (x &&& (x - 1) = 0))`. Unfolds the `do`-block step by step.
+- `usize_pow_of_two_le` — the key bit-trick fact: `x ≠ 0 ∧ x &&& (x - 1) = 0 → x.toNat ≤ 2^63`, discharged by `bv_decide` on a `BitVec 64` reformulation.
+- `max_size_for_align_ok` — `align.toNat ≤ 2^63 → max_size_for_align align = ok (2^63 - align)`.
+- `is_power_of_two_usize_le` — bridges the helper's `ok true` result to `align.toNat ≤ 2^63`.
+
+### Sub-goals that were difficult and how resolved
+
+- **Power-of-two ⇒ `align ≤ 2^63`** — the only example in the picker's selection that touches bitwise operations (`saturating_sub`, `truncate_number`, `clamp`, `is_zero`) doesn't cover this identity. Resolved by reformulating into `BitVec 64` (using `x.toBitVec`, the underlying `BitVec.usubOverflow`, and equality through `USize64.toBitVec_inj`) and discharging the bit-vector goal `x ≠ 0 ∧ x &&& (x - 1) = 0 → x ≤ 0x8000_0000_0000_0000` with `bv_decide`, then converting back to `toNat` arithmetic.
+- **`do`-block reduction in `RustM`** — `RustM.ok v >>= f` doesn't reduce automatically via `pure_bind` because `RustM.ok` isn't syntactically `pure`. Worked around by inserting `show` rewrites that convert `RustM.ok v` to `(pure v : RustM _)` at each step, after which `simp only [pure_bind]` fires.
+- **Injecting `RustM.ok b₁ = RustM.ok b₂ → b₁ = b₂`** — needs two layers of `injection` (one to unwrap `Option`/`some`, one to unwrap `Except.ok`), because `RustM = ExceptT Error Option`.
+
+### Obligations left as `sorry`
+
+None — all four obligations are closed and `lake build` succeeds with no warnings or errors.
+[make_proof] turn 1 done — 0 sorry remain
+[make_proof] closed after 1 turn(s)
+[verify make_proof] running: lake build
+[verify make_proof] all checks passed
+
+make_proof
+Looking at the target's obligations file, the distinctive proof obstacles are:
+
+1. **Power-of-two bit-trick characterization** (`is_power_of_two_usize_eq`): bridges the `do`-block extraction of `if x==0 then false else (x & (x-1)) == 0` to a clean Boolean characterization, then proves the bit-trick implies `x ≤ 2^63` via `bv_decide` on a 64-bit BitVec (lemma `usize_pow_of_two_le`). This "bit-trick → numeric bound via `bv_decide`" shape doesn't appear in any existing entry — `min_modified` uses `bv_decide` only for a simple `min ≤ a/b` bound, and the `bit-manip` entries (`average_ceil_u64`, `average_floor_u64`, `max_odd_part`, `trailing_zeros_u64`) all prove formula identities, not the `x ≠ 0 ∧ x & (x-1) = 0 ⟹ x ≤ 2^k` characterization that downstream code depends on.
+
+2. **Sequential composition of two non-recursive helpers** where the first helper's bit-trick conclusion supplies the precondition (`align ≤ 2^63`) that discharges the second helper's partial subtraction (`2^63 - align`) — paralleling but distinct from `rescale_to_unit`'s recursive sequential composition.
+
+3. **Three-clause contract + totality via case-split on helper result**: a clean shape closing the totality existential by casing on the boolean returned by `is_power_of_two_usize` and dispatching to one of the three named clauses.
+
+The combination — power-of-two predicate characterization, `bv_decide` lifting that to a numeric bound, then using the bound to discharge a downstream partial op — is a recurring real-world pattern (any Rust code using `is_power_of_two()` followed by alignment arithmetic) that no existing entry covers. Worth adding.
+[tool] add_proof_pattern({"name": "is_size_align_valid_usize_modified", "features": ["bit-manip", "power-of-two-characterization", "bv-decide-proof", "bv-nat-bridge", "partial-operator-... [+1607 chars])
+ADDED `is_size_align_valid_usize_modified`
+
+Features: `bit-manip`, `power-of-two-characterization`, `bv-decide-proof`, `bv-nat-bridge`, `partial-operator-discharge`, `subtraction-no-underflow`, `sequential-helper-composition`, `three-conjunct-contract`, `totality-by-helper-case-split`, `functional-correctness`.
+
+Summary: power-of-two bit-trick characterization (`x ≠ 0 ∧ x & (x-1) = 0`) lifted via `bv_decide` on `BitVec 64` to `x ≤ 2^63`, which discharges a downstream partial subtraction `2^63 - align`; composes two straight-line helpers, projects three named contract clauses, and closes totality by `by_cases` on the helper's Boolean.
+
+Observations for a human reader:
+- `usize_pow_of_two_le` is the small reusable kernel — the `revert hbv hbvand; bv_decide` two-liner is short and directly transferable to other widths.
+- `is_power_of_two_usize_eq` shows the full template for normalising a `do`-block of the shape `if x == 0 then false else (x & (x-1)) == 0` into a pure `decide … && decide …`. Worth lifting to a helper if more power-of-two predicates appear.
+- The totality theorem is a clean illustration of "case-split on the helper's Boolean and dispatch to whichever of the three named contract clauses applies" — no separate proof effort needed beyond the three branches.
+
+ADDED `is_size_align_valid_usize_modified`.
+
+harvest_proof_patterns
+Stage notes: /home/tobias/uni/pipeline_v6/runs/20260524-165307_is_size_align_valid_usize_stage_notes.json
+[cleanup] freed 350.7MB from benchmarks/claude-opus-4-7/alloc/is_size_align_valid_usize_modified
